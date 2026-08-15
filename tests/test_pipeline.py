@@ -29,11 +29,50 @@ def claude_bin(tmp_path):
     return str(path)
 
 
+# The measured target repo does not use main: its development line is
+# windows-handoff-20260808. Every pipeline test starts from a branch by that name,
+# so "base is the current HEAD, never main" is proved by the whole suite and not
+# by one test.
+BASE_BRANCH = "windows-handoff-20260808"
+
+GIT_ID = ["-c", "user.email=t@t", "-c", "user.name=t"]
+
+
+def git(path, *args, check=True):
+    return subprocess.run(
+        ["git"] + GIT_ID + ["-C", str(path)] + list(args),
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def commit_all(path, message="snapshot"):
+    git(path, "add", "-A")
+    git(path, "commit", "--allow-empty", "-qm", message)
+    return path
+
+
 @pytest.fixture
 def repo(tmp_path):
     path = tmp_path / "jokertest"
     (path / "tasks").mkdir(parents=True)
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    # `git init -b` is not in every git the tool has to run on.
+    git(path, "symbolic-ref", "HEAD", "refs/heads/{0}".format(BASE_BRANCH))
+    (path / "README.md").write_text("jokertest\n", encoding="utf-8")
+    commit_all(path, "init")
     return path
+
+
+# Kept as a name because tests read better saying it: "everything so far is
+# committed". The repo fixture is already a git repo, so this only snapshots.
+git_repo = commit_all
 
 
 @pytest.fixture
@@ -64,7 +103,18 @@ def argv(repo, tmp_path, claude_bin, *extra):
         "--repo", str(repo),
         "--claude-bin", claude_bin,
         "--no-live",
+        # Short, and beside the repo rather than derived from it: Windows MAX_PATH
+        # is a real limit once a worktree carries a slice id and node_modules.
+        "--worktree-root", str(tmp_path / "wt"),
     ] + list(extra)
+
+
+def worktree(repo, tmp_path, slice_id=None):
+    return tmp_path / "wt" / (slice_id or state_of(repo)["slice_id"])
+
+
+def subjects(repo, rev_range):
+    return [line for line in git(repo, "log", "--format=%s", "--reverse", rev_range).stdout.splitlines() if line]
 
 
 def state_of(repo, slice_id=None):
@@ -547,32 +597,19 @@ def test_ordinary_failure_is_not_retried(repo, tmp_path, claude_bin, log, monkey
 # ------------------------------------------------------------------- safety
 
 
-def git_repo(path):
-    if shutil.which("git") is None:
-        pytest.skip("git is not installed")
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(path), "add", "-A"],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(path),
-         "commit", "-qm", "init"],
-        check=True,
-    )
-    return path
-
-
-def test_dirty_repo_is_refused(repo, tmp_path, claude_bin, log, capsys):
+def test_dirty_repo_is_no_longer_refused(repo, tmp_path, claude_bin, log):
+    """v0.3 removes v0.2's dirty gate: the AI never touches this tree at all."""
     requirement(repo, front="approval: none")
     git_repo(repo)
     (repo / "unstaged.txt").write_text("work in progress", encoding="utf-8")
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
 
-    code = main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md"))
-    assert code == 2
-    assert "uncommitted changes" in capsys.readouterr().err
-    assert invocations(log) == []
-    assert not pipeline.slices_root(repo).exists()
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
+    assert state_of(repo)["status"] == "done"
+    assert len(invocations(log)) == 3
+    # the human's half-finished work is exactly where they left it
+    assert (repo / "unstaged.txt").read_text(encoding="utf-8") == "work in progress"
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == head
 
 
 def test_clean_git_repo_runs_and_its_own_state_is_not_dirt(
@@ -580,8 +617,11 @@ def test_clean_git_repo_runs_and_its_own_state_is_not_dirt(
 ):
     requirement(repo, front="approval: none")
     git_repo(repo)
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
     assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
     assert state_of(repo)["status"] == "done"
+    # the slice landed on its own branch; the checked-out one did not move
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == head
 
 
 def test_plan_stage_that_touches_the_repo_fails_the_slice(repo, tmp_path, claude_bin, log, monkeypatch):
@@ -783,26 +823,31 @@ def test_plan_cannot_forge_its_own_approval(repo, tmp_path, claude_bin, log, mon
     assert state["status"] == "failed"
     assert "readonly" in state["reason"]
     assert len(invocations(log)) == 1
+    # two independent things held: the forgery never reached the real approval
+    # file, and writing under .aidev/ at all was still caught
+    assert not (slice_dir(repo) / "approvals" / "plan.md").exists()
+    assert (worktree(repo, tmp_path) / ".aidev" / "slices" / "forged" / "approvals").is_dir()
 
 
-def test_repo_going_dirty_during_a_gate_stops_implement(repo, tmp_path, claude_bin, log, monkeypatch):
+def test_editing_the_repo_during_a_gate_no_longer_stops_implement(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """The point of isolation: a human can keep working while a gate is open."""
     requirement(repo)
     git_repo(repo)
 
     def approve_and_edit(_seconds):
-        # a human approves, but has also been editing in the meantime
+        # a human approves, and has also been editing in the meantime
         (repo / "unrelated.py").write_text("half-finished work\n", encoding="utf-8")
         (slice_dir(repo) / "approvals" / "plan.md").write_text("approved\n", encoding="utf-8")
 
     monkeypatch.setattr(pipeline, "_sleep", approve_and_edit)
-    code = main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md"))
-    assert code == 1
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
 
-    state = state_of(repo)
-    assert state["status"] == "failed"
-    assert "uncommitted changes" in state["reason"]
-    assert "before stage 'implement'" in state["reason"]
-    assert len(invocations(log)) == 1  # implement never ran on top of that work
+    assert state_of(repo)["status"] == "done"
+    assert len(invocations(log)) == 3  # implement ran, beside that work and not on it
+    assert (repo / "unrelated.py").read_text(encoding="utf-8") == "half-finished work\n"
+    assert not (worktree(repo, tmp_path) / "unrelated.py").exists()
 
 
 def test_resume_after_a_readonly_violation_does_not_launder_it(
@@ -918,6 +963,512 @@ def test_summary_counts_every_attempt_not_just_the_last(repo, tmp_path, claude_b
     # 4 runs at $0.01 each: the failed attempt cost real money too
     assert "$0.0400" in out
     assert "Try" in out
+
+
+# ------------------------------------------------------- workspace isolation
+
+
+def run_slice(repo, tmp_path, claude_bin, *extra):
+    return main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md", *extra))
+
+
+def branches(repo):
+    # git marks the checked-out branch with '*' and a worktree's with '+'
+    return [line[2:].strip() for line in git(repo, "branch", "--list").stdout.splitlines()]
+
+
+def test_one_command_creates_the_workspace_and_finishes(repo, tmp_path, claude_bin, log):
+    """The whole Done Criteria in one run: worktree, branch, four commits, no trace here."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    state = state_of(repo)
+    slice_id = state["slice_id"]
+    work = worktree(repo, tmp_path, slice_id)
+
+    assert work.is_dir()
+    assert "slice/{0}".format(slice_id) in branches(repo)
+    assert subjects(repo, "{0}..slice/{1}".format(head, slice_id)) == [
+        "slice({0}): requirement".format(slice_id),
+        "slice({0}): plan".format(slice_id),
+        "slice({0}): implement".format(slice_id),
+        "slice({0}): test".format(slice_id),
+    ]
+
+    # every stage really ran in the worktree, not in the user's checkout
+    for call in invocations(log):
+        assert Path(call["cwd"]).resolve() == work.resolve()
+
+    # the checkout did not move and grew nothing but the slice's own record
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == head
+    porcelain = git(repo, "status", "--porcelain", "-uall").stdout.splitlines()
+    assert porcelain and all(".aidev/slices/" in line for line in porcelain)
+
+    ws = state["workspace"]
+    assert ws["branch"] == "slice/{0}".format(slice_id)
+    assert ws["base"] == BASE_BRANCH
+    assert Path(ws["path"]).resolve() == work.resolve()
+    assert state["schema"] == 2
+
+
+def test_base_defaults_to_head_not_main(repo, tmp_path, claude_bin, log):
+    """The measured repo's development line is not main, and main is not assumed."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    git(repo, "branch", "main")
+    (repo / "only-on-main.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main moves on")
+    git(repo, "branch", "-f", "main", "HEAD")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    slice_id = state_of(repo)["slice_id"]
+
+    merge_base = git(repo, "merge-base", "slice/" + slice_id, BASE_BRANCH).stdout.strip()
+    assert merge_base == git(repo, "rev-parse", BASE_BRANCH).stdout.strip()
+    assert not (worktree(repo, tmp_path) / "only-on-main.txt").exists()
+
+
+def test_base_flag_selects_another_branch(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    git(repo, "checkout", "-q", "-b", "main")
+    (repo / "only-on-main.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "main moves on")
+    git(repo, "checkout", "-q", BASE_BRANCH)
+
+    assert run_slice(repo, tmp_path, claude_bin, "--base", "main") == 0
+    assert state_of(repo)["workspace"]["base"] == "main"
+    assert (worktree(repo, tmp_path) / "only-on-main.txt").exists()
+
+
+def test_existing_worktree_path_is_refused(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none")
+    slice_id = "{0}-doctor".format(datetime.now().strftime("%Y%m%d"))
+    occupied = tmp_path / "wt" / slice_id
+    occupied.mkdir(parents=True)
+    (occupied / "someone-elses-file.txt").write_text("not ours\n", encoding="utf-8")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    err = capsys.readouterr().err
+    assert "already exists" in err and slice_id in err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
+    # refused, and left exactly as it was: cleaning is the human's job
+    assert (occupied / "someone-elses-file.txt").exists()
+
+
+def test_registered_stale_worktree_is_refused_not_reused(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none")
+    slice_id = "{0}-doctor".format(datetime.now().strftime("%Y%m%d"))
+    path = tmp_path / "wt" / slice_id
+    git(repo, "worktree", "add", "-q", "-b", "orca-leftover", str(path))
+    (path / "orca.txt").write_text("half a migration\n", encoding="utf-8")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert "orca-leftover" in capsys.readouterr().err
+    assert (path / "orca.txt").read_text(encoding="utf-8") == "half a migration\n"
+    assert "orca-leftover" in branches(repo)
+
+
+def test_existing_slice_branch_is_refused(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none")
+    slice_id = "{0}-doctor".format(datetime.now().strftime("%Y%m%d"))
+    git(repo, "branch", "slice/{0}".format(slice_id))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert "branch already exists" in capsys.readouterr().err
+    assert invocations(log) == []
+
+
+def test_stale_worktrees_elsewhere_are_reported_not_cleaned(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    """12 Orca leftovers in the target repo must warn, not block, and not be pruned."""
+    requirement(repo, front="approval: none")
+    for name in ("orca-1", "orca-2"):
+        path = tmp_path / "leftovers" / name
+        git(repo, "worktree", "add", "-q", "-b", name, str(path))
+        shutil.rmtree(str(path))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    out = capsys.readouterr().out
+    registered = git(repo, "worktree", "list", "--porcelain").stdout
+    assert "orca-1" in registered and "orca-2" in registered  # never pruned for them
+    if pipeline.workspace.stale_worktrees(repo):  # 'prunable' needs git >= 2.36
+        assert "stale worktree" in out
+        assert "orca-1" in out and "orca-2" in out
+
+
+def workspace_clean(path):
+    return not git(path, "status", "--porcelain", "-uall").stdout.strip()
+
+
+def test_requirement_is_the_first_commit_not_a_dirty_file(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """v0.2's circle: copying the requirement in was itself what made the tree dirty."""
+    requirement(repo, front="approval: plan")
+    git_repo(repo)
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 130  # killed while the gate is open
+    slice_id = state_of(repo)["slice_id"]
+    work = worktree(repo, tmp_path, slice_id)
+
+    commits = subjects(repo, "{0}..slice/{1}".format(head, slice_id))
+    assert commits[0] == "slice({0}): requirement".format(slice_id)
+    first = git(repo, "rev-list", "--reverse", "{0}..slice/{1}".format(head, slice_id)
+                ).stdout.split()[0]
+    tree = git(repo, "ls-tree", "-r", "--name-only", first).stdout
+    assert ".aidev/history/{0}/requirement.md".format(slice_id) in tree
+    # committed, so the plan stage that follows starts from a clean baseline
+    assert workspace_clean(work)
+
+
+def test_stage_commits_carry_the_slice_metadata(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    state = state_of(repo)
+    slice_id = state["slice_id"]
+    commits = state["commits"]
+    assert set(commits) == {"requirement", "plan", "implement", "test"}
+    for stage in ("plan", "implement", "test"):
+        assert state["stages"][stage]["commit"] == commits[stage]
+
+    path = ".aidev/history/{0}/slice.json".format(slice_id)
+    at_implement = json.loads(git(repo, "show", "{0}:{1}".format(commits["implement"], path)).stdout)
+    assert at_implement["slice_id"] == slice_id
+    assert at_implement["branch"] == "slice/{0}".format(slice_id)
+    assert at_implement["base"] == BASE_BRANCH
+    assert at_implement["stages"]["implement"]["status"] == "done"
+    assert at_implement["stages"]["test"]["status"] == "pending"  # not yet run
+    assert at_implement["stages"]["plan"]["commit"] == commits["plan"]
+    assert sum(int(r["turns"] or 0) for r in at_implement["runs"]) == 2
+
+    # the plan the human could have edited is on the branch too
+    plan_md = git(repo, "show", "{0}:.aidev/history/{1}/plan.md".format(commits["plan"], slice_id))
+    assert "touch aidev/thing.py" in plan_md.stdout
+
+
+def test_the_slice_state_stays_in_the_checkout_not_in_the_worktree(
+    repo, tmp_path, claude_bin, log
+):
+    """Live state has one writer and one home; the branch only gets a projection."""
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    work = worktree(repo, tmp_path)
+
+    assert (slice_dir(repo) / "state.json").exists()
+    assert not (work / ".aidev" / "slices").exists()
+    # the two paths differ on purpose: the same path would collide at merge time
+    assert (work / ".aidev" / "history" / state_of(repo)["slice_id"] / "slice.json").exists()
+
+
+# ------------------------------------------------------------------- setup
+
+
+def setup_script(tmp_path, body):
+    path = tmp_path / "setup_action.py"
+    path.write_text(body, encoding="utf-8")
+    return '"{0}" "{1}"'.format(sys.executable, path)
+
+
+def test_setup_runs_once_before_implement(repo, tmp_path, claude_bin, log):
+    counter = tmp_path / "setup-calls.txt"
+    command = setup_script(
+        tmp_path,
+        "import pathlib\n"
+        "pathlib.Path(r'{0}').open('a').write('ran\\n')\n"
+        "pathlib.Path('installed.txt').write_text('deps')\n".format(counter),
+    )
+    requirement(repo, front="approval: none\nsetup: {0}".format(command))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    # it ran once, in the worktree
+    assert counter.read_text(encoding="utf-8").count("ran") == 1
+    assert (worktree(repo, tmp_path) / "installed.txt").exists()
+    assert not (repo / "installed.txt").exists()
+
+    state = state_of(repo)
+    assert state["setup"]["status"] == "done"
+    assert state["setup"]["exit_code"] == 0
+    assert (slice_dir(repo) / "setup.log").exists()
+
+    # the same command is granted to the stages that may run commands
+    plan, implement, test = (call["argv"] for call in invocations(log))
+    assert "--allowedTools" not in plan
+    for stage_argv in (implement, test):
+        rules = stage_argv[stage_argv.index("--allowedTools") + 1].split(",")
+        assert "Bash({0})".format(command) in rules
+        assert any(rule.endswith(':*)') and rule.startswith("Bash(") for rule in rules)
+
+    # resuming does not install again
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+    assert counter.read_text(encoding="utf-8").count("ran") == 1
+
+
+def test_no_setup_declared_runs_nothing(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    assert "setup" not in state_of(repo)
+    implement = invocations(log)[1]["argv"]
+    rules = implement[implement.index("--allowedTools") + 1].split(",")
+    assert set(rules) == set(pipeline.TEST_COMMAND_TOOLS)
+
+
+def test_setup_failure_stops_before_implement(repo, tmp_path, claude_bin, log):
+    command = setup_script(tmp_path, "import sys\nsys.stderr.write('no lockfile\\n')\nraise SystemExit(3)\n")
+    requirement(repo, front="approval: none\nsetup: {0}".format(command))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert "setup command failed (exit 3)" in state["reason"]
+    assert state["setup"]["status"] == "failed"
+    assert "no lockfile" in (slice_dir(repo) / "setup.log").read_text(encoding="utf-8")
+    # implement never ran on a half-built environment
+    assert len(invocations(log)) == 1
+    assert state["stages"]["implement"]["status"] == "pending"
+
+
+def test_setup_rejects_a_shell_chain(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none\nsetup: npm ci && rm -rf /")
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert "not allowed" in capsys.readouterr().err
+    assert invocations(log) == []
+
+
+# ---------------------------------------------------------- merge / discard
+
+
+def finished_slice(repo, tmp_path, claude_bin):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    return state_of(repo)["slice_id"]
+
+
+def test_merge_lands_on_a_non_main_base(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    tip = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    assert BASE_BRANCH in git(repo, "branch", "--contains", tip).stdout
+    assert "slice({0}): merge".format(slice_id) in git(repo, "log", "--format=%s", "-1").stdout
+    assert (repo / ".aidev" / "history" / slice_id / "requirement.md").exists()
+
+    state = state_of(repo)
+    assert state["status"] == "merged"
+    assert state["merge"]["base"] == BASE_BRANCH
+    # the worktree is not ours to delete just because the merge worked
+    assert worktree(repo, tmp_path, slice_id).is_dir()
+    assert "--discard" in capsys.readouterr().out
+
+
+def test_merge_conflict_aborts_and_reports(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+
+    (work / "README.md").write_text("the slice's version\n", encoding="utf-8")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "slice edit")
+    (repo / "README.md").write_text("the human's version\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "human edit")
+    before = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 4
+    out = capsys.readouterr().out
+    assert "MERGE CONFLICT" in out and "README.md" in out
+
+    # nothing was resolved, and the checkout is exactly as it was
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == before
+    assert (repo / "README.md").read_text(encoding="utf-8") == "the human's version\n"
+    assert not git(repo, "status", "--porcelain").stdout.strip().startswith("UU")
+    assert "slice/{0}".format(slice_id) in branches(repo)
+    assert state_of(repo)["merge"]["status"] == "conflict"
+
+
+def test_merge_refuses_an_unfinished_slice(repo, tmp_path, claude_bin, log, capsys, monkeypatch):
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "fail")
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    slice_id = state_of(repo)["slice_id"]
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 2
+    assert "not 'done'" in capsys.readouterr().err
+
+
+def test_merge_refuses_when_the_repo_is_not_on_the_base(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    git(repo, "checkout", "-q", "-b", "somewhere-else")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 2
+    err = capsys.readouterr().err
+    assert "somewhere-else" in err and "checkout {0}".format(BASE_BRANCH) in err
+    # we never switch the user's branch for them
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "somewhere-else"
+
+
+def test_merge_refuses_to_drop_uncommitted_work_in_the_worktree(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    (worktree(repo, tmp_path, slice_id) / "unfinished.py").write_text("wip\n", encoding="utf-8")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 2
+    assert "uncommitted work" in capsys.readouterr().err
+
+
+def test_merge_refuses_a_dirty_checkout(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    (repo / "README.md").write_text("edited but not committed\n", encoding="utf-8")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 2
+    assert "commit or stash" in capsys.readouterr().err
+
+
+def test_discard_leaves_no_git_trace(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
+    assert not work.exists()
+    assert str(work) not in git(repo, "worktree", "list", "--porcelain").stdout
+    assert not [name for name in branches(repo) if name.startswith("slice/")]
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == head
+
+    state = state_of(repo)
+    assert state["status"] == "discarded"
+    assert state["discard"]["branch"] == "slice/{0}".format(slice_id)
+    # the record of what happened survives the workspace it describes
+    assert (slice_dir(repo) / "state.json").exists()
+    assert "recoverable" in capsys.readouterr().out
+
+
+def test_a_discarded_slice_cannot_be_resumed(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
+    assert "nothing left to resume" in capsys.readouterr().err
+
+
+def test_a_vanished_worktree_is_reported_not_recreated(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none")
+    monkeypatch_free = main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md"))
+    assert monkeypatch_free == 0
+    slice_id = state_of(repo)["slice_id"]
+    shutil.rmtree(str(worktree(repo, tmp_path, slice_id)))
+
+    # rewind one stage so the resume has something to do
+    directory = slice_dir(repo)
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    state["stages"]["test"] = {"status": "pending"}
+    state["status"] = "failed"
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
+    err = capsys.readouterr().err
+    assert "gone" in err and "--discard" in err
+
+
+# --------------------------------------------------------------- edge cases
+
+
+def test_legacy_slice_without_workspace_resumes_in_place(repo, tmp_path, claude_bin, log):
+    """A v0.2 state.json has no workspace key, and v0.2's rules still apply to it."""
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    slice_id = state_of(repo)["slice_id"]
+
+    directory = slice_dir(repo)
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    for key in ("workspace", "commits", "mutated"):
+        state.pop(key, None)
+    state["schema"] = 1
+    state["stages"]["test"] = {"status": "pending"}
+    state["status"] = "failed"
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    git_repo(repo)  # v0.2 needed a clean checkout, and still does
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+    assert Path(invocations(log)[-1]["cwd"]).resolve() == repo.resolve()
+
+    # and the v0.2 dirty rule is still the one guarding it
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    state.pop("mutated", None)
+    state["stages"]["test"] = {"status": "pending"}
+    state["status"] = "failed"
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (repo / "human-work.txt").write_text("in progress\n", encoding="utf-8")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 1
+    assert "uncommitted changes" in state_of(repo, slice_id)["reason"]
+
+
+def test_non_git_repo_is_refused_with_a_way_out(tmp_path, claude_bin, log, capsys):
+    plain = tmp_path / "not-a-repo"
+    (plain / "tasks").mkdir(parents=True)
+    requirement(plain, front="approval: none")
+
+    assert run_slice(plain, tmp_path, claude_bin) == 2
+    err = capsys.readouterr().err
+    assert "not a git repository" in err and "--no-worktree" in err
+    assert invocations(log) == []
+
+    assert run_slice(plain, tmp_path, claude_bin, "--no-worktree") == 0
+    assert state_of(plain)["status"] == "done"
+    assert "workspace" not in state_of(plain)
+    assert Path(invocations(log)[0]["cwd"]).resolve() == plain.resolve()
+
+
+def test_commit_file_limit_refuses_a_node_modules_explosion(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_FILES", "3")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--commit-file-limit", "2") == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert "--commit-file-limit of 2" in state["reason"]
+    # the stage's own work is untouched; only the commit was refused
+    assert state["stages"]["implement"]["status"] == "done"
+    assert set(state["commits"]) == {"requirement", "plan"}
+    assert (worktree(repo, tmp_path) / "generated-0.txt").exists()
+
+
+def test_dry_run_prints_the_workspace_plan_and_touches_nothing(
+    repo, tmp_path, claude_bin, capsys
+):
+    requirement(repo, front="approval: none\nsetup: npm ci --prefix backend")
+    assert run_slice(repo, tmp_path, claude_bin, "--dry-run") == 0
+
+    out = capsys.readouterr().out
+    assert "base      {0}".format(BASE_BRANCH) in out
+    assert "branch    slice/" in out
+    assert "npm ci --prefix backend" in out
+    assert str(tmp_path / "wt") in out
+
+    assert not pipeline.slices_root(repo).exists()
+    assert not (tmp_path / "wt").exists()
+    assert not [name for name in branches(repo) if name.startswith("slice/")]
+
+
+def test_two_commands_at_once_are_a_usage_error(repo, tmp_path, claude_bin, capsys):
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", "a", "--discard", "b")) == 2
+    assert "cannot be combined" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------- unit checks

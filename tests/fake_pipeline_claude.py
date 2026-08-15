@@ -20,6 +20,7 @@ the pipeline has to survive.
     AIDEV_FAKE_QUOTA_FAILS  how many invocations fail with a limit (default: 1)
     AIDEV_FAKE_RESET_IN     seconds from now to advertise as the reset moment
     AIDEV_FAKE_TEXT         final text to emit instead of the per-stage default
+    AIDEV_FAKE_FILES        create N files in cwd during implement (commit guard)
 """
 
 import glob
@@ -176,9 +177,23 @@ def main():
 
     if mode == "forge":
         # The nastier version: write inside .aidev/ and self-approve the gate.
-        for approvals in glob.glob(os.path.join(".aidev", "slices", "*", "approvals")):
+        # Isolated, cwd is a worktree with no slice directory in it at all, so the
+        # attempt has to create one - which proves both halves: the forgery never
+        # reaches the real approvals file, and writing under .aidev/ is still
+        # caught as a readonly violation.
+        targets = glob.glob(os.path.join(".aidev", "slices", "*", "approvals"))
+        if not targets:
+            targets = [os.path.join(".aidev", "slices", "forged", "approvals")]
+        for approvals in targets:
+            if not os.path.isdir(approvals):
+                os.makedirs(approvals)
             with open(os.path.join(approvals, "plan.md"), "w", encoding="utf-8") as handle:
                 handle.write("approved\n")
+
+    if os.environ.get("AIDEV_FAKE_FILES") and stage == "implement":
+        for index in range(int(os.environ["AIDEV_FAKE_FILES"])):
+            with open("generated-{0}.txt".format(index), "w", encoding="utf-8") as handle:
+                handle.write("derived output nobody ignored\n")
 
     # One tool call per run, so telemetry has something to account for. The
     # implement stage reports an Edit, which is what the change summary reads;

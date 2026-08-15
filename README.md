@@ -4,9 +4,11 @@ Claude Code 실행을 감싸서 **어디서 컨텍스트와 돈이 새는지** �
 특정 프로젝트(Joker 등)에 종속되지 않는 독립 도구다. 다른 게임이든 MiniGPT든
 `--repo`만 바꾸면 그대로 쓴다.
 
-**v0.1 = Telemetry Runner**(`aidev run`) **+ v0.2 = Slice Pipeline**(`aidev pipeline`).
-현재 v0.2.0. 요구사항 .md 하나를 주면 plan → 승인 → implement → test를 사람 없이
-진행하고, 정해둔 게이트에서만 승인을 기다린다. 에픽 자동 분해는 v0.4다.
+**v0.1 = Telemetry Runner**(`aidev run`) **+ v0.2 = Slice Pipeline**(`aidev pipeline`)
+**+ v0.3 = Workspace 격리**. 현재 v0.3.0. 요구사항 .md 하나를 주면 plan → 승인 →
+implement → test를 사람 없이 진행하고, 정해둔 게이트에서만 승인을 기다린다.
+그 전부는 pipeline이 만든 **worktree + 전용 브랜치** 안에서 일어나고, 당신의
+체크아웃에는 당신이 `--merge`를 칠 때만 반영된다. 에픽 자동 분해는 v0.4다.
 
 ```
 aidev run
@@ -84,21 +86,31 @@ v0.1이 재던 것(events.jsonl / telemetry.json / live.json / SQLite)이 **단�
 ```
 Requirement (.md)
     ↓
+worktree 생성   <repo>-slices/<slice-id> + 브랜치 slice/<slice-id>  (base = repo의 현재 HEAD)
+    ↓            커밋: slice(<id>): requirement      ← 요구사항이 첫 커밋
+[setup]      front matter에 선언했을 때만, 1회 (미선언 = 아무것도 안 함)
+    ↓
 [plan]       safety readonly — 파일 변경 금지
-    ↓        모델의 최종 메시지를 plan.md로 저장
+    ↓        모델의 최종 메시지를 plan.md로 저장 / 커밋: slice(<id>): plan
 게이트        approvals/plan.md에 "approved" / "rejected: 사유"를 쓸 때까지 대기
     ↓
 [implement]  permission-mode acceptEdits, 프롬프트 = 요구사항 + 승인 시점의 plan.md
-    ↓
+    ↓            커밋: slice(<id>): implement
 [test]       프로젝트 테스트 실행 후 결과 보고 (고치지는 않는다)
     ↓          마지막 줄에 TEST_RESULT: PASS / FAIL 을 요구하고 그걸로 판정한다
+    ↓            커밋: slice(<id>): test
 단계별 토큰 / 비용 / 변경 파일 요약
+    ↓
+--merge <id>   base 브랜치에 merge      (사람이 친다)
+--discard <id> worktree + 브랜치 제거    (사람이 친다)
 ```
 
 ```bash
 aidev pipeline --repo ~/jokertest --requirement tasks/doctor.md
 aidev pipeline --repo ~/jokertest --resume-slice last    # 중단된 slice 이어가기
 aidev pipeline --repo ~/jokertest --list                 # slice 목록 / 상태
+aidev pipeline --repo ~/jokertest --merge 20260816-doctor    # 승인 = base에 반영
+aidev pipeline --repo ~/jokertest --discard 20260816-doctor  # 반려 = 폐기
 ```
 
 `--repo` 기본값은 현재 디렉터리다. run 단위 세션 재개인 `aidev run --resume`과
@@ -106,6 +118,96 @@ aidev pipeline --repo ~/jokertest --list                 # slice 목록 / 상태
 유일한 부분일치 순으로 찾고, **여러 개에 걸리면 고르지 않고 에러를 낸다** (남의
 repo에서 엉뚱한 slice를 재개하는 게 더 나쁘다). `last`는 이름 사전순이 아니라
 `updated_at` 기준 **가장 최근에 움직인** slice다.
+
+### Workspace 격리 (v0.3)
+
+> AI는 사용자의 체크아웃과 base 브랜치에 절대 직접 닿지 않는다.
+> 모든 AI 작업은 pipeline이 만든 worktree + 전용 브랜치에서 일어나고,
+> 사람의 merge만이 결과를 진짜 이력으로 만든다.
+
+`--requirement`로 slice를 시작하면 pipeline이 먼저 격리 공간을 만든다.
+
+```
+<repo>                     당신의 체크아웃 — claude가 여기서 도는 일은 없다
+<repo>-slices/<slice-id>/   worktree, 브랜치 slice/<slice-id>
+```
+
+- **base는 main을 가정하지 않는다.** 기본값은 **repo의 현재 HEAD**다. 개발선이
+  `windows-handoff-20260808`이고 main이 사용 중지 상태여도 그대로 동작한다.
+  다른 데서 갈라지고 싶으면 `--base <branch>`.
+- worktree 위치는 `--worktree-root <path>`로 바꾼다 (Windows 경로 길이 대책).
+- 브랜치 이름은 `slice/<slice-id>`, 커밋 메시지는 `slice(<slice-id>): <stage>`로
+  고정이다. `requirement` / `plan` / `implement` / `test` 네 개가 순서대로 쌓인다.
+  이 커밋들이 이후 그래프 스냅샷의 기준점이다.
+- **커밋은 pipeline이 한다.** 에이전트에게는 여전히 "커밋하지 마라"고 말한다.
+  단계가 성공했을 때만 커밋하고, 실패한 단계가 남긴 변경은 다음에 성공한 단계의
+  커밋에 함께 실린다(사람이 merge 때 한 diff로 본다). 이 커밋은 `--no-verify`로
+  만든다 — 대상 repo의 pre-commit 훅 하나가 무인 루프를 통째로 세우면 안 되기
+  때문이다. 사람이 검토하는 지점은 `--merge`이고, **거기서는 훅을 우회하지 않는다.**
+  git identity가 없는 머신에서만 `aidev <aidev@localhost>`를 주입하고 한 번 알린다.
+
+**잔해는 감지·거부만 한다. 청소는 사람이 한다.**
+
+```text
+error: cannot create the workspace for this slice:
+  - path already exists: C:\...\joker-slices\20260816-doctor
+    contains: node_modules, src
+    registered to branch slice/20260816-doctor, prunable: gitdir file points to ...
+    aidev never reuses or cleans a worktree. Remove it yourself, or pass --worktree-root <path>.
+```
+
+목표 경로가 이미 있거나, 브랜치가 선점됐거나, 등록만 남고 디렉터리가 없으면
+**거부하고 사유를 출력한다** (exit 2). 조용히 재사용하지 않는다. 다른 경로의
+잔해(실측: 조커에 Orca worktree 12개)는 **경고만 찍고 진행한다** — `git worktree
+prune`은 어떤 경우에도 자동으로 돌리지 않고, 필요하면 사람이 칠 명령으로 안내만 한다.
+
+**종료: 승인 = merge, 반려 = discard.**
+
+```bash
+aidev pipeline --repo ~/jokertest --merge 20260816-doctor
+aidev pipeline --repo ~/jokertest --discard 20260816-doctor
+```
+
+`--merge`는 base 브랜치에 `--no-ff`로 merge한다. 전제조건을 하나라도 어기면
+거부한다(exit 2): slice가 `done`이 아니거나, worktree에 커밋 안 된 작업이 남았거나,
+본진이 base를 체크아웃하고 있지 않거나, 본진의 tracked 파일이 더럽거나.
+**우리가 당신의 브랜치를 바꾸지 않는다** — base가 아니면 `git checkout <base>`를
+알려주고 멈춘다. 충돌이 나면 **자동 해결하지 않는다**: 충돌 파일 목록을 먼저
+읽어두고 `merge --abort`로 본진을 원래대로 되돌린 뒤 exit 4로 끝낸다.
+
+`--discard`는 worktree를 지우고 브랜치를 삭제한다. 삭제 직전 sha를 출력하므로
+reflog가 살아있는 동안은 되살릴 수 있다. worktree 제거가 실패하면(Windows에서
+에디터·watcher·node가 파일을 잡고 있으면 흔하다) **브랜치는 남긴 채 중단한다** —
+순서를 뒤집으면 돌아갈 곳 없는 worktree라는 더 나쁜 잔해가 생긴다.
+"본진 무흔적"은 git 이력 기준이다. slice 자체의 기록(`.aidev/slices/<id>/`)은
+**남긴다** — worktree를 버려도 무엇을 왜 했는지는 남아야 하기 때문이다.
+
+`--no-worktree`를 주면 v0.2처럼 repo 안에서 직접 돈다. 경고를 찍고, v0.2의 dirty
+검사가 그대로 살아난다. git이 없거나 git repo가 아닌 디렉터리에서의 유일한 길이다.
+
+### 의존성 설치 (setup)
+
+worktree에는 `node_modules` 같은 untracked 파생물이 없다 (실측: `npm ci` 수동 필요).
+그렇다고 pipeline이 임의 설치 명령을 실행하지는 않는다. 요구사항 front matter에
+**선언한 것만** 실행한다.
+
+```markdown
+---
+approval: plan
+setup: npm ci --prefix backend
+---
+```
+
+- **미선언 = 완전 무동작.** 프로세스 0개, `--allowedTools` 변화 0개.
+- 선언하면 implement 직전에 **1회** 실행한다. 성공은 `state.json`의
+  `setup.status = done`에 남으므로 resume해도 다시 돌지 않는다. 실패하면 slice가
+  실패한다 — 반쯤 깨진 환경 위에 implement를 태우면 모델 탓이 아닌 실패가 나온다.
+  전체 출력은 `.aidev/slices/<id>/setup.log`에 남는다.
+- 같은 명령이 implement/test의 `--allowedTools`에도 정확형(`Bash(npm ci --prefix
+  backend)`)과 접두형(`Bash(npm ci:*)`) 두 가지로 얹힌다.
+- **셸 없이 실행한다.** `&&`, `||`, `|`, `;`, `>`, `<`, 백틱, `$(`가 들어오면
+  거부한다(exit 2). 셸을 열면 front matter 한 줄이 임의 스크립트가 된다.
+  `setup:`을 값 없이 쓰는 것도 `approval:`과 같은 이유로 에러다.
 
 ### 승인 게이트
 
@@ -146,20 +248,46 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 프로젝트 안에 둔다.
 
 ```
-<대상repo>/.aidev/slices/20260815-doctor/
+<대상repo>/.aidev/slices/20260815-doctor/       ← 본진. 살아있는 상태
 ├── requirement.md   원본 사본
 ├── plan.md          plan 산출물 (승인 전 사람이 고쳐도 된다)
 ├── state.json       진행 상태의 유일한 원천 (단일 writer = pipeline 프로세스)
 ├── approvals/
 │   └── plan.md      사람이 쓰는 승인 파일
+├── setup.log        setup을 선언했을 때만
 └── runs.json        단계 → run_id (상세는 data/runs/로 연결)
 ```
+
+**살아있는 상태는 worktree가 아니라 본진에 둔다.** worktree를 폐기해도 slice
+이력은 남아야 하고, 동시에 `state.json`의 단일 writer 규약을 깨면 안 되기
+때문이다. 양쪽에 두면 writer가 둘이 된다.
+
+커밋에 연결 가능한 메타데이터는 **읽기 전용 투영**으로 따로 만든다. 매 단계 커밋
+직전에 pipeline이 worktree 안에 아래 세 파일을 쓰고 같이 커밋한다.
+
+```
+<worktree>/.aidev/history/20260815-doctor/     ← 브랜치. 커밋되는 스냅샷
+├── requirement.md   요구사항 원문 (첫 커밋부터)
+├── plan.md          승인 시점 기준 최신 plan
+└── slice.json       state.json + runs.json의 투영 (stage/승인/commit/토큰/비용)
+```
+
+경로가 `.aidev/slices/`와 **다른 것이 핵심이다.** 같은 경로였다면 `--merge` 때
+git이 *"untracked working tree file .aidev/slices/<id>/requirement.md would be
+overwritten by merge"* 로 죽는다 — 본진에 그 파일이 이미 untracked로 있기
+때문이다. `slice.json`은 pipeline만 쓰고 아무도 읽지 않는다. 도구는 언제나 본진의
+`state.json`을 읽으므로 authoritative source는 계속 하나다.
+(게이트 중에 사람이 `plan.md`를 고치면 그 단계 커밋에는 안 들어가지만, 매 커밋마다
+투영을 다시 쓰므로 **다음 단계 커밋에 수정본이 실린다.**)
 
 `state.json`은 live.json에서 검증된 규칙을 그대로 쓴다: 단일 writer,
 `.tmp` → `os.replace` atomic 쓰기, reader는 깨진 파일에 관용적. slice status는
 `running:<단계>` / `waiting_approval:<단계>` / `quota_wait` / `done` / `rejected` /
-`failed`, stage status는 `pending` / `running` / `done` / `failed`다. **stages의 키
-집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는 모르는 키를 그대로 표시해야 한다.
+`failed` / `merged` / `discarded`, stage status는 `pending` / `running` / `done` /
+`failed`다. **stages의 키 집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는
+모르는 키를 그대로 표시해야 한다. v0.3에서 `schema`가 2가 되고
+`workspace` / `commits` / `setup` 키가 늘었다. reader는 **1도 계속 받는다** —
+`workspace`가 없는 slice는 격리 없이 이어진다.
 
 Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 WinError 5로 죽는다
 (CPython의 `open()`이 delete 공유를 주지 않는다). 지연이 아니라 순간 충돌이므로
@@ -203,16 +331,32 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 
 ### 안전핀
 
-- 대상 repo가 dirty면 거부한다. 시작할 때만이 아니라 **이 slice가 아직 아무것도
-  고치지 않았다면 매 단계 직전에 다시 확인한다.** 승인 게이트는 몇 시간씩 열려
-  있을 수 있고, 그 사이 사람이 편집한 작업 위에 implement가 올라가면 안 된다.
-  일단 implement가 시작된 뒤로는 repo가 더러운 게 정상이므로 검사하지 않는다.
-  **v0.3 worktree 격리 전까지의 임시 제한**이다.
+- **본진 dirty 검사는 없앴다.** v0.2의 "임시 제한"을 v0.3이 대체한 결과다.
+  AI가 본진에 닿지 않으므로 본진이 깨끗한지는 더 이상 전제조건이 아니다.
+  대신 아래가 전제조건이다.
+
+  | v0.2 (임시 제한) | v0.3 (대체 조건) |
+  | --- | --- |
+  | 시작 시 본진이 dirty면 거부 | 본진 dirty는 **무관**. 대신 시작 시 ①git repo일 것 ②base ref가 커밋으로 해석될 것(빈 repo 거부) ③worktree 목표 경로가 비어 있을 것 ④브랜치 `slice/<id>`가 없을 것 |
+  | `mutated`가 false인 동안 매 단계 직전 재검사 | **readonly 단계(plan) 직전에만 worktree가 clean한지** 검사. plan의 사전/사후 비교에 깨끗한 기준선이 필요하고, 이전 실행의 위반이 다음 실행에서 세탁되면 안 되기 때문 |
+  | — | 변경 단계 직전엔 검사 없음. worktree는 AI의 샌드박스이고 더러운 게 정상이다 |
+  | — | `--merge` 할 때만 본진에 tracked 변경이 없을 것 + base가 체크아웃돼 있을 것. merge가 본진을 실제로 쓰는 유일한 순간이다 |
+
+  `--no-worktree`로 돌리면 격리가 없으므로 v0.2의 dirty 규칙이 그대로 살아난다.
+  v0.3 이전에 시작된 slice(`state.json`에 `workspace` 키가 없는 것)도 마찬가지로
+  본진에서 이어지고, 그렇다고 알려준다 — 지금 worktree를 새로 만들면 이미 찍힌
+  단계 커밋들과 다른 곳에서 나머지가 진행되기 때문이다.
+- **stage 커밋이 파일을 너무 많이 쓸어담으면 커밋하지 않고 slice를 실패시킨다**
+  (`--commit-file-limit`, 기본 2000). `.gitignore`가 부실한 프로젝트에서 setup이
+  만든 `node_modules`가 통째로 브랜치에 실려 merge로 본진을 오염시키는 것을 막는다.
+  단계의 작업물은 worktree에 그대로 있고, 사유에 상위 디렉터리별 개수를 찍는다.
 - plan 단계는 `readonly` 프로파일로 돌고, 끝난 뒤 `git status`로 **실제로** 변경이
   없었는지 사후 검증한다. 이때 `.aidev/` 전체를 면제하지 않는다 — 면제하면 plan이
   **자기 승인 파일(`approvals/plan.md`)을 위조**해도 못 잡는다. 파이프라인이
   단계 중에 직접 쓰는 `state.json` / `runs.json` / `.lock`만 제외한다.
   (untracked 디렉터리가 한 줄로 접히지 않도록 `git status -uall`을 쓴다)
+  격리 덕분에 위조 시도는 애초에 본진의 승인 파일에 닿지 못하지만, **worktree
+  안에서 `.aidev/`에 쓰는 행위 자체도 여전히 readonly 위반으로 잡힌다.** 둘 다다.
 - **slice 하나당 프로세스 하나.** `.aidev/slices/<id>/.lock`을 O_EXCL로 잡는다.
   같은 slice를 두 번 돌리면 두 번째는 거부된다 (exit 2). state.json의 단일 writer
   규약이 규약이 아니라 강제가 된다. 프로세스가 강제 종료돼 lock이 남으면 지우라고
@@ -229,9 +373,13 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   Bash(pytest)   Bash(pytest:*)   Bash(python -m pytest:*)
   ```
 
-  대상 repo의 `.claude/settings.json`은 **건드리지 않는다** — 파이프라인이 tracked
-  파일을 만들면 dirty 검사와 정면으로 충돌한다. 사람이 영속 규칙을 원하면
+  대상 repo의 `.claude/settings.json`은 **건드리지 않는다** — 사람 파일을 도구가
+  옮기지 않는다는 v0.2 규약 그대로다. 사람이 영속 규칙을 원하면
   `.claude/settings.local.json`을 직접 두면 되고, 위 규칙은 거기에 *더해진다*.
+  다만 **gitignore된 파일은 worktree에 따라오지 않으므로** 격리 실행에서는 본진의
+  `.claude/settings.local.json`이 보이지 않는다. 파이프라인은 `--allowedTools`를
+  매번 명시 전달하므로 파이프라인 동작에는 영향이 없지만, 그 파일에 의존하고
+  있었다면 달라지는 지점이다. (복사는 하지 않는다.)
   다른 명령이 필요하면 `--allow-tool 'Bash(npx vitest:*)'`처럼 추가한다.
   같은 목록이 프롬프트에도 그대로 들어가므로, 모델이 아는 명령과 실제로 허용된
   명령이 어긋날 수 없다.
@@ -244,6 +392,13 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--requirement` | 요구사항 .md (cwd → repo 순으로 찾는다) |
 | `--resume-slice` | 중단된 slice 이어가기 (id / prefix / `last`) |
 | `--list` | slice 목록과 상태 |
+| `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
+| `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
+| `--base` | slice가 갈라져 나올 브랜치 (기본: repo의 현재 HEAD, **main 아님**) |
+| `--worktree-root` | worktree 부모 디렉터리 (기본 `<repo>-slices`) |
+| `--no-worktree` | 격리 없이 repo 안에서 직접 실행 (v0.2 동작) |
+| `--setup-timeout` | front matter setup 명령의 제한 시간 (기본 1800초) |
+| `--commit-file-limit` | 단계 커밋이 건드릴 수 있는 최대 파일 수 (기본 2000) |
 | `--max-turns` | 단계별 상한 (기본 80) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
 | `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
@@ -252,9 +407,15 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--approval-timeout` | 승인 대기 포기 시간 (기본 0 = 무한 대기) |
 | `--quota-wait` | reset 시각을 못 읽을 때의 재시도 간격 (기본 900초) |
 | `--quota-max-retries` | 쿼터 재시도 상한 (기본 20) |
-| `--dry-run` | slice id / 게이트 / 경로만 출력하고 종료 |
+| `--dry-run` | slice id / base / 브랜치 / worktree / setup / 게이트 / 경로만 출력하고 종료 |
 
-종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부, `127` claude 없음.
+종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부, `4` merge 충돌,
+`127` claude 없음.
+
+**Windows 주의.** worktree 경로 + 깊은 `node_modules`는 `MAX_PATH`(260자)에 쉽게
+닿는다. `--worktree-root D:\wt`처럼 짧은 경로를 주거나
+`git config --global core.longpaths true`를 켠다. `--discard`가 실패하면 대개
+에디터·watcher·node가 worktree 안 파일을 잡고 있는 것이다 — 닫고 다시 실행한다.
 
 ## 다른 터미널에서 관찰 (v0.1.2)
 
@@ -499,6 +660,8 @@ data/
 pipeline이 만든 slice 상태는 여기가 아니라 **대상 repo의 `.aidev/slices/`** 에
 들어간다 (위 [Slice Pipeline](#slice-pipeline-v02) 참고). 도구의 `data/`는 run
 상세, 대상 repo의 `.aidev/`는 프로젝트를 따라다녀야 하는 진행 상태다.
+slice 브랜치에 커밋되는 읽기 전용 스냅샷은 그 둘과 또 다른
+`.aidev/history/<slice-id>/`다.
 
 SQLite 테이블(전체 실행 비교용): `runs`, `tool_calls`, `file_accesses`, `phases`.
 `runs`에는 실행별 exact token(input / cache creation / cache read / output /
@@ -517,8 +680,13 @@ request_id가 같은 중복 메시지 하나**를 섞어 보낸다 — 둘 다 �
 
 pipeline은 `tests/fake_pipeline_claude.py`를 쓴다. 환경변수로 단계별 응답과
 실패 모드(쿼터 / 일반 실패 / readonly 위반)를 지시할 수 있고, 호출마다 argv와
-프롬프트를 로그로 남겨서 **어느 단계에 어떤 플래그와 프롬프트가 갔는지**까지
-검증한다. 승인 대기·거부·중단 후 재개·쿼터 재시도가 전부 테스트에 있다.
+**cwd**와 프롬프트를 로그로 남겨서 어느 단계에 어떤 플래그와 프롬프트가 갔는지,
+그리고 **그 단계가 실제로 worktree에서 돌았는지**까지 검증한다. 승인 대기·거부·
+중단 후 재개·쿼터 재시도가 전부 테스트에 있다.
+
+격리 쪽 테스트는 진짜 git repo에서 돈다. `repo` fixture의 초기 브랜치 이름이
+`windows-handoff-20260808`이라서 **"base가 main이 아닌 브랜치에서 동작한다"를
+스위트 전체가 상시 증명한다.** git이 없으면 skip된다.
 
 ## Pluto IDE — 데스크톱 셸 (desktop/, v0.0.1)
 
@@ -548,9 +716,9 @@ npm run build      # typecheck + electron-vite build
 
 ```
 v0.1  Telemetry Runner            ← 완료
-v0.2  Slice Pipeline              ← 지금 여기
-v0.3  Workspace 격리               (worktree / 브랜치 / 단계별 커밋)
-v0.4  Epic → Slice Planner
+v0.2  Slice Pipeline              ← 완료
+v0.3  Workspace 격리               ← 완료 (worktree / 브랜치 / 단계별 커밋 / merge·discard)
+v0.4  Epic → Slice Planner        ← 지금 여기
 v0.5  Codebase Memory
 v0.6  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
 ```

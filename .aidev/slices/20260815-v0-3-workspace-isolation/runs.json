@@ -1,0 +1,93 @@
+{
+  "slice_id": "20260815-v0-3-workspace-isolation",
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260815-214925-v0-3-workspace-isolation-plan",
+      "run_dir": "C:\\Users\\minsa\\ai-dev-orchestrator\\data\\runs\\20260815-214925-v0-3-workspace-isolation-plan",
+      "status": "completed",
+      "exit_code": 0,
+      "session_id": "ecc9f332-f811-4dfc-bcdc-b604a9050b9b",
+      "turns": 26,
+      "cost_usd": 3.0273250000000003,
+      "tokens": {
+        "input": 406,
+        "cache_creation": 139358,
+        "cache_read": 1012430,
+        "output": 45020,
+        "billed_input": 1152194,
+        "peak_context": 153827
+      },
+      "quota": false,
+      "finished_at": "2026-08-15T12:59:55+00:00",
+      "summary": "# v0.3 Workspace 격리 — 구현 계획\n\n## 0. 현재 코드에서 확인한 사실 (추측 아님)\n\n| 사실 | 위치 |\n| --- | --- |\n| 파이프라인이 claude를 띄우는 cwd는 `RunConfig.repo` 하나뿐. `execute_stage`가 `cfg.repo`를 그대로 넘기고, `runner.execute`가 `cwd=str(cfg.repo)`로 Popen한다 | `aidev/pipeline.py:930-947`, `aidev/runner.py:157-167` |\n| slice 상태 디렉터리 위치는 `slices_root(repo) = <repo>/.aidev/slices` 하나로 고정 | `aidev/pipeline.py:234-236` |\n| git 호출은 `git_porcelain()` 딱 하나. `git status --porcelain -uall`만 쓴다. 커밋·브랜치·worktree 관련 코드는 **존재하지 않는다** | `aidev/pipeline.py:456-477` |\n| dirty 거부는 `ensure_clean_repo()`(시작 시)와 `run_pipeline` 루프의 `state[\"mutated\"]` 가드(매 단계 직전) 두 곳 | `aidev/pipeline.py:543-546`, `1259-1263` |\n| `dirty_reason()`의 메시지에 이미 \"temporary restriction until v0.3 workspace isolation\"이 박혀 있다 | `aidev/pipeline.py:526-539` |\n| plan 사후 검증은 `repo_changes(cfg.repo, include_slice_files=True)`의 before/after 문자열 비교 | `aidev/pipeline.py:1267`, `1197-1201` |\n| `LIVE_STATE_FILES` 예외는 **파이프라인이 stage 도중 직접 쓰는 파일**만 면제한다는 규약 | `aidev/pipeline.py:480-483` |\n| `allowed_tools_for(stage, cfg)`가 `--allowedTools`와 프롬프트 문구를 **같은 튜플**에서 만든다 → 여기 붙이면 둘 다 자동 반영 | `aidev/pipeline.py:825-839`, `766-769`, `788-801` |\n| `PipelineConfig`는 dataclass, `_config()`가 argparse에서 조립 | `aidev/pipeline.py:807-822`, `1511-1527` |\n| `_dispatch()`는 `--list` → `--resume-slice` → `--requirement` 순의 단순 분기 | `aidev/pipeline.py:1493-1508` |\n| `state.json` 스키마 상수 `STATE_SCHEMA = 1`, reader는 모르는 키에 관용적이어야 한다는 규약이 README에 명시 | `aidev/pipeline.py:87`, `README.md:158-162` |\n| 이 repo의 `.gitignore`에 `.aidev/`는 **없다**. `.claude/`는 통째로 무시된다 | `.gitignore:26` |\n| 본진의 `.aidev/slices/<id>/requirement.md`는 v0.2가 **untracked로** 만든다 (`start_slice` → `write_text_atomic`) | `aidev/pipeline.py:1574-1575` |\n| 테스트의 `repo` fixture는 git repo가 아니다. `git_repo()` 헬퍼는 일부 안전핀 테스트만 쓴다 | `tests/test_pipeline.py:32-37`, `550-563` |\n| 스텁은 호출마다 `argv` / `cwd` / `prompt`를 JSONL로 남긴다 → **cwd로 격리를 증명할 수 있다** | `tests/fake_pipeline_claude.py:109-125` |\n| 현재 실행 중인 이 slice(`20260815-v0-3-workspace-isola"
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260815-220208-v0-3-workspace-isolation-implement",
+      "run_dir": "C:\\Users\\minsa\\ai-dev-orchestrator\\data\\runs\\20260815-220208-v0-3-workspace-isolation-implement",
+      "status": "failed",
+      "exit_code": 1,
+      "session_id": "1aa5a75d-96b8-469b-b3d8-21fc7ee09b4b",
+      "turns": 81,
+      "cost_usd": 11.171010999999998,
+      "tokens": {
+        "input": 3370,
+        "cache_creation": 201180,
+        "cache_read": 13857672,
+        "output": 88541,
+        "billed_input": 14062222,
+        "peak_context": 222066
+      },
+      "quota": false,
+      "finished_at": "2026-08-15T13:29:39+00:00",
+      "summary": "I'll start by reading the current state of the code to ground the plan in reality.\n\nNow the front-matter `setup` handling, next to `resolve_gates`:\n\nNow `PipelineConfig` and `allowed_tools_for`:\n\nNow `execute_stage` and `run_stage` must use `cfg.cwd`:\n\nNow rewiring `run_pipeline`:\n\nNow the CLI surface: arguments, dispatch, `start_slice`, `resume_slice`, and the two new commands.\n\nNow `start_slice` — the workspace creation and requirement commit:\n\nNow `resume_slice` and the two new terminal commands:\n\nNow bump the version and update the tests:\n\nNow the test stub, then the test suite:\n\nNow the test fixtures and the tests the plan says to invert:\n\nNow the safety-pin section — the Done Criteria item replacing v0.2's temporary restriction:"
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260815-223715-v0-3-workspace-isolation-implement-2",
+      "run_dir": "C:\\Users\\minsa\\ai-dev-orchestrator\\data\\runs\\20260815-223715-v0-3-workspace-isolation-implement-2",
+      "status": "completed",
+      "exit_code": 0,
+      "session_id": "16a0fbc3-6394-407a-9b12-a7251e21cdfc",
+      "turns": 38,
+      "cost_usd": 2.132501,
+      "tokens": {
+        "input": 375,
+        "cache_creation": 70713,
+        "cache_read": 2109692,
+        "output": 14746,
+        "billed_input": 2180780,
+        "peak_context": 91598
+      },
+      "quota": false,
+      "finished_at": "2026-08-15T13:45:33+00:00",
+      "summary": "All 213 tests pass and the working tree is back to exactly the deliverable (my throwaway harness is gone).\n\n## RESULT\n\nA previous attempt had already implemented this slice; I verified it from scratch rather than assuming, then proved the flow end-to-end.\n\n### Files changed\n| File | Change |\n| --- | --- |\n| `aidev/workspace.py` | **new**, 516 lines — all git plumbing (worktree/branch/commit/merge/discard, leftover detection) |\n| `aidev/pipeline.py` | +777 lines — `cfg.cwd`, setup, stage commits, history mirror, `--merge`/`--discard`, workspace wiring |\n| `tests/test_workspace.py` | **new**, 336 lines / 30 tests |\n| `tests/test_pipeline.py` | +613 lines — all §6.3 scenarios; `repo` fixture is now a git repo on `windows-handoff-20260808` |\n| `tests/fake_pipeline_claude.py` | forge mode creates its approvals path; `AIDEV_FAKE_FILES` |\n| `README.md` | +212 lines — v0.3 section, dirty-restriction replacement table, setup, options, roadmap |\n| `aidev/__init__.py`, `pyproject.toml` | 0.3.0 |\n\n### Verification\n- **`pytest -q`: 213 passed** on Windows.\n- Beyond the suite, I ran a real slice end-to-end in a scratch repo (throwaway harness, since deleted): dry-run → worktree+branch → requirement first commit → plan → gate → implement → test → `--merge` → `--discard`. All 34 assertions passed, including: base resolved to `windows-handoff-20260808` while `main` existed and was never referenced; the checkout's HEAD, branch, and an untracked human file were untouched; an occupied worktree path was refused with its reason and **not** cleaned; discard left no git trace while the slice record survived.\n\n### Done Criteria\nSeven of eight met and verified. **\"조커 본진 실전 완주\" is not done** — it needs a human on the real repo; everything it depends on is verified in a scratch repo instead.\n\n### What the plan got wrong\n- **`HISTORY_DIR = \"history\"`, not `\".aidev/history\"`** — the code composes it with the existing `AIDEV_DIRNAME` constant instead of hardcoding the prefix. Same path, follows t"
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260815-224533-v0-3-workspace-isolation-test",
+      "run_dir": "C:\\Users\\minsa\\ai-dev-orchestrator\\data\\runs\\20260815-224533-v0-3-workspace-isolation-test",
+      "status": "completed",
+      "exit_code": 0,
+      "session_id": "f358042e-ebe9-4bb5-8bc9-4ad325e65708",
+      "turns": 3,
+      "cost_usd": 0.36637549999999997,
+      "tokens": {
+        "input": 6,
+        "cache_creation": 28931,
+        "cache_read": 129521,
+        "output": 491,
+        "billed_input": 158458,
+        "peak_context": 53080
+      },
+      "quota": false,
+      "finished_at": "2026-08-15T13:48:28+00:00",
+      "summary": "Command run (from `[tool.pytest.ini_options]` in `pyproject.toml`, `testpaths = [\"tests\"]`, `addopts = \"-q\"`):\n\n```\npytest\n```\n\nResult:\n\n- **213 passed, 0 failed, 0 errors, 0 skipped** in 161.03s (0:02:41)\n- No failures, no warnings section emitted.\n\nNotes:\n- Run on Windows (win32), working directory `C:\\Users\\minsa\\ai-dev-orchestrator`, branch `feat/v0.2-slice-pipeline`.\n- Nothing was skipped, so the git-dependent `tests/test_workspace.py` and the new worktree scenarios in `tests/test_pipeline.py` actually executed rather than being skipped for a missing `git`.\n- No code or test files were modified during this stage.\n\nTEST_RESULT: PASS"
+    }
+  ]
+}

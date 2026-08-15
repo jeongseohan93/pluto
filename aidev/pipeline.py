@@ -24,12 +24,23 @@ State lives with the project it describes, not with the tool:
 
 ``state.json`` inherits the rules live.json already proved: one writer, written
 through ``write_json_atomic``, read through ``read_json_tolerant``.
+
+v0.3 adds workspace isolation. The state above stays exactly where it is - in
+the user's checkout, written by this one process - but the *work* moves into a
+worktree the pipeline creates (``aidev.workspace``), on its own branch, with one
+commit per stage. So ``cfg.repo`` is the user's repository and ``cfg.cwd`` is
+where Claude actually runs, and those are only the same thing when isolation is
+off. A read-only projection of the slice is committed to ``.aidev/history/`` on
+the branch, which is a *different path* from ``.aidev/slices/`` on purpose:
+merging a branch that carried the same path would collide with the untracked
+copy already sitting in the user's checkout.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,7 +50,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, events as ev, reporter, runner
+from . import __version__, events as ev, reporter, runner, workspace
 from .storage import (
     Database,
     RunStore,
@@ -84,14 +95,33 @@ TEST_COMMAND_TOOLS: Tuple[str, ...] = (
 STAGES_WITH_TEST_COMMANDS: Tuple[str, ...] = ("implement", "test")
 
 AIDEV_DIRNAME = ".aidev"
-STATE_SCHEMA = 1
+# 2: state.json may carry "workspace", "commits" and "setup". A reader must keep
+# accepting 1 - a v0.2 slice has none of them and resumes in place.
+STATE_SCHEMA = 2
 STATE_FILENAME = "state.json"
+
+# The branch a slice owns, and the directory its own record is committed into.
+# HISTORY_DIR is deliberately not ``.aidev/slices``: that path already exists as
+# untracked state in the user's checkout, and a merge bringing the same path in
+# as tracked would be refused by git.
+SLICE_BRANCH_PREFIX = "slice/"
+HISTORY_DIR = "history"
+REQUIREMENT_STAGE = "requirement"
+COMMIT_MESSAGE = "slice({0}): {1}"
+
+# A stage commit that would sweep in this many files is a mistake, not a stage:
+# an unignored node_modules/ from a setup command would otherwise ride the merge
+# straight into the user's repository.
+MAX_COMMIT_FILES = 2000
+SETUP_TIMEOUT_S = 1800.0
 
 # Slice status values, all published through state.json.
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_REJECTED = "rejected"
 STATUS_QUOTA_WAIT = "quota_wait"
+STATUS_MERGED = "merged"
+STATUS_DISCARDED = "discarded"
 
 # Approval verdicts.
 PENDING = "pending"
@@ -104,6 +134,7 @@ EXIT_DONE = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_REJECTED = 3
+EXIT_CONFLICT = 4
 
 DEFAULT_MAX_TURNS = 80
 DEFAULT_POLL_INTERVAL = 3.0
@@ -185,6 +216,63 @@ def resolve_gates(fields: Dict[str, str], stages: Sequence[str] = STAGES) -> Tup
         if name not in gates:
             gates.append(name)
     return tuple(gate for gate in stages if gate in gates)
+
+
+# A front matter line is written by a human, but it is still a string that ends
+# up as an argv. No shell is opened for it, so anything that only means something
+# to a shell is refused rather than quietly taken literally.
+_SHELL_METACHARS = ("&&", "||", "|", ";", ">", "<", "`", "$(", "\n")
+
+
+def resolve_setup(fields: Dict[str, str]) -> Optional[str]:
+    """The one command this slice may run before implement. Absent means: run nothing.
+
+    ``setup:`` with no value is an error for the same reason ``approval:`` is: a
+    line that was meant to do something and silently does nothing is worse than
+    a stop.
+    """
+    raw = fields.get("setup")
+    if raw is None:
+        return None
+    command = raw.strip()
+    if not command:
+        raise PipelineError("setup: needs a command, or leave the line out entirely")
+    for token in _SHELL_METACHARS:
+        if token in command:
+            raise PipelineError(
+                "setup: '{0}' is not allowed - the command runs without a shell, so it "
+                "must be one plain command (found {1!r})".format(command, token)
+            )
+    if not split_command(command):
+        raise PipelineError("setup: could not read a command from {0!r}".format(command))
+    return command
+
+
+def split_command(command: str) -> List[str]:
+    """Split a declared command into argv. Windows keeps its backslashes."""
+    if os.name == "nt":
+        # POSIX mode would eat ``C:\path\to`` one backslash at a time.
+        tokens = shlex.split(command, posix=False)
+        return [token[1:-1] if len(token) > 1 and token[0] == token[-1] == '"' else token
+                for token in tokens]
+    return shlex.split(command)
+
+
+def setup_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
+    """Permission rules for a declared setup command - exact form and prefix form.
+
+    Both, for the same reason ``TEST_COMMAND_TOOLS`` holds both: whether a bare
+    command matches a ``:*`` rule depends on the CLI version.
+    """
+    if not command:
+        return ()
+    tokens = split_command(command)
+    if not tokens:
+        return ()
+    rules = ["Bash({0})".format(command.strip())]
+    prefix = " ".join(tokens[:2]) if len(tokens) > 1 else tokens[0]
+    rules.append("Bash({0}:*)".format(prefix))
+    return tuple(dict.fromkeys(rules))
 
 
 # ------------------------------------------------------------------ approvals
@@ -425,6 +513,8 @@ def new_state(
         "stage_order": list(stages),
         "stages": {name: {"status": "pending"} for name in stages},
         "quota": {"waiting": False, "resume_at": None, "retries": 0},
+        # stage -> commit sha on the slice branch; empty without isolation.
+        "commits": {},
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -456,25 +546,10 @@ def stage_order(state: Dict[str, Any]) -> List[str]:
 def git_porcelain(repo: Path) -> Optional[str]:
     """``git status --porcelain``, or ``None`` when this is not a usable git repo.
 
-    ``-uall`` matters: without it git collapses an untracked directory into a
-    single ``?? .aidev/`` line, which would hide a plan stage writing its own
-    approval file inside it.
+    Every git call the pipeline makes lives in ``aidev.workspace``; this is the
+    one the loop reaches for often enough to keep a name here.
     """
-    exe = shutil.which("git")
-    if exe is None:
-        return None
-    try:
-        proc = subprocess.run(
-            [exe, "status", "--porcelain", "-uall"],
-            cwd=str(repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return proc.stdout if proc.returncode == 0 else None
+    return workspace.porcelain(repo)
 
 
 # The only files the pipeline itself rewrites while a stage is running. Nothing
@@ -523,8 +598,9 @@ def repo_changes(repo: Path, include_slice_files: bool = False) -> Optional[str]
 def dirty_reason(repo: Path, quiet: bool = False) -> Optional[str]:
     """Why this repo is not safe to start work in, or ``None`` if it is.
 
-    Temporary restriction: v0.3 replaces it with worktree isolation, and inside
-    an isolated workspace this check goes away.
+    Only the un-isolated path (``--no-worktree``, or a legacy v0.2 slice) still
+    asks this. An isolated slice never edits the user's checkout, so its
+    cleanliness stopped being a precondition - see ``workspace_dirty_reason``.
     """
     status = repo_changes(repo)
     if status is None:
@@ -535,7 +611,7 @@ def dirty_reason(repo: Path, quiet: bool = False) -> Optional[str]:
         return None
     return (
         "repo has uncommitted changes; commit or stash first "
-        "(temporary restriction until v0.3 workspace isolation)\n"
+        "(--no-worktree edits your checkout directly, so it needs a clean one)\n"
         + "\n".join("    " + line for line in status.strip().splitlines()[:20])
     )
 
@@ -544,6 +620,24 @@ def ensure_clean_repo(repo: Path) -> None:
     reason = dirty_reason(repo)
     if reason is not None:
         raise PipelineError(reason)
+
+
+def workspace_dirty_reason(cwd: Path, stage: str) -> Optional[str]:
+    """The isolated replacement for the v0.2 dirty gate, and it asks about the worktree.
+
+    Only before a readonly stage. That stage is judged by comparing the working
+    tree before and after, which needs a clean baseline - and a violation left by
+    an earlier run must not be laundered by the next one. A mutating stage has no
+    such check: the worktree is the AI's sandbox, and its mess is the point.
+    """
+    status = repo_changes(cwd, include_slice_files=True)
+    if not status or not status.strip():
+        return None
+    return (
+        "workspace has uncommitted changes before readonly stage '{0}'; "
+        "commit or revert them in {1}\n".format(stage, cwd)
+        + "\n".join("    " + line for line in status.strip().splitlines()[:20])
+    )
 
 
 # ------------------------------------------------------------- quota handling
@@ -707,7 +801,8 @@ INSTRUCTIONS
   and say so in your final message.
 - Change only what the requirement needs. Match the conventions of every file
   you touch.
-- Do not commit, do not branch, do not touch git state.
+{workspace}- Do not commit, do not branch, do not touch git state. The pipeline commits
+  each stage for you when it finishes.
 {allowed}
 Finish with a short summary: files changed and anything the plan got wrong.
 """
@@ -727,7 +822,7 @@ PLAN THAT WAS IMPLEMENTED
 INSTRUCTIONS
 - Run this project's own test suite the way the project runs it. Find the
   command from the project's config rather than assuming one.
-{allowed}- Run the test command as ONE plain command. Do not chain it with '&&' or
+{workspace}{allowed}- Run the test command as ONE plain command. Do not chain it with '&&' or
   'cd x && ...': a chained command is a different command and may not be
   approved.
 - If a command is refused for permission reasons, say so verbatim and report
@@ -768,6 +863,14 @@ _ALLOWED_NOTE = """\
 {rules}
 """
 
+# Only rendered when the slice is isolated, so the un-isolated path reads exactly
+# as it did in v0.2.
+_WORKSPACE_NOTE = """\
+- You are in an isolated git worktree on branch {branch}, created from {base}.
+  It is yours alone: the user's checkout is somewhere else and you must not go
+  looking for it.
+"""
+
 
 _VERDICT_RE = re.compile(r"^[^\S\n]*TEST_RESULT:[^\S\n]*(PASS|FAIL)\b", re.IGNORECASE | re.MULTILINE)
 
@@ -786,7 +889,12 @@ def parse_test_verdict(text: str) -> str:
 
 
 def build_prompt(
-    stage: str, requirement: str, plan: str = "", allowed: Sequence[str] = ()
+    stage: str,
+    requirement: str,
+    plan: str = "",
+    allowed: Sequence[str] = (),
+    branch: Optional[str] = None,
+    base: Optional[str] = None,
 ) -> str:
     if stage == "plan":
         return _PLAN_PROMPT.format(requirement=requirement.strip())
@@ -794,10 +902,14 @@ def build_prompt(
     note = ""
     if allowed:
         note = _ALLOWED_NOTE.format(rules="\n".join("    " + rule for rule in allowed))
+    where = ""
+    if branch:
+        where = _WORKSPACE_NOTE.format(branch=branch, base=base or "the repository's HEAD")
     return template.format(
         requirement=requirement.strip(),
         plan=(plan.strip() or "(no plan recorded)"),
         allowed=note,
+        workspace=where,
     )
 
 
@@ -820,6 +932,16 @@ class PipelineConfig:
     quota_max_retries: int = DEFAULT_QUOTA_MAX_RETRIES
     allow_tools: List[str] = field(default_factory=list)
     session_reset_after: int = DEFAULT_SESSION_RESET_AFTER
+    # None = in-place, which is v0.2's behaviour: a legacy slice or --no-worktree.
+    workspace: Optional[workspace.Workspace] = None
+    setup_command: Optional[str] = None
+    setup_timeout: float = SETUP_TIMEOUT_S
+    commit_file_limit: int = MAX_COMMIT_FILES
+
+    @property
+    def cwd(self) -> Path:
+        """Where Claude actually runs: the worktree when isolated, the repo otherwise."""
+        return self.workspace.path if self.workspace is not None else self.repo
 
 
 def allowed_tools_for(stage: str, cfg: PipelineConfig) -> Tuple[str, ...]:
@@ -832,7 +954,8 @@ def allowed_tools_for(stage: str, cfg: PipelineConfig) -> Tuple[str, ...]:
     if stage not in STAGES_WITH_TEST_COMMANDS:
         return ()
     rules: List[str] = []
-    for rule in tuple(TEST_COMMAND_TOOLS) + tuple(cfg.allow_tools):
+    declared = tuple(TEST_COMMAND_TOOLS) + setup_tool_rules(cfg.setup_command)
+    for rule in declared + tuple(cfg.allow_tools):
         rule = str(rule).strip()
         if rule and rule not in rules:
             rules.append(rule)
@@ -928,7 +1051,9 @@ def execute_stage(
     run_id = stage_run_id(cfg.data_dir / "runs", rec.slug, stage, attempt)
     task = "{0}-{1}".format(rec.slug, stage)
     run_cfg = runner.RunConfig(
-        repo=cfg.repo,
+        # The worktree when isolated. ``project`` stays the real repository name
+        # so `aidev stats` keeps aggregating a project instead of one slice.
+        repo=cfg.cwd,
         prompt_path=rec.requirement_path,
         prompt=prompt,
         phase=stage,
@@ -949,7 +1074,7 @@ def execute_stage(
         run_id=run_id,
         project=cfg.repo.name,
         phase=stage,
-        repo=str(cfg.repo),
+        repo=str(cfg.cwd),
         prompt_path=str(rec.requirement_path),
         task=task,
         safety_profile=run_cfg.safety_profile,
@@ -1051,7 +1176,14 @@ def run_stage(
         entry["attempts"] = attempt
         set_status(rec, state, "running:{0}".format(stage))
 
-        prompt = build_prompt(stage, requirement, rec.read_plan(), allowed=allowed)
+        prompt = build_prompt(
+            stage,
+            requirement,
+            rec.read_plan(),
+            allowed=allowed,
+            branch=cfg.workspace.branch if cfg.workspace else None,
+            base=cfg.workspace.base if cfg.workspace else None,
+        )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
         elif fresh:
@@ -1124,6 +1256,184 @@ def record_run(rec: SliceRecord, run: StageRun) -> None:
     )
 
 
+# ------------------------------------------------------------------- setup
+
+# A fresh worktree has no node_modules/, no venv, no build output: git only
+# carries what is tracked. The pipeline still runs nothing of its own accord -
+# the requirement has to say what, once, in its front matter.
+
+
+def run_setup(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> Optional[str]:
+    """Run the declared setup command once. Returns a reason to fail the slice, or None."""
+    command = cfg.setup_command
+    if not command:
+        return None  # nothing declared: nothing runs, and nothing is granted
+    entry = state.get("setup")
+    if isinstance(entry, dict) and entry.get("status") == "done" and entry.get("command") == command:
+        say("setup already ran for this slice - not repeating it")
+        return None
+
+    argv = split_command(command)
+    exe = shutil.which(argv[0], path=os.environ.get("PATH"))
+    if exe is None:
+        return "setup command not found on PATH: {0}".format(argv[0])
+    log_path = rec.dir / "setup.log"
+    say("setup: {0}".format(command))
+    try:
+        proc = subprocess.run(
+            [exe] + argv[1:],
+            cwd=str(cfg.cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=cfg.setup_timeout,
+        )
+        output, code = proc.stdout or "", proc.returncode
+    except subprocess.TimeoutExpired:
+        output, code = "timed out after {0}s".format(cfg.setup_timeout), None
+    except OSError as exc:
+        output, code = str(exc), None
+
+    write_text_atomic(log_path, output)
+    state["setup"] = {
+        "command": command,
+        "status": "done" if code == 0 else "failed",
+        "exit_code": code,
+        "ran_at": now_iso(),
+        "log": str(log_path),
+    }
+    rec.write_state(state)
+    if code == 0:
+        return None
+    # Implementing on top of a half-installed environment produces failures that
+    # look like the model's and are not.
+    tail = "\n".join("    " + line for line in output.strip().splitlines()[-20:])
+    return "setup command failed (exit {0}): {1}\n{2}\n    full log: {3}".format(
+        code, command, tail, log_path
+    )
+
+
+# -------------------------------------------------------- branch bookkeeping
+
+
+def history_dir(cfg: PipelineConfig, slice_id: str) -> Path:
+    return Path(cfg.cwd) / AIDEV_DIRNAME / HISTORY_DIR / slice_id
+
+
+def history_snapshot(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
+    """What the commit carries about the slice it belongs to.
+
+    A projection, not a second source of truth: nothing reads it back. state.json
+    in the user's checkout stays the one authority, with one writer.
+    """
+    stages = {}
+    for name in stage_order(state):
+        entry = stage_entry(state, name)
+        stages[name] = {
+            key: entry.get(key)
+            for key in ("status", "approval", "approval_reason", "run_id", "verdict", "attempts")
+            if entry.get(key) is not None
+        }
+        commit = (state.get("commits") or {}).get(name)
+        if commit:
+            stages[name]["commit"] = commit
+    runs = [
+        {
+            key: entry.get(key)
+            for key in ("stage", "attempt", "run_id", "status", "turns", "tokens", "cost_usd")
+        }
+        for entry in rec.runs()
+    ]
+    ws = state.get("workspace") or {}
+    return {
+        "slice_id": rec.slice_id,
+        "status": state.get("status"),
+        "branch": ws.get("branch"),
+        "base": ws.get("base"),
+        "base_commit": ws.get("base_commit"),
+        "gates": state.get("gates"),
+        "setup": state.get("setup"),
+        "stages": stages,
+        "runs": runs,
+        "updated_at": now_iso(),
+    }
+
+
+def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> Path:
+    """Project the slice's own record into the worktree, so the commit carries it.
+
+    Rewritten before every stage commit, which is also how a plan.md edited by a
+    human during the gate reaches the branch: the next stage commit carries it.
+    """
+    directory = history_dir(cfg, rec.slice_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        write_text_atomic(directory / "requirement.md", rec.requirement_path.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    plan = rec.read_plan()
+    if plan.strip():
+        write_text_atomic(directory / "plan.md", plan)
+    write_json_atomic(directory / "slice.json", history_snapshot(rec, state))
+    return directory
+
+
+def _pending_files(cwd: Path) -> List[str]:
+    status = git_porcelain(cwd) or ""
+    return [_porcelain_path(line) for line in status.splitlines() if line.strip()]
+
+
+def _explosion_reason(cfg: PipelineConfig, stage: str, paths: Sequence[str]) -> str:
+    counts: Dict[str, int] = {}
+    for path in paths:
+        counts[path.split("/", 1)[0]] = counts.get(path.split("/", 1)[0], 0) + 1
+    top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    return (
+        "stage '{0}' left {1} changed files, over the --commit-file-limit of {2}, so "
+        "nothing was committed.\n"
+        "    The work is still in {3} - this usually means a setup command produced "
+        "output the project does not .gitignore.\n".format(
+            stage, len(paths), cfg.commit_file_limit, cfg.cwd
+        )
+        + "\n".join("    {0:<40}{1}".format(name, count) for name, count in top)
+    )
+
+
+def commit_stage(
+    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any], stage: str
+) -> Optional[str]:
+    """One commit per stage, made by the pipeline - never by the agent.
+
+    Returns a reason to fail the slice, or None. A failed stage is not committed:
+    whatever it left behind rides along with the next stage that succeeds, where
+    a human sees it in one diff at merge time.
+    """
+    if cfg.workspace is None:
+        return None
+    mirror_history(cfg, rec, state)
+    pending = _pending_files(cfg.cwd)
+    if cfg.commit_file_limit and len(pending) > cfg.commit_file_limit:
+        return _explosion_reason(cfg, stage, pending)
+    history = "{0}/{1}/{2}".format(AIDEV_DIRNAME, HISTORY_DIR, rec.slice_id)
+    try:
+        sha = workspace.commit_all(
+            cfg.cwd, COMMIT_MESSAGE.format(rec.slice_id, stage), force_paths=(history,)
+        )
+    except workspace.GitError as exc:
+        return "could not commit stage '{0}': {1}".format(stage, exc)
+    commits = state.setdefault("commits", {})
+    if isinstance(commits, dict) and sha:
+        commits[stage] = sha
+    if sha:
+        # 'requirement' is a commit, not a stage: it must not appear in stages{}.
+        if stage in stage_order(state):
+            stage_entry(state, stage)["commit"] = sha
+        say("committed {0} ({1})".format(COMMIT_MESSAGE.format(rec.slice_id, stage), sha[:7]))
+    return None
+
+
 # ---------------------------------------------------------------- the loop
 
 
@@ -1194,7 +1504,9 @@ def finish_stage(
             return "plan stage produced no text to save as plan.md"
         # Verified before plan.md is written, so the comparison sees only what
         # the run itself did - including any approval file it tried to forge.
-        after = repo_changes(cfg.repo, include_slice_files=True)
+        # Isolation keeps a forgery away from the user's checkout; this keeps it
+        # from counting as a legal move inside the worktree either.
+        after = repo_changes(cfg.cwd, include_slice_files=True)
         if before is not None and after is not None and before != after:
             return "plan stage changed the repository despite the readonly profile:\n" + _diff_lines(
                 before, after
@@ -1253,20 +1565,32 @@ def run_pipeline(
     for stage in stage_order(state):
         entry = stage_entry(state, stage)
         if entry.get("status") != "done":
-            # Until this slice has edited anything, the tree must still be clean:
-            # a gate can be open for hours, and a resumed slice may be picking up
-            # after a readonly violation. Once a stage has edited, its own work is
-            # what makes the tree dirty, so the question stops making sense.
-            if not state.get("mutated"):
+            readonly = STAGE_POLICY.get(stage, {}).get("safety_profile") == "readonly"
+            if cfg.workspace is not None:
+                # Isolated: the user's checkout is not this slice's business, so
+                # only the worktree is asked, and only where a clean baseline is
+                # actually needed.
+                if readonly:
+                    reason = workspace_dirty_reason(cfg.cwd, stage)
+                    if reason is not None:
+                        return fail_slice(rec, state, reason)
+            elif not state.get("mutated"):
+                # In place: until this slice has edited anything, the tree must
+                # still be clean. A gate can be open for hours, and a resumed
+                # slice may be picking up after a readonly violation. Once a
+                # stage has edited, its own work is what makes the tree dirty.
                 reason = dirty_reason(cfg.repo, quiet=True)
                 if reason is not None:
                     return fail_slice(rec, state, "before stage '{0}': {1}".format(stage, reason))
 
-            readonly = STAGE_POLICY.get(stage, {}).get("safety_profile") == "readonly"
             # Only a readonly stage is verified against the working tree afterwards.
-            before = repo_changes(cfg.repo, include_slice_files=True) if readonly else None
+            before = repo_changes(cfg.cwd, include_slice_files=True) if readonly else None
             if not readonly:
                 state["mutated"] = True
+            if stage == "implement":
+                reason = run_setup(cfg, rec, state)
+                if reason is not None:
+                    return fail_slice(rec, state, reason)
             try:
                 run = run_stage(cfg, rec, state, stage, requirement)
             except PipelineError as exc:
@@ -1296,6 +1620,11 @@ def run_pipeline(
                 # The run itself succeeded but the stage did not - a TEST_RESULT:
                 # FAIL verdict lands here, and that is a session conclusion too.
                 note_stage_failure(state, stage)
+                return fail_slice(rec, state, reason)
+            reason = commit_stage(cfg, rec, state, stage)
+            if reason is not None:
+                # The stage itself succeeded and stays done; what failed is the
+                # snapshot, and a human has to say what belongs on the branch.
                 return fail_slice(rec, state, reason)
             rec.write_state(state)
 
@@ -1400,7 +1729,43 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
         lines.append("Tests     {0}{1}".format(str(verdict).upper(), note.get(verdict, "")))
     if state.get("reason"):
         lines.append("Reason    {0}".format(state["reason"]))
+    lines.extend(_workspace_lines(state))
     return "\n".join(lines)
+
+
+def _workspace_lines(state: Dict[str, Any]) -> List[str]:
+    """Where the work landed and what to do with it. Silent without isolation."""
+    ws = workspace.Workspace.from_dict(state.get("workspace"))
+    if ws is None:
+        return []
+    lines = ["", "Workspace {0}".format(ws.path)]
+    lines.append(
+        "Branch    {0}  (base: {1} @ {2})".format(
+            ws.branch, ws.base or "detached HEAD", (ws.base_commit or "?")[:7]
+        )
+    )
+    commits = state.get("commits")
+    if isinstance(commits, dict) and commits:
+        order = [REQUIREMENT_STAGE] + stage_order(state)
+        shown = [
+            "{0} {1}".format(name, str(commits[name])[:7]) for name in order if commits.get(name)
+        ]
+        if shown:
+            lines.append("Commits   {0}".format("  ".join(shown)))
+    setup = state.get("setup")
+    if isinstance(setup, dict) and setup.get("command"):
+        lines.append(
+            "Setup     {0}  ({1}, exit {2})".format(
+                setup["command"], setup.get("status", "?"), setup.get("exit_code")
+            )
+        )
+    slice_id = state.get("slice_id", "?")
+    repo = state.get("repo", "<repo>")
+    if state.get("status") == STATUS_DONE:
+        lines.append("")
+        lines.append("Next      aidev pipeline --repo {0} --merge {1}".format(repo, slice_id))
+        lines.append("          aidev pipeline --repo {0} --discard {1}".format(repo, slice_id))
+    return lines
 
 
 def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
@@ -1438,6 +1803,42 @@ def add_parser(sub: Any) -> Any:
     )
     cmd.add_argument(
         "--list", action="store_true", dest="list_slices", help="list slices of --repo and exit"
+    )
+    cmd.add_argument("--merge", default=None, metavar="SLICE", help="merge a finished slice into its base")
+    cmd.add_argument(
+        "--discard", default=None, metavar="SLICE", help="remove a slice's worktree and branch"
+    )
+    cmd.add_argument(
+        "--base",
+        default=None,
+        metavar="BRANCH",
+        help="branch the slice starts from (default: the repo's current HEAD, never 'main')",
+    )
+    cmd.add_argument(
+        "--worktree-root",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="where slice worktrees live (default: <repo>-slices)",
+    )
+    cmd.add_argument(
+        "--no-worktree",
+        action="store_true",
+        help="v0.2 behaviour: run in --repo itself, with no isolation",
+    )
+    cmd.add_argument(
+        "--setup-timeout",
+        type=float,
+        default=SETUP_TIMEOUT_S,
+        metavar="S",
+        help="seconds the front matter's setup command may take (default 1800)",
+    )
+    cmd.add_argument(
+        "--commit-file-limit",
+        type=int,
+        default=MAX_COMMIT_FILES,
+        metavar="N",
+        help="refuse a stage commit touching more files than this (default 2000)",
     )
     cmd.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help="per stage (default 80)")
     cmd.add_argument("--model", default=None)
@@ -1499,8 +1900,23 @@ def _dispatch(args: Any) -> int:
     # Whether the repo was chosen or merely defaulted to, so an empty answer can
     # say which of the two it is.
     repo_given = args.repo is not None
+    # Each of these is a whole command, not a modifier of another one.
+    modes = (
+        ("list_slices", "--list"),
+        ("merge", "--merge"),
+        ("discard", "--discard"),
+        ("resume_slice", "--resume-slice"),
+        ("requirement", "--requirement"),
+    )
+    chosen = [flag for attr, flag in modes if getattr(args, attr, None)]
+    if len(chosen) > 1:
+        raise PipelineError("these cannot be combined: {0}".format(", ".join(chosen)))
     if args.list_slices:
         return list_slices(repo, repo_given)
+    if getattr(args, "merge", None):
+        return merge_slice(args, repo, repo_given)
+    if getattr(args, "discard", None):
+        return discard_slice(args, repo, repo_given)
     if args.resume_slice:
         return resume_slice(args, repo, data_dir, repo_given)
     if args.requirement:
@@ -1508,7 +1924,13 @@ def _dispatch(args: Any) -> int:
     raise PipelineError("one of --requirement, --resume-slice or --list is required")
 
 
-def _config(args: Any, repo: Path, data_dir: Path) -> PipelineConfig:
+def _config(
+    args: Any,
+    repo: Path,
+    data_dir: Path,
+    ws: Optional[workspace.Workspace] = None,
+    setup_command: Optional[str] = None,
+) -> PipelineConfig:
     return PipelineConfig(
         repo=repo,
         data_dir=data_dir,
@@ -1524,6 +1946,10 @@ def _config(args: Any, repo: Path, data_dir: Path) -> PipelineConfig:
         quota_max_retries=args.quota_max_retries,
         allow_tools=list(getattr(args, "allow_tools", None) or []),
         session_reset_after=getattr(args, "session_reset_after", DEFAULT_SESSION_RESET_AFTER),
+        workspace=ws,
+        setup_command=setup_command,
+        setup_timeout=getattr(args, "setup_timeout", SETUP_TIMEOUT_S),
+        commit_file_limit=getattr(args, "commit_file_limit", MAX_COMMIT_FILES),
     )
 
 
@@ -1547,6 +1973,7 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     if not body.strip():
         raise PipelineError("requirement has front matter but no body: {0}".format(source))
     gates = resolve_gates(fields)
+    setup_command = resolve_setup(fields)
 
     root = slices_root(repo)
     unfinished = [
@@ -1556,17 +1983,32 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     ]
     slice_id = make_slice_id(source.stem, root)
     rec = SliceRecord(root, slice_id)
+    isolate = not getattr(args, "no_worktree", False)
+    plan = _plan_workspace(args, repo, slice_id) if isolate else None
 
     if args.dry_run:
         print("slice     {0}".format(slice_id))
         print("repo      {0}".format(repo))
+        if plan is not None:
+            print("base      {0} @ {1}".format(plan.base or "detached HEAD", plan.base_commit[:7]))
+            print("branch    {0}".format(plan.branch))
+            print("worktree  {0}".format(plan.path))
+            for reason in workspace.blocking_reasons(repo, plan):
+                print("BLOCKED   {0}".format(reason))
+        else:
+            print("worktree  (none: --no-worktree runs in the repo itself)")
+        print("setup     {0}".format(setup_command or "(none declared: nothing runs)"))
         print("stages    {0}".format(" -> ".join(STAGES)))
         print("gates     {0}".format(", ".join(gates) or "(none: fully unattended)"))
         print("slice dir {0}".format(rec.dir))
         print("run dir   {0}".format(data_dir / "runs"))
         return EXIT_DONE
 
-    ensure_clean_repo(repo)
+    if plan is None:
+        say("warning: --no-worktree - the AI will edit {0} directly".format(repo))
+        ensure_clean_repo(repo)
+    else:
+        _refuse_blocked_workspace(repo, plan)
     if unfinished:
         say("note: unfinished slice(s) here: {0}".format(", ".join(unfinished)))
         say("      use --resume-slice <id> to continue one instead of starting over")
@@ -1574,12 +2016,100 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     rec.ensure()
     write_text_atomic(rec.requirement_path, text)
     state = new_state(slice_id, repo, gates)
-    rec.write_state(state)
+    if setup_command:
+        state["setup"] = {"command": setup_command, "status": "pending"}
     say("slice {0}".format(slice_id))
     say("  dir   {0}".format(rec.dir))
     say("  gates {0}".format(", ".join(gates) or "(none: fully unattended)"))
 
-    return _finish(_config(args, repo, data_dir), rec, state, body)
+    ws = None
+    if plan is not None:
+        ws = _open_workspace(repo, plan, rec, state)
+    rec.write_state(state)
+
+    return _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+
+
+def _plan_workspace(args: Any, repo: Path, slice_id: str) -> workspace.WorkspacePlan:
+    """Work out where this slice would live, refusing a repo that cannot host one."""
+    if not workspace.git_available():
+        raise PipelineError(
+            "git is not on PATH, so no worktree can be created.\n"
+            "    Install git, or pass --no-worktree to run in {0} itself.".format(repo)
+        )
+    if not workspace.is_git_repo(repo):
+        raise PipelineError(
+            "{0} is not a git repository, so no worktree can be created.\n"
+            "    Run 'git init' there, or pass --no-worktree to run in it directly.".format(repo)
+        )
+    try:
+        return workspace.plan_workspace(
+            repo,
+            slice_id,
+            SLICE_BRANCH_PREFIX + slice_id,
+            base=getattr(args, "base", None),
+            root=getattr(args, "worktree_root", None),
+        )
+    except workspace.GitError as exc:
+        raise PipelineError(str(exc))
+
+
+def _refuse_blocked_workspace(repo: Path, plan: workspace.WorkspacePlan) -> None:
+    """Leftovers are reported, never reused and never cleaned - cleaning is the human's."""
+    reasons = workspace.blocking_reasons(repo, plan)
+    if reasons:
+        raise PipelineError(
+            "cannot create the workspace for this slice:\n"
+            + "\n".join("  - " + reason for reason in reasons)
+        )
+    stale = workspace.stale_worktrees(repo)
+    if stale:
+        say("note: {0} stale worktree(s) registered in this repo - left alone:".format(len(stale)))
+        for entry in stale[:12]:
+            say("      {0}  ({1})".format(entry.path, entry.prunable or "locked"))
+        say("      aidev never prunes. If they are really gone: git worktree prune")
+
+
+def _open_workspace(
+    repo: Path, plan: workspace.WorkspacePlan, rec: SliceRecord, state: Dict[str, Any]
+) -> workspace.Workspace:
+    """Create the worktree and make the requirement its first commit.
+
+    The requirement being a commit rather than a working-tree file is what ends
+    v0.2's circle, where copying the requirement in was itself what made the repo
+    dirty enough to refuse the next stage.
+    """
+    injected = workspace.identity_args(repo)
+    if injected:
+        say("note: git has no user.name/user.email here - slice commits use aidev <aidev@localhost>")
+    try:
+        ws = workspace.create(repo, plan)
+    except workspace.GitError as exc:
+        raise PipelineError(str(exc))
+    say("  work  {0}  (branch {1} from {2})".format(ws.path, ws.branch, ws.base or "detached HEAD"))
+    state["workspace"] = ws.to_dict()
+
+    cfg = PipelineConfig(repo=repo, data_dir=Path("."), workspace=ws)
+    try:
+        reason = commit_stage(cfg, rec, state, REQUIREMENT_STAGE)
+        if reason is not None:
+            raise PipelineError(reason)
+    except BaseException:
+        # We made this worktree seconds ago, so undoing it is not the leftover
+        # cleanup we refuse to do; leaving half a workspace behind would be worse.
+        _rollback_workspace(repo, ws)
+        state.pop("workspace", None)
+        raise
+    return ws
+
+
+def _rollback_workspace(repo: Path, ws: workspace.Workspace) -> None:
+    try:
+        workspace.destroy(repo, ws)
+    except workspace.GitError as exc:
+        say("could not undo the half-made workspace: {0}".format(exc))
+        say("  worktree {0}".format(ws.path))
+        say("  branch   {0}".format(ws.branch))
 
 
 def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
@@ -1593,9 +2123,17 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
         print(render_summary(state, rec.runs()))
         return EXIT_DONE
 
-    _, body = parse_front_matter(rec.requirement_path.read_text(encoding="utf-8"))
+    if status in (STATUS_MERGED, STATUS_DISCARDED):
+        raise PipelineError(
+            "slice {0} is {1}; there is nothing left to resume".format(rec.slice_id, status)
+        )
+
+    fields, body = parse_front_matter(rec.requirement_path.read_text(encoding="utf-8"))
+    setup_command = resolve_setup(fields)
+    ws = workspace.Workspace.from_dict(state.get("workspace"))
     if args.dry_run:
         print("slice   {0}  ({1})".format(rec.slice_id, status))
+        print("work    {0}".format(ws.path if ws else "{0} (no worktree)".format(repo)))
         print("stages  {0}".format(
             ", ".join(
                 "{0}={1}".format(name, stage_entry(state, name).get("status", "?"))
@@ -1604,12 +2142,163 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
         ))
         return EXIT_DONE
 
+    if ws is None:
+        # A slice started before v0.3 has no workspace key, and re-creating one
+        # now would put its remaining stages somewhere its earlier ones never were.
+        say("note: this slice has no workspace - continuing in {0} (v0.2 behaviour)".format(repo))
+    else:
+        broken = workspace.verify(repo, ws)
+        if broken is not None:
+            raise PipelineError(
+                "{0}\n"
+                "    aidev does not re-create it: the stage commits already on '{1}' were made "
+                "there.\n"
+                "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
+                    broken, ws.branch, repo, rec.slice_id
+                )
+            )
+
     say("resuming slice {0} (was {1})".format(rec.slice_id, status))
     if status == STATUS_REJECTED:
         # The approval file is the record: a rejection stands until a human edits it.
         say("this slice was rejected: {0}".format(state.get("reason", "")))
     state.setdefault("quota", {"waiting": False, "resume_at": None, "retries": 0})
-    return _finish(_config(args, repo, data_dir), rec, state, body)
+    return _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+
+
+# ------------------------------------------------------- merge and discard
+#
+# The final gate. Approval is a merge and rejection is a discard, and both are a
+# human's decision typed as a command - the loop never reaches either by itself.
+
+
+def _finished_workspace(
+    repo: Path, slice_id: str, repo_given: bool
+) -> Tuple[SliceRecord, Dict[str, Any], workspace.Workspace]:
+    rec = find_slice(repo, slice_id, repo_given)
+    state = rec.read_state()
+    if state is None:
+        raise PipelineError("no readable state.json in {0}".format(rec.dir))
+    ws = workspace.Workspace.from_dict(state.get("workspace"))
+    if ws is None:
+        raise PipelineError(
+            "slice {0} has no workspace - it ran in {1} itself, so there is no branch "
+            "to merge or discard".format(rec.slice_id, repo)
+        )
+    return rec, state, ws
+
+
+def merge_slice(args: Any, repo: Path, repo_given: bool = True) -> int:
+    """Land a finished slice on its base branch. A conflict stops, it is never resolved."""
+    rec, state, ws = _finished_workspace(repo, args.merge, repo_given)
+    status = str(state.get("status", ""))
+    if status != STATUS_DONE:
+        raise PipelineError(
+            "slice {0} is '{1}', not '{2}' - finish or discard it before merging".format(
+                rec.slice_id, status or "(unknown)", STATUS_DONE
+            )
+        )
+    if ws.base is None:
+        raise PipelineError(
+            "slice {0} started from a detached HEAD, so there is no base branch to merge "
+            "into. Merge '{1}' wherever you want it yourself.".format(rec.slice_id, ws.branch)
+        )
+    broken = workspace.verify(repo, ws)
+    if broken is not None:
+        raise PipelineError(broken)
+    if not workspace.is_clean(ws.path):
+        raise PipelineError(
+            "the worktree still has uncommitted work: {0}\n"
+            "    aidev will not throw it away by merging without it.".format(ws.path)
+        )
+    on = workspace.current_branch(repo)
+    if on != ws.base:
+        raise PipelineError(
+            "{0} is on '{1}', not on the base '{2}'.\n"
+            "    aidev does not switch your branches: git -C {0} checkout {2}".format(
+                repo, on or "a detached HEAD", ws.base
+            )
+        )
+    if not workspace.is_clean(repo, tracked_only=True):
+        raise PipelineError(
+            "{0} has uncommitted changes to tracked files; commit or stash them first.\n"
+            "    This is the one moment aidev writes to your checkout.".format(repo)
+        )
+
+    with SliceLock(rec):
+        result = workspace.merge_branch(
+            repo, ws.branch, COMMIT_MESSAGE.format(rec.slice_id, "merge")
+        )
+        if not result.ok:
+            state["merge"] = {
+                "at": now_iso(),
+                "status": "conflict",
+                "conflicts": result.conflicts,
+                "branch": ws.branch,
+                "base": ws.base,
+            }
+            rec.write_state(state)
+            say("MERGE CONFLICT - {0} is untouched, the merge was aborted".format(repo))
+            for path in result.conflicts[:20] or ["(git named no paths)"]:
+                say("  {0}".format(path))
+            if result.detail:
+                say("  {0}".format(result.detail.splitlines()[0]))
+            say("resolve it yourself:")
+            say("  git -C {0} merge --no-ff {1}".format(repo, ws.branch))
+            return EXIT_CONFLICT
+
+        state["merge"] = {
+            "at": now_iso(),
+            "status": "merged",
+            "commit": result.commit,
+            "branch": ws.branch,
+            "base": ws.base,
+        }
+        set_status(rec, state, STATUS_MERGED)
+
+    say("merged {0} into {1} ({2})".format(ws.branch, ws.base, (result.commit or "?")[:7]))
+    say("the worktree is still there - aidev does not remove what it did not just create:")
+    say("  aidev pipeline --repo {0} --discard {1}".format(repo, rec.slice_id))
+    return EXIT_DONE
+
+
+def discard_slice(args: Any, repo: Path, repo_given: bool = True) -> int:
+    """Throw the slice's workspace away. The user's checkout keeps no git trace of it."""
+    rec, state, ws = _finished_workspace(repo, args.discard, repo_given)
+    with SliceLock(rec):
+        if Path(ws.path).exists() or workspace.find_worktree(repo, ws.path) is not None:
+            try:
+                workspace.worktree_remove(repo, ws.path)
+            except workspace.GitError as exc:
+                # Windows holds files open for editors, watchers and node. Deleting
+                # the branch anyway would leave the worse leftover: a worktree with
+                # nothing to go back to.
+                raise PipelineError(
+                    "could not remove the worktree, so the branch was kept: {0}\n"
+                    "    {1}\n"
+                    "    Close whatever holds files in there and run --discard again.".format(
+                        ws.path, exc
+                    )
+                )
+        else:
+            say("worktree was already gone: {0}".format(ws.path))
+            say("  if git still lists it, prune it yourself: git -C {0} worktree prune".format(repo))
+        sha = None
+        if workspace.branch_exists(repo, ws.branch):
+            try:
+                sha = workspace.delete_branch(repo, ws.branch)
+            except workspace.GitError as exc:
+                raise PipelineError("could not delete branch {0}: {1}".format(ws.branch, exc))
+        state["discard"] = {"at": now_iso(), "branch": ws.branch, "commit": sha}
+        set_status(rec, state, STATUS_DISCARDED)
+
+    say("discarded {0}".format(rec.slice_id))
+    say("  worktree removed: {0}".format(ws.path))
+    say("  branch deleted:   {0} (was {1})".format(ws.branch, (sha or "?")[:7]))
+    if sha:
+        say("  recoverable for now: git -C {0} branch {1} {2}".format(repo, ws.branch, sha[:10]))
+    say("no git trace left in {0}. The slice's own record stays at {1}".format(repo, rec.dir))
+    return EXIT_DONE
 
 
 def _finish(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any], body: str) -> int:
