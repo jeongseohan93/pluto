@@ -856,6 +856,21 @@ npm run build      # typecheck + electron-vite build
 확정했고 `aidev` 코어 연동은 아직 없다. Code Graph도 좌표가 손으로 적힌 mock이며,
 레이아웃 엔진은 v0.0.4에서 만든다.
 
+### v0.2.5 — 최소 바인딩 (mock 제거 1단계)
+
+Activity bar의 **Pipeline** 화면 세 가지만 실데이터다: 대상 repo의 slice/epic
+상태 목록, `waiting_approval`인 slice의 산출물(plan.md) 뷰어, 승인/반려 버튼.
+대상 repo에 **쓰는 것은 `approvals/<stage>.md` 하나뿐**이고(preload의 신규 쓰기
+capability도 `writeApproval` 하나), 판단은 그대로 Python 코어에 있다. Graph /
+Code / Diff / Test / Browser 화면은 아직 mock 그대로다.
+
+```bash
+npm test --prefix desktop   # typecheck + main 프로세스 읽기·쓰기 단위 테스트
+```
+
+승인이 실제로 파이프라인을 진행시키는지는 자동으로 증명할 수 없다 —
+`desktop/README.md`의 수동 검증 절차가 그 자리를 채운다.
+
 > Windows에서 VS Code 내장 터미널로 실행하면 `ELECTRON_RUN_AS_NODE=1`이 상속돼
 > Electron이 plain Node로 떠서 죽는다. 그 터미널에서는 변수를 지우고 실행한다.
 
@@ -868,6 +883,7 @@ v0.3  Workspace 격리               ← 완료 (worktree / 브랜치 / 단계�
 v0.4  Epic → Slice Planner        ← 완료 (decompose / 목록 게이트 / 순차 큐 / --resume-epic)
 v0.5  Codebase Memory             ← 지금 여기
 v0.6  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
+      (v0.2.5에서 상태/plan/승인 3종 선행)
 ```
 
 Planner(에픽→slice 자동 분해)를 뒤로 미룬 이유: 그건 지금 사람이 직접 해도

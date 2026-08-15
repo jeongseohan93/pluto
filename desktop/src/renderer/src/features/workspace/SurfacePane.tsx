@@ -6,12 +6,16 @@ import { CodeSurface } from '@renderer/features/code/CodeSurface'
 import { TestSurface } from '@renderer/features/tests/TestSurface'
 import { DiffSurface } from '@renderer/features/diff/DiffSurface'
 import { BrowserSurface } from '@renderer/features/browser/BrowserSurface'
+import { PlanSurface, type PlanSurfaceProps } from '@renderer/features/pipeline/PlanSurface'
 import type { SymbolLocation } from '@renderer/lib/graph-lookup'
 import { Icon } from '@renderer/components/Icon'
 
-export type SurfaceId = 'graph' | 'code' | 'test' | 'diff' | 'browser'
+export type SurfaceId = 'plan' | 'graph' | 'code' | 'test' | 'diff' | 'browser'
 
 export interface SurfaceData {
+  /** The real pipeline. Every other field here is still mock data. */
+  pipeline: PlanSurfaceProps
+  waitingCount: number
   graph: CodeGraph | null
   changes: ChangeSummary | null
   tests: TestCase[] | null
@@ -44,6 +48,16 @@ export function SurfacePane({
   const failed = (data.tests ?? []).filter((t) => t.state === 'failed').length
 
   const tabs = [
+    {
+      id: 'plan' as const,
+      label: 'Plan',
+      badge:
+        data.waitingCount > 0 ? (
+          <span className="rounded-sm bg-accent-soft px-1 font-mono text-micro text-accent">
+            {data.waitingCount}
+          </span>
+        ) : undefined
+    },
     { id: 'graph' as const, label: 'Graph' },
     { id: 'code' as const, label: 'Code' },
     {
@@ -97,7 +111,9 @@ export function SurfacePane({
       />
 
       <div className="min-h-0 flex-1">
-        {surface === 'graph' ? (
+        {surface === 'plan' ? (
+          <PlanSurface {...data.pipeline} />
+        ) : surface === 'graph' ? (
           <GraphSurface
             graph={data.graph}
             selectedSymbolId={data.selectedSymbolId}

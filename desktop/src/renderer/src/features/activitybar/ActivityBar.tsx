@@ -1,9 +1,10 @@
 import type { JSX } from 'react'
 import { Icon, type IconName } from '@renderer/components/Icon'
 
-export type ActivityId = 'workspaces' | 'graph' | 'changes' | 'tests' | 'telemetry'
+export type ActivityId = 'pipeline' | 'workspaces' | 'graph' | 'changes' | 'tests' | 'telemetry'
 
 const ITEMS: { id: ActivityId; icon: IconName; label: string }[] = [
+  { id: 'pipeline', icon: 'pipeline', label: 'Pipeline' },
   { id: 'workspaces', icon: 'workspaces', label: 'Workspaces' },
   { id: 'graph', icon: 'graph', label: 'Code graph' },
   { id: 'changes', icon: 'changes', label: 'Changes' },

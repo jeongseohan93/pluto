@@ -148,9 +148,115 @@ export interface SessionLogs {
   test: LogLine[]
 }
 
+// --------------------------------------------------------------------------
+// v0.2.5 — the pipeline binding. Everything below is read from a real
+// `<repo>/.aidev/` by the main process; none of it is mock.
+// --------------------------------------------------------------------------
+
+/** One entry of `state.json`'s `stages`. Keys are open — v0.2 lets a
+ *  requirement declare its own stage names, and a reader that only knew
+ *  plan/implement/test would silently hide the rest. */
+export interface SliceStage {
+  name: string
+  /** `pending` / `running` / `done` / `failed`, and whatever v0.5 adds. */
+  status: string
+  approval?: string
+  approvalReason?: string
+  runId?: string
+  attempts?: number
+  verdict?: string
+}
+
 /**
- * The full surface the renderer is allowed to reach. Capability-scoped and
- * read-only by design — no `exec`, no arbitrary path reads.
+ * Freshness of the run a slice is inside, under `aidev/reporter.py`'s rule:
+ * a `running` live.json that has not moved for 10s is stale. Never derived
+ * from state.json — that file only moves at stage boundaries.
+ */
+export interface LiveStatus {
+  status: string
+  updatedAt: number
+  ageSeconds: number
+  stale: boolean
+}
+
+export interface SliceState {
+  id: string
+  dir: string
+  /** `pending` / `running:<stage>` / `waiting_approval:<stage>` / `quota_wait`
+   *  / `done` / `failed` / `rejected` / `merged` / `discarded`. */
+  status: string
+  /** The stage whose gate is open, or null. This is what may be approved. */
+  waitingStage: string | null
+  stages: SliceStage[]
+  gates: string[]
+  updatedAt: string | null
+  reason: string | null
+  testVerdict: string | null
+  epic: { epic_id?: string; index?: number } | null
+  live: LiveStatus | null
+  /** state.json was missing or unusable. The slice is still listed. */
+  unreadable: boolean
+}
+
+export interface EpicSliceRef {
+  index: number | null
+  title: string
+  sliceId: string | null
+  status: string
+}
+
+export interface EpicState {
+  id: string
+  status: string
+  current: number | null
+  slices: EpicSliceRef[]
+  updatedAt: string | null
+  unreadable: boolean
+}
+
+export interface RepoState {
+  root: string | null
+  name: string | null
+  /** `<root>/.aidev` is a directory. False means "probably the wrong folder". */
+  isAidevRepo: boolean
+  /** Owned by main and stored under `userData` — never written into a repo. */
+  recent: string[]
+  slices: SliceState[]
+  epics: EpicState[]
+  readAt: number
+}
+
+/** The stage output a human reads before deciding. Plain text, not rendered. */
+export interface StageArtifact {
+  stage: string
+  path: string
+  text: string
+  exists: boolean
+}
+
+export type ApprovalVerdict = 'pending' | 'approved' | 'rejected'
+export type ApprovalDecision = 'approved' | 'rejected'
+
+export interface ApprovalInput {
+  sliceId: string
+  stage: string
+  decision: ApprovalDecision
+  reason?: string
+}
+
+export interface ApprovalResult {
+  ok: boolean
+  path: string
+  /** What Python will read back, checked after the write — not what we meant. */
+  effective?: ApprovalVerdict
+  /** The gate was already decided; nothing was written. */
+  conflict?: ApprovalVerdict
+  error?: string
+}
+
+/**
+ * The full surface the renderer is allowed to reach. Capability-scoped by
+ * design — no `exec`, no arbitrary path reads.
  */
 export interface AidevBridge {
   getProject(): Promise<ProjectInfo>
@@ -161,6 +267,20 @@ export interface AidevBridge {
   getTests(workspaceId: string): Promise<TestCase[]>
   getTelemetrySnapshot(): Promise<TelemetrySnapshot>
   getSessionLogs(): Promise<SessionLogs>
+
+  // -- v0.2.5 pipeline binding
+  getRepoState(): Promise<RepoState>
+  /** Main opens the folder dialog; the renderer never names a path itself. */
+  openRepoDialog(): Promise<RepoState>
+  /** Only a path already in `recent` is accepted. */
+  selectRepo(root: string): Promise<RepoState>
+  getStageArtifact(sliceId: string, stage: string): Promise<StageArtifact>
+  /**
+   * The one and only capability that writes into the target repository:
+   * `<repo>/.aidev/slices/<id>/approvals/<stage>.md`. Judgement stays with the
+   * Python core — Pluto records the human's answer and nothing else.
+   */
+  writeApproval(input: ApprovalInput): Promise<ApprovalResult>
 }
 
 /** Channel names, kept in one place so main and preload cannot drift apart. */
@@ -172,5 +292,10 @@ export const IPC = {
   changeSummary: 'aidev:get-change-summary',
   tests: 'aidev:get-tests',
   telemetry: 'aidev:get-telemetry-snapshot',
-  sessionLogs: 'aidev:get-session-logs'
+  sessionLogs: 'aidev:get-session-logs',
+  repoState: 'aidev:get-repo-state',
+  openRepo: 'aidev:open-repo-dialog',
+  selectRepo: 'aidev:select-repo',
+  artifact: 'aidev:get-stage-artifact',
+  approve: 'aidev:write-approval'
 } as const

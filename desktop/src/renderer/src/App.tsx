@@ -1,6 +1,12 @@
-import { useMemo, useState, type JSX } from 'react'
+import { useCallback, useEffect, useMemo, useState, type JSX } from 'react'
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels'
-import { useGlobalData, useWorkspaceData } from '@renderer/lib/useIdeData'
+import type { ApprovalDecision, ApprovalResult } from '@shared/ide'
+import {
+  useGlobalData,
+  useRepoState,
+  useStageArtifact,
+  useWorkspaceData
+} from '@renderer/lib/useIdeData'
 import { findSymbol } from '@renderer/lib/graph-lookup'
 import { TopBar } from '@renderer/features/topbar/TopBar'
 import { ActivityBar, type ActivityId } from '@renderer/features/activitybar/ActivityBar'
@@ -13,6 +19,7 @@ import mark from '@renderer/assets/pluto-mark.png'
 
 /** Which surface each activity opens in the main pane. */
 const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
+  pipeline: 'plan',
   graph: 'graph',
   changes: 'diff',
   tests: 'test'
@@ -30,9 +37,11 @@ function App(): JSX.Element {
   const [zoom, setZoom] = useState(1)
   const [bottomTab, setBottomTab] = useState<BottomTab>('agent')
   const [bottomCollapsed, setBottomCollapsed] = useState(false)
+  const [pipelineSliceId, setPipelineSliceId] = useState<string | null>(null)
 
   const global = useGlobalData()
   const workspace = useWorkspaceData(workspaceId)
+  const repo = useRepoState()
   const bottomRef = usePanelRef()
 
   const location = useMemo(
@@ -40,11 +49,49 @@ function App(): JSX.Element {
     [workspace, selectedSymbolId]
   )
 
+  const repoState = repo.state
+  const slices = useMemo(() => repoState?.slices ?? [], [repoState])
+  const waiting = useMemo(() => slices.filter((s) => s.waitingStage !== null), [slices])
+  const pipelineSlice = slices.find((s) => s.id === pipelineSliceId) ?? null
+
+  // Approving is what this panel is for, so an open gate is what it opens on.
+  // A selection that no longer exists (repo switched, slice discarded) is
+  // dropped rather than left pointing at nothing.
+  useEffect(() => {
+    if (pipelineSliceId && slices.some((s) => s.id === pipelineSliceId)) return
+    setPipelineSliceId(waiting[0]?.id ?? slices[0]?.id ?? null)
+  }, [pipelineSliceId, slices, waiting])
+
+  const artifactStage = pipelineSlice ? (pipelineSlice.waitingStage ?? 'plan') : null
+  const artifact = useStageArtifact(pipelineSlice?.id ?? null, artifactStage)
+
+  const refreshRepo = repo.refresh
+  const decide = useCallback(
+    async (decision: ApprovalDecision, reason: string): Promise<ApprovalResult> => {
+      if (!pipelineSlice?.waitingStage) {
+        return { ok: false, path: '', error: 'no gate is open on this slice' }
+      }
+      const result = await window.aidev.writeApproval({
+        sliceId: pipelineSlice.id,
+        stage: pipelineSlice.waitingStage,
+        decision,
+        reason
+      })
+      // The pipeline polls every 3s; re-read now so the row moves without
+      // waiting out our own interval on top of that.
+      if (result.ok) refreshRepo()
+      return result
+    },
+    [pipelineSlice, refreshRepo]
+  )
+
   if (!global) return <Booting />
 
   const activeWorkspace = global.workspaces.find((w) => w.id === workspaceId)
 
   const surfaceData = {
+    pipeline: { slice: pipelineSlice, artifact, onDecide: decide },
+    waitingCount: waiting.length,
     graph: workspace?.graph ?? null,
     changes: workspace?.changes ?? null,
     tests: workspace?.tests ?? null,
@@ -87,6 +134,13 @@ function App(): JSX.Element {
           >
             <Sidebar
               activity={activity}
+              pipeline={{
+                repo: repo.state,
+                selectedSliceId: pipelineSliceId,
+                onSelectSlice: setPipelineSliceId,
+                onOpenRepo: repo.open,
+                onSelectRepo: repo.select
+              }}
               workspaces={global.workspaces}
               activeWorkspaceId={workspaceId}
               onSelectWorkspace={setWorkspaceId}

@@ -1,0 +1,25 @@
+// Deliberately not extending @electron-toolkit/tsconfig: that one is tuned for
+// a bundler and does not emit. `node --test` needs real .js on disk, and
+// package.json has no "type" field, so CommonJS is what Node will execute.
+//
+// Only the Electron-free modules are listed: everything under test is plain
+// node:fs plus types from src/shared.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "out-test"
+  },
+  "include": [
+    "src/main/aidev-store.ts",
+    "src/main/recent-repos.ts",
+    "src/main/*.test.ts",
+    "src/shared/**/*"
+  ]
+}
