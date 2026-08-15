@@ -1,0 +1,99 @@
+{
+  "slice_id": "20260815-v0-4-planner",
+  "status": "running:test",
+  "branch": "slice/20260815-v0-4-planner",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "8c4b8355b0c08da79a2c1b6e22bdcb6df666b66f",
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260815-235213-v0-4-planner-plan",
+      "attempts": 1,
+      "commit": "425ab050c310efcf98e3e2a592017b3356c4a4e2"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260816-022855-v0-4-planner-implement-2",
+      "attempts": 2,
+      "commit": "3d94c01d256846f8bb8628a33675e769a9816b7e"
+    },
+    "test": {
+      "status": "done",
+      "run_id": "20260816-025118-v0-4-planner-test",
+      "verdict": "pass",
+      "attempts": 1
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260815-235213-v0-4-planner-plan",
+      "status": "completed",
+      "turns": 26,
+      "tokens": {
+        "input": 50,
+        "cache_creation": 169326,
+        "cache_read": 3057965,
+        "output": 51434,
+        "billed_input": 3227341,
+        "peak_context": 183795
+      },
+      "cost_usd": 4.5083425
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260816-020717-v0-4-planner-implement",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 151,
+        "cache_creation": 206036,
+        "cache_read": 13373251,
+        "output": 65293,
+        "billed_input": 13579438,
+        "peak_context": 226922
+      },
+      "cost_usd": 10.380065499999997
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260816-022855-v0-4-planner-implement-2",
+      "status": "completed",
+      "turns": 49,
+      "tokens": {
+        "input": 92,
+        "cache_creation": 77650,
+        "cache_read": 3782469,
+        "output": 22273,
+        "billed_input": 3860211,
+        "peak_context": 98536
+      },
+      "cost_usd": 3.2250194999999997
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260816-025118-v0-4-planner-test",
+      "status": "completed",
+      "turns": 5,
+      "tokens": {
+        "input": 8,
+        "cache_creation": 27971,
+        "cache_read": 165752,
+        "output": 938,
+        "billed_input": 193731,
+        "peak_context": 48857
+      },
+      "cost_usd": 0.38607600000000003
+    }
+  ],
+  "updated_at": "2026-08-16T02:54:36+09:00"
+}

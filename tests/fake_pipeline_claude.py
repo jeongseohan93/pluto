@@ -21,6 +21,11 @@ the pipeline has to survive.
     AIDEV_FAKE_RESET_IN     seconds from now to advertise as the reset moment
     AIDEV_FAKE_TEXT         final text to emit instead of the per-stage default
     AIDEV_FAKE_FILES        create N files in cwd during implement (commit guard)
+    AIDEV_FAKE_SLICES       how many items the decompose stage lists (default: 2)
+    AIDEV_FAKE_SLICE_APPROVAL
+                          the 'approval:' each listed slice declares (default: none)
+    AIDEV_FAKE_FAIL_AFTER   fail every invocation from the Nth on, whatever the
+                          mode - how a queue is stopped at a chosen slice
 """
 
 import glob
@@ -94,14 +99,44 @@ def emit(event):
     sys.stdout.flush()
 
 
+def decompose_report():
+    """A slice list in the format the parser is promised, with N items."""
+    count = int(os.environ.get("AIDEV_FAKE_SLICES", "2"))
+    approval = os.environ.get("AIDEV_FAKE_SLICE_APPROVAL", "none")
+    return "\n".join(
+        "=== SLICE {0}: fake slice {0} ===\n"
+        "---\n"
+        "approval: {1}\n"
+        "---\n"
+        "# fake slice {0}\n"
+        "\n"
+        "## What it must do\n"
+        "Step {0} of the fake epic.\n"
+        "\n"
+        "## Scope\n"
+        "aidev/thing.py\n"
+        "\n"
+        "## Tests\n"
+        "pytest -q\n"
+        "\n"
+        "## Not in this slice\n"
+        "Everything the other items do.\n".format(index, approval)
+        for index in range(1, count + 1)
+    )
+
+
 def final_text(stage, mode):
+    if stage == "decompose":
+        return decompose_report()
     if stage != "test":
         return STAGE_TEXT[stage]
     return approval_report() if mode == "requires_approval" else test_report()
 
 
 def detect_stage(prompt):
-    for stage in STAGE_TEXT:
+    # decompose first: it is the only stage whose prompt carries a whole epic,
+    # which may well talk about planning or testing.
+    for stage in ("decompose",) + tuple(STAGE_TEXT):
         if "{0} stage".format(stage).upper() in prompt.upper():
             return stage
     return "plan"
@@ -157,6 +192,10 @@ def main():
             }
         )
         return 1
+
+    fail_after = os.environ.get("AIDEV_FAKE_FAIL_AFTER")
+    if fail_after and previous >= int(fail_after):
+        mode = "fail"
 
     if mode == "fail":
         emit(

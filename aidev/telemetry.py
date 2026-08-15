@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from . import events as ev
 
-PHASES = ("plan", "explore", "implement", "review", "test", "repair")
+PHASES = ("plan", "explore", "implement", "review", "test", "repair", "decompose")
 
 # Hotspot buckets shown by the final report, in display order.
 HOTSPOT_BUCKETS = (
