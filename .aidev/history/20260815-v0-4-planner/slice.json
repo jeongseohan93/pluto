@@ -1,0 +1,24 @@
+{
+  "slice_id": "20260815-v0-4-planner",
+  "status": "pending",
+  "branch": "slice/20260815-v0-4-planner",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "8c4b8355b0c08da79a2c1b6e22bdcb6df666b66f",
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-15T23:52:12+09:00"
+}
