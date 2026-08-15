@@ -1,6 +1,6 @@
 {
   "slice_id": "20260816-v0-2-5-pluto-minimal-binding",
-  "status": "running:implement",
+  "status": "running:test",
   "branch": "slice/20260816-v0-2-5-pluto-minimal-binding",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "50d828a6bccff5ad5a323fcdf61397c0575d990f",
@@ -27,10 +27,14 @@
     "implement": {
       "status": "done",
       "run_id": "20260816-034616-v0-2-5-pluto-minimal-binding-implement",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "ac0b83720c57e564adf7679cb2dec531ffe3641a"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260816-040213-v0-2-5-pluto-minimal-binding-test",
+      "verdict": "pass",
+      "attempts": 1
     }
   },
   "runs": [
@@ -65,7 +69,23 @@
         "peak_context": 165560
       },
       "cost_usd": 6.784479499999996
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260816-040213-v0-2-5-pluto-minimal-binding-test",
+      "status": "completed",
+      "turns": 5,
+      "tokens": {
+        "input": 8,
+        "cache_creation": 34478,
+        "cache_read": 178301,
+        "output": 1011,
+        "billed_input": 212787,
+        "peak_context": 55364
+      },
+      "cost_usd": 0.4592455
     }
   ],
-  "updated_at": "2026-08-16T04:02:12+09:00"
+  "updated_at": "2026-08-16T04:05:41+09:00"
 }
