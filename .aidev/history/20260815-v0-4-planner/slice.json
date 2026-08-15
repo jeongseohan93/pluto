@@ -1,6 +1,6 @@
 {
   "slice_id": "20260815-v0-4-planner",
-  "status": "running:implement",
+  "status": "running:test",
   "branch": "slice/20260815-v0-4-planner",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "8c4b8355b0c08da79a2c1b6e22bdcb6df666b66f",
@@ -19,10 +19,14 @@
     "implement": {
       "status": "done",
       "run_id": "20260816-022855-v0-4-planner-implement-2",
-      "attempts": 2
+      "attempts": 2,
+      "commit": "3d94c01d256846f8bb8628a33675e769a9816b7e"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260816-025118-v0-4-planner-test",
+      "verdict": "pass",
+      "attempts": 1
     }
   },
   "runs": [
@@ -73,7 +77,23 @@
         "peak_context": 98536
       },
       "cost_usd": 3.2250194999999997
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260816-025118-v0-4-planner-test",
+      "status": "completed",
+      "turns": 5,
+      "tokens": {
+        "input": 8,
+        "cache_creation": 27971,
+        "cache_read": 165752,
+        "output": 938,
+        "billed_input": 193731,
+        "peak_context": 48857
+      },
+      "cost_usd": 0.38607600000000003
     }
   ],
-  "updated_at": "2026-08-16T02:51:17+09:00"
+  "updated_at": "2026-08-16T02:54:36+09:00"
 }
