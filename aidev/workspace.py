@@ -357,6 +357,7 @@ class WorkspacePlan:
     branch: str
     base: Optional[str]
     base_commit: str
+    start: Optional[str] = None
 
 
 @dataclass
@@ -367,6 +368,10 @@ class Workspace:
     branch: str
     base: Optional[str]
     base_commit: str
+    # Where the branch was cut, when that is not the base itself. v0.4 chains one
+    # epic slice onto the previous one's branch while every slice still merges
+    # into the same base, so "where it forked" and "where it lands" are two facts.
+    start: Optional[str] = None
     created_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -375,6 +380,7 @@ class Workspace:
             "branch": self.branch,
             "base": self.base,
             "base_commit": self.base_commit,
+            "start": self.start,
             "created_at": self.created_at,
         }
 
@@ -388,11 +394,13 @@ class Workspace:
         if not isinstance(path, str) or not path or not isinstance(branch, str) or not branch:
             return None
         base = data.get("base")
+        start = data.get("start")  # absent in every v0.3 record, and that is fine
         return cls(
             path=Path(path),
             branch=branch,
             base=base if isinstance(base, str) and base else None,
             base_commit=str(data.get("base_commit") or ""),
+            start=start if isinstance(start, str) and start else None,
             created_at=str(data.get("created_at") or ""),
         )
 
@@ -402,6 +410,7 @@ def plan_workspace(
     slice_id: str,
     branch: str,
     base: Optional[str] = None,
+    start: Optional[str] = None,
     root: Optional[Path] = None,
 ) -> WorkspacePlan:
     """Where the slice would live. ``base`` defaults to the repo's current HEAD.
@@ -409,11 +418,20 @@ def plan_workspace(
     main is never assumed: a repository whose development line is
     ``windows-handoff-20260808`` must branch from what is checked out, not from
     a name this tool made up.
+
+    ``start`` forks the branch somewhere other than the base without changing
+    where it merges back to. Without it the two are the same thing, which is
+    what every single-slice run does.
     """
     if base is not None and not resolve_commit(repo, base):
         raise GitError(["rev-parse", base], 1, "base ref not found: {0}".format(base))
     resolved_base = base if base is not None else current_branch(repo)
-    commit = resolve_commit(repo, base if base is not None else "HEAD")
+    if start is not None:
+        commit = resolve_commit(repo, start)
+        if commit is None:
+            raise GitError(["rev-parse", start], 1, "start ref not found: {0}".format(start))
+    else:
+        commit = resolve_commit(repo, base if base is not None else "HEAD")
     if commit is None:
         raise GitError(
             ["rev-parse", "HEAD"],
@@ -427,6 +445,7 @@ def plan_workspace(
         branch=branch,
         base=resolved_base,
         base_commit=commit,
+        start=start,
     )
 
 
@@ -488,6 +507,7 @@ def create(repo: Path, plan: WorkspacePlan) -> Workspace:
         branch=plan.branch,
         base=plan.base,
         base_commit=plan.base_commit,
+        start=plan.start,
         created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
     )
 

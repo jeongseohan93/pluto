@@ -278,15 +278,15 @@ def setup_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
 # ------------------------------------------------------------------ approvals
 
 APPROVAL_TEMPLATE = """\
-# Approval gate: {stage}   (slice {slice_id})
+# Approval gate: {stage}   ({label})
 #
 # Write the decision on its own line below. Lines starting with '#' are ignored.
 #
 #   approved
 #   rejected: <reason>
 #
-# You may edit plan.md before approving - the next stage reads plan.md as it is
-# at the moment of approval.
+# You may edit {artifact} before approving - what follows reads {artifact} as it
+# is at the moment of approval.
 """
 
 
@@ -373,6 +373,14 @@ class SliceRecord:
         _, _, rest = self.slice_id.partition("-")
         return rest or self.slice_id
 
+    @property
+    def label(self) -> str:
+        """What this record is called in messages. An epic record answers too."""
+        return self.slice_id
+
+    #: What kind of record this is, in the one message that has to name it.
+    kind = "slice"
+
     def approval_path(self, stage: str) -> Path:
         return self.approvals_dir / "{0}.md".format(stage)
 
@@ -384,17 +392,7 @@ class SliceRecord:
         return read_json_tolerant(self.state_path)
 
     def write_state(self, state: Dict[str, Any]) -> None:
-        state["updated_at"] = now_iso()
-        for attempt in range(_STATE_REPLACE_RETRIES):
-            try:
-                write_json_atomic(self.state_path, state)
-                return
-            except PermissionError:
-                # Windows readers may briefly open state.json without delete
-                # sharing, which makes os.replace fail until that handle closes.
-                if attempt + 1 >= _STATE_REPLACE_RETRIES:
-                    raise
-                _sleep(_STATE_REPLACE_RETRY_S)
+        write_state_atomic(self.state_path, state)
 
     def read_plan(self) -> str:
         try:
@@ -421,6 +419,21 @@ class SliceRecord:
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def write_state_atomic(path: Path, state: Dict[str, Any]) -> None:
+    """Publish a state.json - a slice's or an epic's - under the live.json rules."""
+    state["updated_at"] = now_iso()
+    for attempt in range(_STATE_REPLACE_RETRIES):
+        try:
+            write_json_atomic(path, state)
+            return
+        except PermissionError:
+            # Windows readers may briefly open state.json without delete
+            # sharing, which makes os.replace fail until that handle closes.
+            if attempt + 1 >= _STATE_REPLACE_RETRIES:
+                raise
+            _sleep(_STATE_REPLACE_RETRY_S)
 
 
 # storage.slugify truncates a run label to this many characters.
@@ -459,15 +472,16 @@ def write_text_atomic(path: Path, text: str) -> None:
 
 
 class SliceLock:
-    """One process per slice, so state.json genuinely has a single writer.
+    """One process per record, so state.json genuinely has a single writer.
 
-    v0.2 does not run slices in parallel, so a second process on the same slice
-    is a mistake rather than a case to merge: it is refused, not queued.
+    Slices are not run in parallel, so a second process on the same record is a
+    mistake rather than a case to merge: it is refused, not queued. An epic holds
+    the same lock over its own directory while its queue runs.
     """
 
-    def __init__(self, rec: SliceRecord) -> None:
+    def __init__(self, rec: Any) -> None:
         self.path = rec.dir / ".lock"
-        self.slice_id = rec.slice_id
+        self.label = "{0} {1}".format(getattr(rec, "kind", "slice"), rec.label)
 
     def __enter__(self) -> "SliceLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -475,9 +489,9 @@ class SliceLock:
             handle = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             raise PipelineError(
-                "slice {0} is already running ({1}).\n"
+                "{0} is already running ({1}).\n"
                 "    If that process is gone, delete {2}".format(
-                    self.slice_id, self._holder() or "owner unknown", self.path
+                    self.label, self._holder() or "owner unknown", self.path
                 )
             )
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
@@ -503,8 +517,9 @@ def new_state(
     repo: Path,
     gates: Sequence[str],
     stages: Sequence[str] = STAGES,
+    epic: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    state = {
         "schema": STATE_SCHEMA,
         "slice_id": slice_id,
         "status": "pending",
@@ -518,6 +533,12 @@ def new_state(
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
+    if epic:
+        # Which epic queued this slice, and where in the list it sat. Optional,
+        # like every other key added after schema 2: a reader that does not know
+        # it is not wrong, it is only older.
+        state["epic"] = dict(epic)
+    return state
 
 
 def stage_entry(state: Dict[str, Any], stage: str) -> Dict[str, Any]:
@@ -1033,6 +1054,32 @@ def _run_meta(cfg: runner.RunConfig, telemetry: Telemetry, command: List[str]) -
     }
 
 
+@dataclass
+class StageSpec:
+    """How one stage is run, for a stage that is not necessarily a slice stage.
+
+    An epic's ``decompose`` is driven by exactly the loop below - same quota
+    waits, same session policy, same storage - but it is not in ``STAGES`` and
+    has no entry in ``STAGE_POLICY``, so what used to be looked up is passed in.
+    The default is the lookup, which is why every slice stage behaves as before.
+    """
+
+    stage: str
+    policy: Dict[str, Optional[str]]
+    phase: str
+    allowed: Tuple[str, ...] = ()
+    prompt: Optional[str] = None  # a fixed prompt; None means build one per attempt
+
+    @classmethod
+    def for_slice(cls, stage: str, cfg: "PipelineConfig") -> "StageSpec":
+        return cls(
+            stage=stage,
+            policy=STAGE_POLICY.get(stage, STAGE_POLICY["implement"]),
+            phase=stage,
+            allowed=allowed_tools_for(stage, cfg),
+        )
+
+
 def execute_stage(
     cfg: PipelineConfig,
     rec: SliceRecord,
@@ -1040,9 +1087,11 @@ def execute_stage(
     prompt: str,
     attempt: int,
     resume_session: Optional[str] = None,
+    spec: Optional[StageSpec] = None,
 ) -> StageRun:
     """One stage = one ``runner.execute()``, stored exactly like ``aidev run`` stores it."""
-    policy = STAGE_POLICY.get(stage, STAGE_POLICY["implement"])
+    spec = spec or StageSpec.for_slice(stage, cfg)
+    policy = spec.policy
     permission_mode = policy["permission_mode"]
     # An override may relax the editing stages but must never unlock plan.
     if permission_mode is not None and cfg.permission_mode:
@@ -1056,7 +1105,7 @@ def execute_stage(
         repo=cfg.cwd,
         prompt_path=rec.requirement_path,
         prompt=prompt,
-        phase=stage,
+        phase=spec.phase,
         project=cfg.repo.name,
         task=task,
         max_turns=cfg.max_turns,
@@ -1064,7 +1113,7 @@ def execute_stage(
         permission_mode=permission_mode,
         # Rule-scoped, never a blanket Bash unlock: acceptEdits alone would leave
         # every verification command waiting for an approval nobody is there to give.
-        allowed_tools=",".join(allowed_tools_for(stage, cfg)) or None,
+        allowed_tools=",".join(spec.allowed) or None,
         safety_profile=policy["safety_profile"] or "default",
         resume_session=resume_session,
         claude_cmd=list(cfg.claude_cmd),
@@ -1073,7 +1122,7 @@ def execute_stage(
     telemetry = Telemetry(
         run_id=run_id,
         project=cfg.repo.name,
-        phase=stage,
+        phase=spec.phase,
         repo=str(cfg.cwd),
         prompt_path=str(rec.requirement_path),
         task=task,
@@ -1147,8 +1196,10 @@ def run_stage(
     state: Dict[str, Any],
     stage: str,
     requirement: str,
+    spec: Optional[StageSpec] = None,
 ) -> StageRun:
     """Run one stage, waiting out usage limits on the same session as it goes."""
+    spec = spec or StageSpec.for_slice(stage, cfg)
     entry = stage_entry(state, stage)
     attempt = int(entry.get("attempts") or 0)
     # Session policy: recovering the same stage resumes its session; a new stage
@@ -1168,7 +1219,6 @@ def run_stage(
         session = None
         fresh = True
     retries = int((state.get("quota") or {}).get("retries") or 0)
-    allowed = allowed_tools_for(stage, cfg)
 
     while True:
         attempt += 1
@@ -1176,21 +1226,23 @@ def run_stage(
         entry["attempts"] = attempt
         set_status(rec, state, "running:{0}".format(stage))
 
-        prompt = build_prompt(
+        prompt = spec.prompt or build_prompt(
             stage,
             requirement,
             rec.read_plan(),
-            allowed=allowed,
+            allowed=spec.allowed,
             branch=cfg.workspace.branch if cfg.workspace else None,
-            base=cfg.workspace.base if cfg.workspace else None,
+            # What the worktree was actually cut from, which in an epic chain is
+            # the previous slice's branch rather than the base it merges into.
+            base=(cfg.workspace.start or cfg.workspace.base) if cfg.workspace else None,
         )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
         elif fresh:
             prompt += _FRESH_SESSION_NOTE
-        banner(stage, rec.slice_id, attempt, resumed=bool(session), fresh=fresh)
+        banner(stage, rec.label, attempt, resumed=bool(session), fresh=fresh)
 
-        run = execute_stage(cfg, rec, stage, prompt, attempt, resume_session=session)
+        run = execute_stage(cfg, rec, stage, prompt, attempt, resume_session=session, spec=spec)
         record_run(rec, run)
         if run.session_id:
             entry["session_id"] = run.session_id
@@ -1353,6 +1405,8 @@ def history_snapshot(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
         "branch": ws.get("branch"),
         "base": ws.get("base"),
         "base_commit": ws.get("base_commit"),
+        "start": ws.get("start"),
+        "epic": state.get("epic"),
         "gates": state.get("gates"),
         "setup": state.get("setup"),
         "stages": stages,
@@ -1456,19 +1510,26 @@ def fail_slice(rec: SliceRecord, state: Dict[str, Any], reason: str) -> int:
 
 
 def await_approval(
-    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any], stage: str
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    stage: str,
+    artifact: str = "plan.md",
 ) -> Decision:
     """Block until ``approvals/<stage>.md`` says approved or rejected.
 
     The file is the durable record, so a process killed while waiting resumes
-    into exactly this function and reads the same answer.
+    into exactly this function and reads the same answer. ``artifact`` is what
+    the human may edit first - plan.md for a slice, slices.md for an epic.
     """
     path = rec.approval_path(stage)
     decision = read_decision(path)
     if decision.verdict == PENDING:
         rec.approvals_dir.mkdir(parents=True, exist_ok=True)
         if not path.exists():
-            write_text_atomic(path, APPROVAL_TEMPLATE.format(stage=stage, slice_id=rec.slice_id))
+            write_text_atomic(
+                path, APPROVAL_TEMPLATE.format(stage=stage, label=rec.label, artifact=artifact)
+            )
         set_status(rec, state, "waiting_approval:{0}".format(stage))
         say("waiting for approval of '{0}'".format(stage))
         say("  edit {0}".format(path))
@@ -1739,9 +1800,14 @@ def _workspace_lines(state: Dict[str, Any]) -> List[str]:
     if ws is None:
         return []
     lines = ["", "Workspace {0}".format(ws.path)]
+    # In an epic chain the branch was cut from the slice before it, but it still
+    # merges into the base - saying only one of the two would mislead.
+    start = ws.start or ""
+    # Nothing to add when the fork point is the base itself, by name or by commit.
+    forked = "" if start in ("", ws.base, ws.base_commit) else ", from {0}".format(start)
     lines.append(
-        "Branch    {0}  (base: {1} @ {2})".format(
-            ws.branch, ws.base or "detached HEAD", (ws.base_commit or "?")[:7]
+        "Branch    {0}  (base: {1} @ {2}{3})".format(
+            ws.branch, ws.base or "detached HEAD", (ws.base_commit or "?")[:7], forked
         )
     )
     commits = state.get("commits")
@@ -1799,10 +1865,22 @@ def add_parser(sub: Any) -> Any:
     )
     cmd.add_argument("--requirement", type=Path, default=None, help="requirement markdown file")
     cmd.add_argument(
+        "--epic",
+        type=Path,
+        default=None,
+        help="epic markdown file: decompose it into slices, approve the list, run them in order",
+    )
+    cmd.add_argument(
         "--resume-slice", default=None, help="continue a stopped slice (id, prefix, or 'last')"
     )
     cmd.add_argument(
-        "--list", action="store_true", dest="list_slices", help="list slices of --repo and exit"
+        "--resume-epic", default=None, help="continue a stopped epic queue (id, prefix, or 'last')"
+    )
+    cmd.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_slices",
+        help="list slices and epics of --repo and exit",
     )
     cmd.add_argument("--merge", default=None, metavar="SLICE", help="merge a finished slice into its base")
     cmd.add_argument(
@@ -1906,12 +1984,19 @@ def _dispatch(args: Any) -> int:
         ("merge", "--merge"),
         ("discard", "--discard"),
         ("resume_slice", "--resume-slice"),
+        ("resume_epic", "--resume-epic"),
         ("requirement", "--requirement"),
+        ("epic", "--epic"),
     )
     chosen = [flag for attr, flag in modes if getattr(args, attr, None)]
     if len(chosen) > 1:
         raise PipelineError("these cannot be combined: {0}".format(", ".join(chosen)))
+    # Local, and only here: the epic module is a layer built on this one, so it
+    # imports pipeline at the top. Importing it back at module level would be a cycle.
+    from . import epic as epic_module
+
     if args.list_slices:
+        epic_module.list_epics(repo)
         return list_slices(repo, repo_given)
     if getattr(args, "merge", None):
         return merge_slice(args, repo, repo_given)
@@ -1919,9 +2004,13 @@ def _dispatch(args: Any) -> int:
         return discard_slice(args, repo, repo_given)
     if args.resume_slice:
         return resume_slice(args, repo, data_dir, repo_given)
+    if getattr(args, "resume_epic", None):
+        return epic_module.resume_epic(args, repo, data_dir, repo_given)
     if args.requirement:
         return start_slice(args, repo, data_dir)
-    raise PipelineError("one of --requirement, --resume-slice or --list is required")
+    if getattr(args, "epic", None):
+        return epic_module.start_epic(args, repo, data_dir)
+    raise PipelineError("one of --requirement, --epic, --resume-slice or --list is required")
 
 
 def _config(
@@ -1953,7 +2042,7 @@ def _config(
     )
 
 
-def resolve_requirement(path: Path, repo: Path) -> Path:
+def resolve_requirement(path: Path, repo: Path, flag: str = "--requirement") -> Path:
     candidates = [path.expanduser()]
     if not path.is_absolute():
         candidates.append((Path.cwd() / path).resolve())
@@ -1961,7 +2050,16 @@ def resolve_requirement(path: Path, repo: Path) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise PipelineError("--requirement not found: {0}".format(path))
+    raise PipelineError("{0} not found: {1}".format(flag, path))
+
+
+@dataclass
+class SliceOutcome:
+    """What launching a slice produced, for a caller that has to keep going."""
+
+    code: int
+    rec: SliceRecord
+    state: Dict[str, Any]
 
 
 def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
@@ -1969,24 +2067,18 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     text = source.read_text(encoding="utf-8")
     if not text.strip():
         raise PipelineError("requirement file is empty: {0}".format(source))
-    fields, body = parse_front_matter(text)
-    if not body.strip():
-        raise PipelineError("requirement has front matter but no body: {0}".format(source))
-    gates = resolve_gates(fields)
-    setup_command = resolve_setup(fields)
-
-    root = slices_root(repo)
-    unfinished = [
-        rec.slice_id
-        for rec in _existing_slices(root)
-        if str((rec.read_state() or {}).get("status", "")) not in (STATUS_DONE, STATUS_REJECTED)
-    ]
-    slice_id = make_slice_id(source.stem, root)
-    rec = SliceRecord(root, slice_id)
-    isolate = not getattr(args, "no_worktree", False)
-    plan = _plan_workspace(args, repo, slice_id) if isolate else None
 
     if args.dry_run:
+        fields, body = parse_front_matter(text)
+        if not body.strip():
+            raise PipelineError("requirement has front matter but no body: {0}".format(source))
+        gates = resolve_gates(fields)
+        setup_command = resolve_setup(fields)
+        root = slices_root(repo)
+        slice_id = make_slice_id(source.stem, root)
+        rec = SliceRecord(root, slice_id)
+        isolate = not getattr(args, "no_worktree", False)
+        plan = _plan_workspace(args, repo, slice_id) if isolate else None
         print("slice     {0}".format(slice_id))
         print("repo      {0}".format(repo))
         if plan is not None:
@@ -2004,18 +2096,57 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
         print("run dir   {0}".format(data_dir / "runs"))
         return EXIT_DONE
 
+    return launch_slice(args, repo, data_dir, text, source.stem).code
+
+
+def launch_slice(
+    args: Any,
+    repo: Path,
+    data_dir: Path,
+    text: str,
+    name: str,
+    base: Optional[str] = None,
+    start: Optional[str] = None,
+    epic: Optional[Dict[str, Any]] = None,
+    quiet_unfinished: bool = False,
+) -> SliceOutcome:
+    """Create a slice from requirement text and run it to its first stop.
+
+    Everything a new slice needs, with nothing about *where the text came from*:
+    a file the human named, or one item of an approved epic list. The epic queue
+    is only the second caller of this, which is why it inherits the whole v0.3
+    flow rather than re-stating it.
+    """
+    fields, body = parse_front_matter(text)
+    if not body.strip():
+        raise PipelineError("requirement has front matter but no body: {0}".format(name))
+    gates = resolve_gates(fields)
+    setup_command = resolve_setup(fields)
+
+    root = slices_root(repo)
+    unfinished = [
+        rec.slice_id
+        for rec in _existing_slices(root)
+        if str((rec.read_state() or {}).get("status", "")) not in (STATUS_DONE, STATUS_REJECTED)
+    ]
+    slice_id = make_slice_id(name, root)
+    rec = SliceRecord(root, slice_id)
+    isolate = not getattr(args, "no_worktree", False)
+    plan = _plan_workspace(args, repo, slice_id, base=base, start=start) if isolate else None
+
     if plan is None:
         say("warning: --no-worktree - the AI will edit {0} directly".format(repo))
         ensure_clean_repo(repo)
     else:
         _refuse_blocked_workspace(repo, plan)
-    if unfinished:
+    # Inside a queue the advice is wrong: the unfinished slices are the queue's own.
+    if unfinished and not quiet_unfinished:
         say("note: unfinished slice(s) here: {0}".format(", ".join(unfinished)))
         say("      use --resume-slice <id> to continue one instead of starting over")
 
     rec.ensure()
     write_text_atomic(rec.requirement_path, text)
-    state = new_state(slice_id, repo, gates)
+    state = new_state(slice_id, repo, gates, epic=epic)
     if setup_command:
         state["setup"] = {"command": setup_command, "status": "pending"}
     say("slice {0}".format(slice_id))
@@ -2027,11 +2158,19 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
         ws = _open_workspace(repo, plan, rec, state)
     rec.write_state(state)
 
-    return _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+    code = _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+    return SliceOutcome(code=code, rec=rec, state=state)
 
 
-def _plan_workspace(args: Any, repo: Path, slice_id: str) -> workspace.WorkspacePlan:
-    """Work out where this slice would live, refusing a repo that cannot host one."""
+def _plan_workspace(
+    args: Any,
+    repo: Path,
+    name: str,
+    branch: Optional[str] = None,
+    base: Optional[str] = None,
+    start: Optional[str] = None,
+) -> workspace.WorkspacePlan:
+    """Work out where this workspace would live, refusing a repo that cannot host one."""
     if not workspace.git_available():
         raise PipelineError(
             "git is not on PATH, so no worktree can be created.\n"
@@ -2045,9 +2184,10 @@ def _plan_workspace(args: Any, repo: Path, slice_id: str) -> workspace.Workspace
     try:
         return workspace.plan_workspace(
             repo,
-            slice_id,
-            SLICE_BRANCH_PREFIX + slice_id,
-            base=getattr(args, "base", None),
+            name,
+            branch or SLICE_BRANCH_PREFIX + name,
+            base=base if base is not None else getattr(args, "base", None),
+            start=start,
             root=getattr(args, "worktree_root", None),
         )
     except workspace.GitError as exc:
@@ -2114,6 +2254,25 @@ def _rollback_workspace(repo: Path, ws: workspace.Workspace) -> None:
 
 def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
     rec = find_slice(repo, args.resume_slice, repo_given)
+    if args.dry_run:
+        state = rec.read_state()
+        if state is None:
+            raise PipelineError("no readable state.json in {0}".format(rec.dir))
+        ws = workspace.Workspace.from_dict(state.get("workspace"))
+        print("slice   {0}  ({1})".format(rec.slice_id, state.get("status", "")))
+        print("work    {0}".format(ws.path if ws else "{0} (no worktree)".format(repo)))
+        print("stages  {0}".format(
+            ", ".join(
+                "{0}={1}".format(name, stage_entry(state, name).get("status", "?"))
+                for name in stage_order(state)
+            )
+        ))
+        return EXIT_DONE
+    return continue_slice(args, repo, data_dir, rec)
+
+
+def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> int:
+    """Pick a stopped slice up where it stopped. The queue resumes slices this way too."""
     state = rec.read_state()
     if state is None:
         raise PipelineError("no readable state.json in {0}".format(rec.dir))
@@ -2131,16 +2290,6 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
     fields, body = parse_front_matter(rec.requirement_path.read_text(encoding="utf-8"))
     setup_command = resolve_setup(fields)
     ws = workspace.Workspace.from_dict(state.get("workspace"))
-    if args.dry_run:
-        print("slice   {0}  ({1})".format(rec.slice_id, status))
-        print("work    {0}".format(ws.path if ws else "{0} (no worktree)".format(repo)))
-        print("stages  {0}".format(
-            ", ".join(
-                "{0}={1}".format(name, stage_entry(state, name).get("status", "?"))
-                for name in stage_order(state)
-            )
-        ))
-        return EXIT_DONE
 
     if ws is None:
         # A slice started before v0.3 has no workspace key, and re-creating one
@@ -2319,8 +2468,8 @@ def _existing_slices(root: Path) -> List[SliceRecord]:
     ]
 
 
-def slice_touched_at(rec: SliceRecord) -> float:
-    """When this slice last moved. Ids sort alphabetically, which is not the same."""
+def record_touched_at(rec: Any) -> float:
+    """When this record last moved. Ids sort alphabetically, which is not the same."""
     state = rec.read_state() or {}
     for key in ("updated_at", "created_at"):
         value = state.get(key)
@@ -2345,36 +2494,46 @@ def _repo_hint(repo: Path, repo_given: bool) -> str:
     )
 
 
-def find_slice(repo: Path, slice_id: str, repo_given: bool = True) -> SliceRecord:
+def find_record(
+    records: Sequence[Any], pattern: str, kind: str, root: Path, hint: str = ""
+) -> Any:
     """Exact id, then unique prefix, then unique substring. ``last`` is by time.
 
     An ambiguous pattern is refused rather than resolved: picking the wrong
-    slice would resume the wrong work in someone's repository.
+    record would resume the wrong work in someone's repository.
     """
-    records = _existing_slices(slices_root(repo))
     if not records:
-        raise PipelineError(
-            "no slices in {0}{1}".format(slices_root(repo), _repo_hint(repo, repo_given))
-        )
-    if slice_id in ("last", "latest", "-"):
-        return max(records, key=lambda rec: (slice_touched_at(rec), rec.slice_id))
+        raise PipelineError("no {0}s in {1}{2}".format(kind, root, hint))
+    if pattern in ("last", "latest", "-"):
+        return max(records, key=lambda rec: (record_touched_at(rec), rec.label))
 
-    exact = [rec for rec in records if rec.slice_id == slice_id]
+    exact = [rec for rec in records if rec.label == pattern]
     if exact:
         return exact[0]
     for candidates in (
-        [rec for rec in records if rec.slice_id.startswith(slice_id)],
-        [rec for rec in records if slice_id in rec.slice_id],
+        [rec for rec in records if rec.label.startswith(pattern)],
+        [rec for rec in records if pattern in rec.label],
     ):
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
             raise PipelineError(
-                "'{0}' matches {1} slices: {2}\n    use the full id".format(
-                    slice_id, len(candidates), ", ".join(rec.slice_id for rec in candidates[:8])
+                "'{0}' matches {1} {2}s: {3}\n    use the full id".format(
+                    pattern,
+                    len(candidates),
+                    kind,
+                    ", ".join(rec.label for rec in candidates[:8]),
                 )
             )
-    raise PipelineError("no slice matching '{0}' in {1}".format(slice_id, slices_root(repo)))
+    raise PipelineError("no {0} matching '{1}' in {2}".format(kind, pattern, root))
+
+
+def find_slice(repo: Path, slice_id: str, repo_given: bool = True) -> SliceRecord:
+    """The slice half of ``find_record``, with the repo's own hint attached."""
+    root = slices_root(repo)
+    return find_record(
+        _existing_slices(root), slice_id, "slice", root, _repo_hint(repo, repo_given)
+    )
 
 
 def list_slices(repo: Path, repo_given: bool = True) -> int:

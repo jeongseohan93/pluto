@@ -5,10 +5,12 @@ Claude Code 실행을 감싸서 **어디서 컨텍스트와 돈이 새는지** �
 `--repo`만 바꾸면 그대로 쓴다.
 
 **v0.1 = Telemetry Runner**(`aidev run`) **+ v0.2 = Slice Pipeline**(`aidev pipeline`)
-**+ v0.3 = Workspace 격리**. 현재 v0.3.0. 요구사항 .md 하나를 주면 plan → 승인 →
-implement → test를 사람 없이 진행하고, 정해둔 게이트에서만 승인을 기다린다.
-그 전부는 pipeline이 만든 **worktree + 전용 브랜치** 안에서 일어나고, 당신의
-체크아웃에는 당신이 `--merge`를 칠 때만 반영된다. 에픽 자동 분해는 v0.4다.
+**+ v0.3 = Workspace 격리 + v0.4 = Epic → Slice Planner**. 현재 v0.4.0.
+요구사항 .md 하나를 주면 plan → 승인 → implement → test를 사람 없이 진행하고,
+정해둔 게이트에서만 승인을 기다린다. **에픽 .md 하나를 주면** 그것을 slice 목록으로
+분해하고, 목록을 사람이 승인한 뒤 slice들을 순서대로 완주시킨다. 그 전부는
+pipeline이 만든 **worktree + 전용 브랜치** 안에서 일어나고, 당신의 체크아웃에는
+당신이 `--merge`를 칠 때만 반영된다.
 
 ```
 aidev run
@@ -53,7 +55,7 @@ aidev run \
 
 | 옵션 | 설명 |
 | --- | --- |
-| `--phase` | `plan` / `explore` / `implement` / `review` / `test` / `repair` (기본 `implement`) |
+| `--phase` | `plan` / `explore` / `implement` / `review` / `test` / `repair` / `decompose` (기본 `implement`) |
 | `--project`, `--task` | 라벨. 기본값은 repo 디렉터리명, 프롬프트 파일명 |
 | `--max-turns` | 기본 80 |
 | `--model` | claude에 그대로 전달 |
@@ -61,7 +63,7 @@ aidev run \
 | `--allowed-tools` | `--allowedTools`로 전달 |
 | `--disallowed-tools` | `--disallowedTools`로 전달 (쉼표 구분) |
 | `--safety` | `default` / `readonly`. readonly는 변경 계열 툴 전부 차단 |
-| `--resume` | 기존 session id 이어받기 (v0.4 대비 배선만 해둠) |
+| `--resume` | 기존 session id 이어받기 (pipeline이 쿼터 재시도에 쓰는 것과 같은 배선) |
 | `--claude-bin`, `--claude-arg` | 실행 파일 교체 / 원시 인자 추가 |
 | `--dry-run` | 실행할 커맨드만 출력 |
 | `--no-live` | 라이브 패널 끄기 |
@@ -242,6 +244,140 @@ rejected: 사유         → slice 중단, 사유를 state.json에 기록
 대기 중 프로세스를 죽여도 승인 파일이 곧 기록이라, `--resume-slice`로 이어가면
 그 답을 그대로 읽고 계속한다.
 
+### Epic → Slice Planner (v0.4)
+
+> slice 하나의 무인 실행은 v0.3에서 끝났다. 남은 병목은 **사람이 slice마다
+> 요구사항을 쓰고 발사 명령을 치는 것**이었다. 에픽 .md 하나를 주면 목록으로
+> 분해하고, 사람이 그 목록을 승인하면 나머지는 순서대로 완주한다.
+
+```bash
+aidev pipeline --repo ~/jokertest --epic epics/v0-5-memory.md
+aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점부터
+```
+
+```
+에픽.md
+  → decompose (readonly, 에픽 전용 worktree)  → slices.md
+  → 목록 승인 게이트  ← 사람이 고치고 승인. 끌 수 없다
+  → slice 1 → slice 2 → ...   각각 v0.3 전체 흐름 그대로
+  → 사람이 --merge
+```
+
+**decompose는 새 단계다.** plan과 같은 `readonly` 프로파일로 돌고, 끝난 뒤
+`git status`로 사후 검증한다 — 분해가 코드를 건드렸으면 에픽을 실패시킨다.
+`aidev stats`에도 독립 phase로 집계된다. 본진이 아니라 **에픽 전용 worktree**
+(`epic/<epic-id>`)에서 도는데, 그래야 plan과 같은 강도의 사후 검증이 가능한
+깨끗한 기준선이 생기고, 분해가 읽는 코드도 사람의 WIP가 아닌 base 커밋이 된다.
+이 worktree에는 커밋을 만들지 않고, **목록이 승인되는 순간 통째로 사라진다.**
+
+**분해의 품질 기준은 턴 예산이다.** 프롬프트가 "각 slice의 각 단계가
+`--max-turns`(기본 80) 안에 끝나야 한다"고 요구하고, 실측 근거(2026-08-15에 너무
+크게 자른 slice 2건이 81턴에서 작업 절반을 남기고 사망)를 그대로 준다.
+판단이 서지 않으면 더 작게 자르라고 명시한다.
+
+`slices.md`의 각 항목은 **그 자체로 실행 가능한 requirement**다. 형식은 기존
+front matter 규약과 그대로 호환이고, 마커만 추가된다.
+
+```markdown
+=== SLICE 1: state.json에 memory 키 추가 ===
+---
+approval: plan
+---
+# state.json에 memory 키 추가
+
+## 요구 동작
+## Scope
+## 테스트
+## 하지 않는 것
+
+=== SLICE 2: ... ===
+```
+
+파서는 번호·콜론·대소문자·문서 전체를 감싼 코드펜스에 관용적이다(모델이 실제로
+흔들리는 지점이고, 어느 것도 목록의 의미를 바꾸지 않는다). 첫 마커 앞의 텍스트는
+메모로 보존되고 실행되지 않는다. 마커를 하나도 못 찾으면 slices.md 경로와
+`--resume-epic`을 찍고 실패한다 — **게이트가 바로 이 실패를 사람 손에 넘기는
+장치다.** 목록의 순서가 곧 의존 순서다: 뒤가 앞에 의존할 수는 있어도 반대는 안 된다.
+
+**목록 게이트는 `approval: none`으로도 끌 수 없다.** 분해는 모델이 "무슨 일이
+존재하는가"를 정하는 유일한 단계라서, 무엇이든 돌기 전에 반드시 사람을 거친다.
+사람은 승인 전에 slices.md를 직접 고쳐도 된다 (plan 수정-승인과 같은 규약).
+
+#### slice N+1은 어디서 갈라지나
+
+요구사항이 명시적으로 요구한 결정이다. 세 안을 실제 코드 기준으로 비교했다.
+
+| | (a) 모두 같은 base | (b) N의 브랜치 위에 N+1 | (c) N을 auto-merge 후 N+1 |
+| --- | --- | --- | --- |
+| 의존 slice가 선행 결과를 본다 | **못 본다.** slice 2의 worktree에 slice 1의 코드가 없다 | 본다 | 본다 |
+| merge 충돌 | 같은 파일을 건드리면 merge마다 충돌 | 사슬이라 base 대비 선형 | 없음 |
+| 사람 merge 원칙 | 지킴 | 지킴 | **깨짐.** 무인 루프가 base를 움직인다 |
+| 실패 slice 격리 | 좋음 | tip부터 거꾸로 discard | auto-merge된 건 되돌리기 어렵다 |
+
+**(b)를 채택했다.** 단 그대로 쓰면 slice N+1의 base가 `slice/<N>`이 되어 `--merge`가
+사람에게 남의 브랜치를 체크아웃하라고 요구한다. 그래서 **"어디서 갈라지나"와
+"어디로 merge되나"를 분리한다** — `workspace`의 `base`는 에픽의 base 브랜치로
+모든 slice가 동일하고(merge 대상), `start`가 분기 지점이다(slice 1은 에픽 시작
+시점에 고정한 `base_commit`, slice N+1은 `slice/<N>`). 사슬이므로 앞 slice들은
+조상이고, 사람이 순서대로 merge하든 tip 하나만 merge하든 결과가 같다.
+(c)는 채택하지 않았으므로 "사람의 merge만이 진짜 이력" 원칙과의 조화 방안도 필요없다.
+
+사슬 중간 slice를 `--discard`해서 뒤 slice가 갈라질 곳이 사라지면 **조용히 base로
+되돌아가지 않고 실패시킨다.** 의존이 사라진 채 도는 쪽이 더 나쁘다.
+
+#### 큐가 멈추는 것과 실패하는 것
+
+- **쿼터 대기는 큐를 중단시키지 않는다.** 해당 slice가 `quota_wait`로 대기 후
+  이어가고, 큐는 그 slice의 완료를 기다릴 뿐이다.
+- **slice 안의 승인 게이트도 그대로 작동한다.** 큐가 승인 대기에서 멈춰 있는 것은
+  정상 상태다. 둘 다 특별 처리가 없다 — 큐는 v0.3 루프를 호출하고 그 안에서
+  블로킹되므로 저절로 성립한다.
+- slice 하나가 `failed`면 큐는 거기서 **중단**한다.
+
+```text
+[pipeline] EPIC FAILED - slice 2 (v0-5-memory-02-queue) failed: stage 'test' reported failing tests
+[pipeline]   fix it, then:  aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory
+[pipeline]   the remaining list can be rewritten first: ~/jokertest/.aidev/epics/v0-5-memory/slices.md
+```
+
+재개 전에 **남은 목록을 다시 쓸 수 있다.** 이미 시작된 항목은 위치 기준으로
+그대로 유지하고(그 requirement는 이미 브랜치에 커밋돼 있어서 지금 바꾸면
+거짓말이 된다), 시작되지 않은 첫 위치부터 끝까지를 현재 slices.md로 통째
+교체한다. 목록이 이미 돈 개수보다 짧아지면 무엇이 이미 돌았는지 알려주고
+거부한다. 버려진(`discarded`) 항목은 "시작되지 않음"으로 되돌아가 다시 만들어진다 —
+사람이 slice를 버리고 다시 쓰는 탈출구다. 분해의 **자동** 재조정은 하지 않는다.
+
+`.aidev/epics/<epic-id>/`에 들어가는 것:
+
+```
+<대상repo>/.aidev/epics/v0-5-memory/
+├── epic.md          원본 사본
+├── slices.md        decompose 산출물 (승인 전 사람이 고쳐도 된다)
+├── slices/01-x.md   목록에서 잘라낸, 항목당 하나의 실행 가능한 requirement
+├── state.json       에픽 진행의 유일한 원천 (단일 writer = 이 프로세스)
+├── approvals/
+│   └── decompose.md
+└── runs.json        decompose의 run들
+```
+
+epic `state.json`은 slice의 규약을 그대로 상속한다(단일 writer, atomic 쓰기,
+관용적 reader). status는 `running:decompose` / `waiting_approval:decompose` /
+`running:slice` / `quota_wait` / `done` / `failed` / `rejected`이고, `slices[]`에
+각 항목의 `index` / `title` / `requirement` / `slice_id` / `branch` / `start`가
+들어간다. **거기 적힌 `status`는 투영이다** — authoritative source는 언제나 해당
+slice의 `state.json`이고, 표시할 때마다 그쪽을 읽는다 (`.aidev/history/`의
+`slice.json`과 같은 철학). slice 쪽 state에도 `epic` 키로 어느 에픽의 몇 번째인지
+역참조가 남는다.
+
+`--list`는 에픽이 하나라도 있으면 slice 목록 위에 진행 상황을 함께 찍는다.
+
+```text
+EPIC                              STATUS                    SLICES                        UPDATED
+v0-5-memory                       running:slice 2/3         1=done 2=running:test 3=pending  2026-08-15T21:04
+```
+
+에픽은 중첩되지 않고(에픽 안의 에픽), slice는 **직렬로만** 돈다.
+
 ### 저장 위치
 
 run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다녀야 하므로**
@@ -362,6 +498,14 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   규약이 규약이 아니라 강제가 된다. 프로세스가 강제 종료돼 lock이 남으면 지우라고
   경로를 알려준다.
 - `--permission-mode`는 implement/test에만 먹는다. plan은 무슨 값을 줘도 readonly다.
+- **에픽의 목록 게이트는 `approval: none`으로도 못 끈다.** 다른 게이트는 사람이
+  끄겠다고 하면 꺼지지만, 분해는 무슨 일이 존재하는지를 정하는 단계라 예외다.
+- **decompose도 readonly + 사후 git 검증이다.** plan과 같은 프로파일, 같은 검사다.
+  게다가 에픽 전용 worktree에서 돌기 때문에 위조 시도가 본진의 승인 파일에
+  애초에 닿지 못한다.
+- **큐는 조용히 base로 되돌아가지 않는다.** slice N+1이 갈라질 `slice/<N>`이
+  없어졌으면 base에서 분기하는 대신 실패시킨다 — 의존이 사라진 채 도는 것이
+  더 나쁘다.
 - **테스트 명령은 규칙 단위로만 허용한다.** `acceptEdits`는 편집만 자동 승인하고
   Bash는 여전히 승인 대상이라, 규칙이 없으면 test 단계가 테스트를 **한 번도 못 돌린
   채** 끝난다(v0.2 실측). 그래서 implement/test에는 `--allowedTools`로 아래 규칙만
@@ -390,8 +534,10 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | 옵션 | 설명 |
 | --- | --- |
 | `--requirement` | 요구사항 .md (cwd → repo 순으로 찾는다) |
+| `--epic` | 에픽 .md — 분해 → 목록 승인 → slice 순차 실행 (v0.4) |
 | `--resume-slice` | 중단된 slice 이어가기 (id / prefix / `last`) |
-| `--list` | slice 목록과 상태 |
+| `--resume-epic` | 중단된 에픽 큐를 실패 지점부터 이어가기 (id / prefix / `last`) |
+| `--list` | slice 목록과 상태 (에픽이 있으면 에픽 진행 상황도 위에 함께) |
 | `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
 | `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
 | `--base` | slice가 갈라져 나올 브랜치 (기본: repo의 현재 HEAD, **main 아님**) |
@@ -661,7 +807,8 @@ pipeline이 만든 slice 상태는 여기가 아니라 **대상 repo의 `.aidev/
 들어간다 (위 [Slice Pipeline](#slice-pipeline-v02) 참고). 도구의 `data/`는 run
 상세, 대상 repo의 `.aidev/`는 프로젝트를 따라다녀야 하는 진행 상태다.
 slice 브랜치에 커밋되는 읽기 전용 스냅샷은 그 둘과 또 다른
-`.aidev/history/<slice-id>/`다.
+`.aidev/history/<slice-id>/`다. 에픽은 같은 원리로 `.aidev/epics/<epic-id>/`에
+들어간다 (위 [Epic → Slice Planner](#epic--slice-planner-v04) 참고).
 
 SQLite 테이블(전체 실행 비교용): `runs`, `tool_calls`, `file_accesses`, `phases`.
 `runs`에는 실행별 exact token(input / cache creation / cache read / output /
@@ -718,8 +865,8 @@ npm run build      # typecheck + electron-vite build
 v0.1  Telemetry Runner            ← 완료
 v0.2  Slice Pipeline              ← 완료
 v0.3  Workspace 격리               ← 완료 (worktree / 브랜치 / 단계별 커밋 / merge·discard)
-v0.4  Epic → Slice Planner        ← 지금 여기
-v0.5  Codebase Memory
+v0.4  Epic → Slice Planner        ← 완료 (decompose / 목록 게이트 / 순차 큐 / --resume-epic)
+v0.5  Codebase Memory             ← 지금 여기
 v0.6  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
 ```
 
@@ -727,6 +874,11 @@ Planner(에픽→slice 자동 분해)를 뒤로 미룬 이유: 그건 지금 사
 진행이 되지만, Pipeline(무인 실행 루프)이 없으면 사람이 자리를 비우는 순간 모든
 작업이 멈춘다. 병목부터 풀었다. 구 로드맵의 "HTML Dashboard"는 Pluto IDE가
 같은 화면을 담당하므로 제거했다.
+
+v0.4로 루프가 닫혔다. 사람이 치는 것은 **에픽 하나와 승인들과 merge**뿐이고,
+slice마다의 요구사항 작성과 발사는 없어졌다. 남긴 것: 병렬 slice 실행,
+분해의 자동 재조정, 에픽 중첩. 셋 다 사람의 판단을 대체하려다 조용히 틀릴 수 있는
+자리라서 의도적으로 비웠다.
 
 세션 정책: **쿼터 대기는 기존 session resume, 결론을 낸 실패 뒤의 재시도는 새 session,
 다음 단계는 언제나 새 session.**
