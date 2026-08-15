@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-dev-orchestrator"
-version = "0.1.2"
-description = "Telemetry runner for Claude Code sessions: raw stream-json capture, tool/file accounting, context hotspot reports."
+version = "0.2.0"
+description = "Telemetry runner and slice pipeline for Claude Code: raw stream-json capture, tool/file accounting, context hotspot reports, unattended plan/implement/test loop."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

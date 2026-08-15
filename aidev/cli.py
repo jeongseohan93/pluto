@@ -1,6 +1,7 @@
 """``aidev`` command line.
 
     aidev run --repo ~/jokertest --prompt tasks/doctor.md --phase implement
+    aidev pipeline --repo ~/jokertest --requirement tasks/doctor.md
     aidev report <run-id>|last
     aidev list
     aidev stats
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from . import __version__, reporter, runner
+from . import __version__, pipeline, reporter, runner
 from .storage import (
     Database,
     RunStore,
@@ -86,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print the command that would run and exit"
     )
     run_cmd.set_defaults(func=cmd_run)
+
+    pipeline.add_parser(sub)
 
     report_cmd = sub.add_parser("report", help="print the report of a stored run")
     report_cmd.add_argument("run_id", nargs="?", default="last")
