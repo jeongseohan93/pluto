@@ -15,8 +15,10 @@ function createWindow(): void {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#0d0e10',
-    title: 'AI Dev IDE',
-    ...(process.platform === 'linux' ? { icon } : {}),
+    title: 'Pluto IDE',
+    // macOS takes its icon from the bundle; Windows and Linux need it set here
+    // or the dev run shows the default Electron mark.
+    ...(process.platform === 'darwin' ? {} : { icon }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       // The renderer gets no OS reach of its own: everything it may do arrives
@@ -50,7 +52,7 @@ function createWindow(): void {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
   // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
+  electronApp.setAppUserModelId('com.plutoide.app')
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.

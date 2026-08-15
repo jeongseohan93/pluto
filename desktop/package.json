@@ -1,7 +1,7 @@
 {
-  "name": "desktop",
+  "name": "pluto-ide",
   "version": "1.0.0",
-  "description": "An Electron application with React and TypeScript",
+  "description": "Pluto IDE — graph-first, agent-first development environment",
   "main": "./out/main/index.js",
   "author": "example.com",
   "homepage": "https://electron-vite.org",

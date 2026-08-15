@@ -3,6 +3,7 @@ import type { ProjectInfo, TelemetrySnapshot, WorkspaceSummary } from '@shared/i
 import { Icon } from '@renderer/components/Icon'
 import { RunStateBadge } from '@renderer/components/primitives'
 import { tokens, usd } from '@renderer/lib/format'
+import mark from '@renderer/assets/pluto-mark.png'
 
 /**
  * The top bar answers the first three questions in the information hierarchy:
@@ -19,8 +20,11 @@ export function TopBar({
 }): JSX.Element {
   return (
     <header className="flex h-9 shrink-0 items-center gap-3 border-b border-line bg-panel pr-2 pl-3">
-      <span className="shrink-0 whitespace-nowrap text-tiny font-semibold tracking-[0.14em] text-fg-dim">
-        AI DEV IDE
+      <span className="flex shrink-0 items-center gap-2">
+        <img src={mark} alt="" width={20} height={20} className="rounded-[4px]" />
+        <span className="whitespace-nowrap text-tiny font-semibold text-fg">
+          Pluto <span className="text-fg-mute">IDE</span>
+        </span>
       </span>
 
       <span className="h-4 w-px shrink-0 bg-line" aria-hidden="true" />

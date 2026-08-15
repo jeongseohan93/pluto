@@ -329,10 +329,11 @@ pytest
 전 구간을 API 비용 없이 검증한다. 스텁은 일부러 **파싱 불가능한 줄 하나와
 request_id가 같은 중복 메시지 하나**를 섞어 보낸다 — 둘 다 회귀 테스트 대상이다.
 
-## 데스크톱 IDE 셸 (desktop/, v0.0.1)
+## Pluto IDE — 데스크톱 셸 (desktop/, v0.0.1)
 
-Electron + React + TypeScript 기반 AI Dev IDE의 첫 셸. Python 코어와 완전히 분리돼
-있고, CLI 경로는 그대로 남는다.
+Electron + React + TypeScript 기반 첫 셸. Python 코어와 완전히 분리돼 있고,
+CLI 경로는 그대로 남는다. 앱 아이콘은 `png/pluto.png`에서 정사각 크롭해
+`desktop/resources/icon.png`와 `desktop/build/icon.{ico,icns,png}`로 만든다.
 
 ```bash
 cd desktop

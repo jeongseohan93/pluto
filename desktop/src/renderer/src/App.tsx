@@ -9,6 +9,7 @@ import { SurfacePane, type SurfaceId } from '@renderer/features/workspace/Surfac
 import { Inspector } from '@renderer/features/inspector/Inspector'
 import { BottomPanel, type BottomTab } from '@renderer/features/bottom/BottomPanel'
 import { StatusBar } from '@renderer/features/statusbar/StatusBar'
+import mark from '@renderer/assets/pluto-mark.png'
 
 /** Which surface each activity opens in the main pane. */
 const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
@@ -186,8 +187,9 @@ function App(): JSX.Element {
 
 function Booting(): JSX.Element {
   return (
-    <div className="flex h-full items-center justify-center">
-      <span className="text-tiny tracking-[0.14em] text-fg-mute">AI DEV IDE</span>
+    <div className="flex h-full flex-col items-center justify-center gap-2">
+      <img src={mark} alt="" width={40} height={40} className="rounded-lg opacity-70" />
+      <span className="text-tiny text-fg-mute">Pluto IDE</span>
     </div>
   )
 }

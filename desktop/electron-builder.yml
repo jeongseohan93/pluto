@@ -1,5 +1,5 @@
-appId: com.electron.app
-productName: desktop
+appId: com.plutoide.app
+productName: Pluto IDE
 directories:
   buildResources: build
 files:
@@ -12,7 +12,7 @@ files:
 asarUnpack:
   - resources/**
 win:
-  executableName: desktop
+  executableName: pluto-ide
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
