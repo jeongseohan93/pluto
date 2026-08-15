@@ -22,6 +22,13 @@ import os
 import sys
 import time
 
+# ``runner.execute`` writes and reads UTF-8 explicitly.  Python launched through
+# a Windows .cmd file otherwise decodes redirected stdin with the active ANSI
+# code page, corrupting non-ASCII requirements before the stub can log them.
+for stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+
 # A run that fails still burned tokens, so failures report usage like real ones.
 FAILED_USAGE = {
     "input_tokens": 20,

@@ -80,6 +80,23 @@ def slice_dir(repo):
 # ------------------------------------------------------------------ full loop
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows .cmd encoding regression")
+def test_windows_cmd_stub_reads_utf8_prompt(repo, claude_bin, log):
+    prompt = "밤 페이즈 의사 보호 로직"
+    result = subprocess.run(
+        ["cmd", "/c", claude_bin],
+        cwd=str(repo),
+        input=prompt,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocations(log)[0]["prompt"] == prompt
+
+
 def test_unattended_slice_runs_every_stage(repo, tmp_path, claude_bin, log, capsys):
     requirement(repo, front="approval: none")
 
@@ -808,6 +825,28 @@ def test_decision_parsing(tmp_path, text, verdict, reason):
 
 def test_decision_of_a_missing_file_is_pending(tmp_path):
     assert pipeline.read_decision(tmp_path / "absent.md").verdict == pipeline.PENDING
+
+
+def test_state_write_retries_a_transient_windows_replace_collision(tmp_path, monkeypatch):
+    rec = pipeline.SliceRecord(tmp_path, "20260815-doctor").ensure()
+    real_write = pipeline.write_json_atomic
+    calls = []
+    slept = []
+
+    def locked_once(path, data):
+        calls.append(path)
+        if len(calls) == 1:
+            raise PermissionError("state.json is briefly open by a reader")
+        real_write(path, data)
+
+    monkeypatch.setattr(pipeline, "write_json_atomic", locked_once)
+    monkeypatch.setattr(pipeline, "_sleep", lambda seconds: slept.append(seconds))
+    rec.write_state({"status": "pending"})
+
+    assert len(calls) == 2
+    assert slept == [pipeline._STATE_REPLACE_RETRY_S]
+    assert rec.read_state()["status"] == "pending"
+    assert not rec.state_path.with_name("state.json.tmp").exists()
 
 
 def test_quota_markers_do_not_fire_on_ordinary_failures():

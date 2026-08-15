@@ -94,6 +94,8 @@ DEFAULT_QUOTA_MAX_RETRIES = 20
 # A quota wait is chunked so the process stays interruptible; the chunk count is
 # fixed up front, never derived from the wall clock, so tests can stub _sleep.
 _WAIT_CHUNK_S = 30.0
+_STATE_REPLACE_RETRIES = 20
+_STATE_REPLACE_RETRY_S = 0.05
 
 _sleep = time.sleep  # indirection so tests can drive the waits without real time
 
@@ -271,7 +273,16 @@ class SliceRecord:
 
     def write_state(self, state: Dict[str, Any]) -> None:
         state["updated_at"] = now_iso()
-        write_json_atomic(self.state_path, state)
+        for attempt in range(_STATE_REPLACE_RETRIES):
+            try:
+                write_json_atomic(self.state_path, state)
+                return
+            except PermissionError:
+                # Windows readers may briefly open state.json without delete
+                # sharing, which makes os.replace fail until that handle closes.
+                if attempt + 1 >= _STATE_REPLACE_RETRIES:
+                    raise
+                _sleep(_STATE_REPLACE_RETRY_S)
 
     def read_plan(self) -> str:
         try:
