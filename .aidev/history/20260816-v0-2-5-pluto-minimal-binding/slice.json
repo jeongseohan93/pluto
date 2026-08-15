@@ -1,0 +1,29 @@
+{
+  "slice_id": "20260816-v0-2-5-pluto-minimal-binding",
+  "status": "pending",
+  "branch": "slice/20260816-v0-2-5-pluto-minimal-binding",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "50d828a6bccff5ad5a323fcdf61397c0575d990f",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": {
+    "command": "npm ci --prefix desktop",
+    "status": "pending"
+  },
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-16T03:31:45+09:00"
+}
