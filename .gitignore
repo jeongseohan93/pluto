@@ -13,6 +13,23 @@ node_modules/
 out/
 dist-electron/
 .vite/
+.eslintcache
+
+# Runtime artifacts: local run logs and telemetry carry absolute paths,
+# session ids, cost figures, and the contents of whatever repo was driven.
+/data/*
+!/data/runs/
+/data/runs/*
+!/data/runs/.gitkeep
+
+# Local agent config
+.claude/
+CLAUDE.local.md
+
+# Secrets
+.env
+.env.*
+!.env.example
 
 # Editor / OS
 .DS_Store
