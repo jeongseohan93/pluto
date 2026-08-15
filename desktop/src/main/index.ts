@@ -2,18 +2,28 @@ import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { IPC } from '../shared/ide'
+import * as mock from './mock-data'
 
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 670,
+    width: 1440,
+    height: 900,
+    minWidth: 960,
+    minHeight: 600,
     show: false,
     autoHideMenuBar: true,
+    backgroundColor: '#0d0e10',
+    title: 'AI Dev IDE',
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      // The renderer gets no OS reach of its own: everything it may do arrives
+      // through the capability API in preload.
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
     }
   })
 
@@ -49,8 +59,7 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window)
   })
 
-  // IPC test
-  ipcMain.on('ping', () => console.log('pong'))
+  registerIdeHandlers()
 
   createWindow()
 
@@ -70,5 +79,21 @@ app.on('window-all-closed', () => {
   }
 })
 
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.
+/**
+ * Read-only capability handlers backing the preload bridge.
+ *
+ * v0.0.1 answers every one of these from `mock-data`. When the Python `aidev`
+ * core is wired in, only the right-hand side of these lines changes.
+ */
+function registerIdeHandlers(): void {
+  ipcMain.handle(IPC.project, () => mock.project)
+  ipcMain.handle(IPC.workspaces, () => mock.workspaces)
+  ipcMain.handle(IPC.projectTree, () => mock.projectTree)
+  ipcMain.handle(IPC.graph, (_event, workspaceId: string) => mock.graphFor(workspaceId))
+  ipcMain.handle(IPC.changeSummary, (_event, workspaceId: string) =>
+    mock.changeSummaryFor(workspaceId)
+  )
+  ipcMain.handle(IPC.tests, (_event, workspaceId: string) => mock.testsFor(workspaceId))
+  ipcMain.handle(IPC.telemetry, () => mock.telemetry)
+  ipcMain.handle(IPC.sessionLogs, () => mock.sessionLogs)
+}

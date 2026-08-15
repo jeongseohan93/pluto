@@ -1,0 +1,118 @@
+@import 'tailwindcss';
+
+/**
+ * AI Dev IDE — neutral dark tool theme.
+ *
+ * Restrained on purpose: colour carries meaning (selection, run state, change),
+ * never decoration. No gradients, no glow, no glass.
+ */
+@theme {
+  --color-app: #0d0e10;
+  --color-panel: #131417;
+  --color-raised: #17181c;
+  --color-hover: #1d1f24;
+  --color-active: #23262c;
+
+  --color-line: #232529;
+  --color-line-strong: #31343b;
+
+  --color-fg: #e3e5e8;
+  --color-fg-dim: #9ea3ab;
+  --color-fg-mute: #676c74;
+
+  --color-accent: #4a7fc7;
+  --color-accent-soft: #1c2836;
+  --color-ok: #4f9d62;
+  --color-warn: #c39331;
+  --color-bad: #c2564f;
+  --color-add: #3f7d52;
+  --color-del: #a4514c;
+
+  --font-ui: 'Segoe UI', system-ui, -apple-system, 'Noto Sans KR', sans-serif;
+  --font-mono: 'Cascadia Mono', Consolas, ui-monospace, 'SFMono-Regular', monospace;
+
+  --text-micro: 10px;
+  --text-tiny: 11px;
+  --text-small: 12px;
+  --text-base: 13px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-app);
+    color: var(--color-fg);
+    font-family: var(--font-ui);
+    font-size: var(--text-small);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    cursor: default;
+    user-select: none;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #2b2e35;
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 6px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a3e46;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-accent);
+    outline-offset: -1px;
+  }
+}
+
+@layer components {
+  /* Section label used across every panel header. */
+  .panel-label {
+    font-size: var(--text-micro);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-fg-mute);
+  }
+
+  /**
+   * Resize handles: a hairline at rest, with a hit target wider than the line
+   * itself so the affordance is reachable without being visual noise.
+   */
+  .rp-separator {
+    position: relative;
+    flex: 0 0 1px;
+    background: var(--color-line);
+    transition: background 100ms ease;
+  }
+
+  .rp-separator::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
+  }
+
+  .rp-separator:hover,
+  .rp-separator:active {
+    background: var(--color-accent);
+  }
+}

@@ -1,22 +1,22 @@
-import { contextBridge } from 'electron'
-import { electronAPI } from '@electron-toolkit/preload'
+import { contextBridge, ipcRenderer } from 'electron'
+import { IPC, type AidevBridge } from '../shared/ide'
 
-// Custom APIs for renderer
-const api = {}
-
-// Use `contextBridge` APIs to expose Electron APIs to
-// renderer only if context isolation is enabled, otherwise
-// just add to the DOM global.
-if (process.contextIsolated) {
-  try {
-    contextBridge.exposeInMainWorld('electron', electronAPI)
-    contextBridge.exposeInMainWorld('api', api)
-  } catch (error) {
-    console.error(error)
-  }
-} else {
-  // @ts-ignore (define in dts)
-  window.electron = electronAPI
-  // @ts-ignore (define in dts)
-  window.api = api
+/**
+ * The only channel between the IDE UI and the machine.
+ *
+ * Every member is a named, read-only capability. There is deliberately no
+ * `exec`, no `runShell`, and no `readFile(anyPath)` here — the renderer must
+ * not be able to widen its own reach.
+ */
+const aidev: AidevBridge = {
+  getProject: () => ipcRenderer.invoke(IPC.project),
+  getWorkspaces: () => ipcRenderer.invoke(IPC.workspaces),
+  getProjectTree: () => ipcRenderer.invoke(IPC.projectTree),
+  getGraph: (workspaceId) => ipcRenderer.invoke(IPC.graph, workspaceId),
+  getChangeSummary: (workspaceId) => ipcRenderer.invoke(IPC.changeSummary, workspaceId),
+  getTests: (workspaceId) => ipcRenderer.invoke(IPC.tests, workspaceId),
+  getTelemetrySnapshot: () => ipcRenderer.invoke(IPC.telemetry),
+  getSessionLogs: () => ipcRenderer.invoke(IPC.sessionLogs)
 }
+
+contextBridge.exposeInMainWorld('aidev', aidev)

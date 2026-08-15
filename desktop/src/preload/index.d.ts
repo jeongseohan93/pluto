@@ -1,8 +1,7 @@
-import { ElectronAPI } from '@electron-toolkit/preload'
+import type { AidevBridge } from '../shared/ide'
 
 declare global {
   interface Window {
-    electron: ElectronAPI
-    api: unknown
+    aidev: AidevBridge
   }
 }

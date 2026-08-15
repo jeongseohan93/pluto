@@ -329,6 +329,29 @@ pytest
 전 구간을 API 비용 없이 검증한다. 스텁은 일부러 **파싱 불가능한 줄 하나와
 request_id가 같은 중복 메시지 하나**를 섞어 보낸다 — 둘 다 회귀 테스트 대상이다.
 
+## 데스크톱 IDE 셸 (desktop/, v0.0.1)
+
+Electron + React + TypeScript 기반 AI Dev IDE의 첫 셸. Python 코어와 완전히 분리돼
+있고, CLI 경로는 그대로 남는다.
+
+```bash
+cd desktop
+npm install
+npm run dev        # Electron 개발 실행
+npm run build      # typecheck + electron-vite build
+```
+
+`@quick-start/create-electron`의 `react-ts` 템플릿으로 생성했다. renderer는 OS 권한을
+직접 갖지 않는다 — `sandbox: true` / `contextIsolation: true`에서 preload가 노출하는
+읽기 전용 capability API(`window.aidev`)만 쓴다.
+
+**이 단계의 데이터는 전부 main 프로세스가 소유한 mock이다.** IPC 경계의 모양만
+확정했고 `aidev` 코어 연동은 아직 없다. Code Graph도 좌표가 손으로 적힌 mock이며,
+레이아웃 엔진은 v0.0.4에서 만든다.
+
+> Windows에서 VS Code 내장 터미널로 실행하면 `ELECTRON_RUN_AS_NODE=1`이 상속돼
+> Electron이 plain Node로 떠서 죽는다. 그 터미널에서는 변수를 지우고 실행한다.
+
 ## 로드맵
 
 ```
