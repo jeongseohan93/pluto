@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Node / Electron
+node_modules/
+out/
+dist-electron/
+.vite/
+
+# Editor / OS
+.DS_Store
+Thumbs.db

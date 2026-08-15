@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-dev-orchestrator"
+version = "0.1.2"
+description = "Telemetry runner for Claude Code sessions: raw stream-json capture, tool/file accounting, context hotspot reports."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+aidev = "aidev.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aidev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
