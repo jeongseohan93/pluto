@@ -30,6 +30,13 @@ from typing import Any, Dict, Iterable, List, Optional
 LIVE_FILENAME = "live.json"
 LIVE_SCHEMA = 1
 
+# How long an atomic write keeps trying when Windows refuses the replace because
+# a reader still holds the file: 20 x 0.05s, so one second at the outside.
+_REPLACE_RETRIES = 20
+_REPLACE_RETRY_S = 0.05
+
+_sleep = time.sleep  # same test seam as pipeline._sleep / cli._sleep
+
 # Declared once so the schema and the migration can never drift apart.
 RUN_COLUMNS = (
     ("id", "TEXT PRIMARY KEY"),
@@ -246,15 +253,34 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
-    """Write to ``<path>.tmp`` then ``os.replace`` - readers never see a partial file."""
+    """Write to ``<path>.tmp`` then ``os.replace`` - readers never see a partial file.
+
+    On Windows a reader that merely has the file open makes ``os.replace`` fail
+    with WinError 5: CPython's ``open()`` asks for no delete sharing, so a single
+    watcher reading live.json is enough. That is a momentary collision rather
+    than a wait, so it is retried briefly (1 second at most) and then raised.
+
+    The whole body is retried, not just the replace: ``tmp.open()`` can fail the
+    same way, and rewriting the temporary file is safer than reusing a partially
+    written one. ``SliceRecord.write_state`` retries on top of this, which is why
+    state.json's worst case is 20x this second - only reachable if a handle is
+    never released, and it still ends in the exception.
+    """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     text = json.dumps(data, indent=2, ensure_ascii=False, default=str)
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(str(tmp), str(path))
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(path))
+            return
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_RETRIES:
+                raise
+            _sleep(_REPLACE_RETRY_S)
 
 
 def read_json_tolerant(path: Path) -> Optional[Dict[str, Any]]:

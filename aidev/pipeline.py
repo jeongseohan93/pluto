@@ -64,6 +64,25 @@ STAGE_POLICY: Dict[str, Dict[str, Optional[str]]] = {
     "test": {"safety_profile": "default", "permission_mode": "acceptEdits"},
 }
 
+# acceptEdits auto-approves edits only: Bash still asks. Without rules granting
+# the verification commands up front, the test stage cannot run the suite even
+# once - measured, not guessed. Unrestricted Bash (--dangerously-skip-permissions)
+# stays forbidden: only what is listed here is opened.
+TEST_COMMAND_TOOLS: Tuple[str, ...] = (
+    "Bash(npm test)",
+    "Bash(npm test:*)",
+    "Bash(npm run test:*)",
+    "Bash(node --test)",
+    "Bash(node --test:*)",
+    "Bash(pytest)",
+    "Bash(pytest:*)",
+    "Bash(python -m pytest:*)",
+)
+# Both the exact and the prefix form of each command: whether a bare ``npm test``
+# matches a ``:*`` rule depends on the CLI version, and holding both passes either
+# way. plan is absent on purpose - it is readonly, so Bash is blocked outright.
+STAGES_WITH_TEST_COMMANDS: Tuple[str, ...] = ("implement", "test")
+
 AIDEV_DIRNAME = ".aidev"
 STATE_SCHEMA = 1
 STATE_FILENAME = "state.json"
@@ -90,6 +109,11 @@ DEFAULT_MAX_TURNS = 80
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_QUOTA_WAIT_S = 15 * 60.0
 DEFAULT_QUOTA_MAX_RETRIES = 20
+
+# A resumed session carries its own conclusion with it ("I was blocked"), so
+# after this many consecutive non-quota failures of one stage the retry starts a
+# fresh session instead. 1: the very first retry is the one that follows a fix.
+DEFAULT_SESSION_RESET_AFTER = 1
 
 # A quota wait is chunked so the process stays interruptible; the chunk count is
 # fixed up front, never derived from the wall clock, so tests can stub _sleep.
@@ -684,7 +708,7 @@ INSTRUCTIONS
 - Change only what the requirement needs. Match the conventions of every file
   you touch.
 - Do not commit, do not branch, do not touch git state.
-
+{allowed}
 Finish with a short summary: files changed and anything the plan got wrong.
 """
 
@@ -703,6 +727,11 @@ PLAN THAT WAS IMPLEMENTED
 INSTRUCTIONS
 - Run this project's own test suite the way the project runs it. Find the
   command from the project's config rather than assuming one.
+{allowed}- Run the test command as ONE plain command. Do not chain it with '&&' or
+  'cd x && ...': a chained command is a different command and may not be
+  approved.
+- If a command is refused for permission reasons, say so verbatim and report
+  FAIL. Never report a suite as passing that you could not run.
 - Do not fix the code and do not rewrite tests to make them pass. Reporting a
   failure honestly is the deliverable of this stage.
 
@@ -719,8 +748,24 @@ all, that is FAIL.
 _RESUME_NOTE = """\
 
 ---
-This session was interrupted by a usage limit and has been resumed. Continue the
-{stage} work from where it stopped; do not start over.
+This session was interrupted before it finished and has been resumed. Continue
+the {stage} work from where it stopped; do not start over.
+"""
+
+_FRESH_SESSION_NOTE = """\
+
+---
+A previous attempt at this stage failed and this is a NEW session with no memory
+of it. Judge the current state of the repository and the tools you have access to
+now, from scratch. Do not assume an earlier obstacle is still in place.
+"""
+
+# Rendered into the stages that are granted commands, so the model is told exactly
+# what --allowedTools already carries rather than guessing at a command shape. It
+# is built from the same tuple that is granted, so the two cannot drift apart.
+_ALLOWED_NOTE = """\
+- These Bash commands are pre-approved; prefer one of them:
+{rules}
 """
 
 
@@ -740,12 +785,19 @@ def parse_test_verdict(text: str) -> str:
     return matches[-1].lower() if matches else VERDICT_UNKNOWN
 
 
-def build_prompt(stage: str, requirement: str, plan: str = "") -> str:
+def build_prompt(
+    stage: str, requirement: str, plan: str = "", allowed: Sequence[str] = ()
+) -> str:
     if stage == "plan":
         return _PLAN_PROMPT.format(requirement=requirement.strip())
     template = _IMPLEMENT_PROMPT if stage == "implement" else _TEST_PROMPT
+    note = ""
+    if allowed:
+        note = _ALLOWED_NOTE.format(rules="\n".join("    " + rule for rule in allowed))
     return template.format(
-        requirement=requirement.strip(), plan=(plan.strip() or "(no plan recorded)")
+        requirement=requirement.strip(),
+        plan=(plan.strip() or "(no plan recorded)"),
+        allowed=note,
     )
 
 
@@ -766,6 +818,25 @@ class PipelineConfig:
     approval_timeout: float = 0.0
     quota_wait_s: float = DEFAULT_QUOTA_WAIT_S
     quota_max_retries: int = DEFAULT_QUOTA_MAX_RETRIES
+    allow_tools: List[str] = field(default_factory=list)
+    session_reset_after: int = DEFAULT_SESSION_RESET_AFTER
+
+
+def allowed_tools_for(stage: str, cfg: PipelineConfig) -> Tuple[str, ...]:
+    """The permission rules this stage is granted, in the order they were added.
+
+    Empty for a stage that runs no commands, which is what keeps plan readonly.
+    The same tuple feeds both ``--allowedTools`` and the prompt, so what the
+    stage is told it may run can never drift from what it actually may run.
+    """
+    if stage not in STAGES_WITH_TEST_COMMANDS:
+        return ()
+    rules: List[str] = []
+    for rule in tuple(TEST_COMMAND_TOOLS) + tuple(cfg.allow_tools):
+        rule = str(rule).strip()
+        if rule and rule not in rules:
+            rules.append(rule)
+    return tuple(rules)
 
 
 @dataclass
@@ -866,6 +937,9 @@ def execute_stage(
         max_turns=cfg.max_turns,
         model=cfg.model,
         permission_mode=permission_mode,
+        # Rule-scoped, never a blanket Bash unlock: acceptEdits alone would leave
+        # every verification command waiting for an approval nobody is there to give.
+        allowed_tools=",".join(allowed_tools_for(stage, cfg)) or None,
         safety_profile=policy["safety_profile"] or "default",
         resume_session=resume_session,
         claude_cmd=list(cfg.claude_cmd),
@@ -953,9 +1027,23 @@ def run_stage(
     entry = stage_entry(state, stage)
     attempt = int(entry.get("attempts") or 0)
     # Session policy: recovering the same stage resumes its session; a new stage
-    # always starts a new one.
+    # always starts a new one. Except after this stage has *concluded* it failed:
+    # a quota wait only interrupted the session, but an ordinary failure left it
+    # holding "I was blocked", and resuming that re-decides on a stale memory.
+    failures = int(entry.get("failures") or 0)
     session = entry.get("session_id")
+    fresh = False
+    if session and failures and failures >= cfg.session_reset_after:
+        say(
+            "stage '{0}' failed {1}x - starting a new session instead of resuming {2}".format(
+                stage, failures, session
+            )
+        )
+        entry.pop("session_id", None)
+        session = None
+        fresh = True
     retries = int((state.get("quota") or {}).get("retries") or 0)
+    allowed = allowed_tools_for(stage, cfg)
 
     while True:
         attempt += 1
@@ -963,10 +1051,12 @@ def run_stage(
         entry["attempts"] = attempt
         set_status(rec, state, "running:{0}".format(stage))
 
-        prompt = build_prompt(stage, requirement, rec.read_plan())
+        prompt = build_prompt(stage, requirement, rec.read_plan(), allowed=allowed)
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
-        banner(stage, rec.slice_id, attempt, resumed=bool(session))
+        elif fresh:
+            prompt += _FRESH_SESSION_NOTE
+        banner(stage, rec.slice_id, attempt, resumed=bool(session), fresh=fresh)
 
         run = execute_stage(cfg, rec, stage, prompt, attempt, resume_session=session)
         record_run(rec, run)
@@ -975,8 +1065,10 @@ def run_stage(
             session = run.session_id
 
         if not run.quota:
-            if run.ok and isinstance(state.get("quota"), dict):
-                state["quota"].update({"waiting": False, "resume_at": None})
+            if run.ok:
+                entry["failures"] = 0
+                if isinstance(state.get("quota"), dict):
+                    state["quota"].update({"waiting": False, "resume_at": None})
             return run
 
         if retries >= cfg.quota_max_retries:
@@ -1033,6 +1125,12 @@ def record_run(rec: SliceRecord, run: StageRun) -> None:
 
 
 # ---------------------------------------------------------------- the loop
+
+
+def note_stage_failure(state: Dict[str, Any], stage: str) -> None:
+    """Count a conclusion this stage reached, so the next retry can drop its session."""
+    entry = stage_entry(state, stage)
+    entry["failures"] = int(entry.get("failures") or 0) + 1
 
 
 def set_status(rec: SliceRecord, state: Dict[str, Any], status: str) -> None:
@@ -1180,6 +1278,10 @@ def run_pipeline(
             if not run.ok:
                 entry["status"] = "failed"
                 entry["run_id"] = run.run_id
+                # Quota is excluded: a stage abandoned on a usage limit reached no
+                # conclusion of its own, so its session is still worth resuming.
+                if not run.quota:
+                    note_stage_failure(state, stage)
                 return fail_slice(
                     rec,
                     state,
@@ -1191,6 +1293,9 @@ def run_pipeline(
             reason = finish_stage(cfg, rec, state, run, before)
             if reason is not None:
                 entry["status"] = "failed"
+                # The run itself succeeded but the stage did not - a TEST_RESULT:
+                # FAIL verdict lands here, and that is a session conclusion too.
+                note_stage_failure(state, stage)
                 return fail_slice(rec, state, reason)
             rec.write_state(state)
 
@@ -1219,10 +1324,13 @@ def say(message: str) -> None:
     print("[pipeline] {0}".format(message), flush=True)
 
 
-def banner(stage: str, slice_id: str, attempt: int, resumed: bool = False) -> None:
+def banner(
+    stage: str, slice_id: str, attempt: int, resumed: bool = False, fresh: bool = False
+) -> None:
     label = "{0}  {1}".format(stage.upper(), slice_id)
     if attempt > 1:
-        label += "  (attempt {0}{1})".format(attempt, ", resumed session" if resumed else "")
+        note = ", resumed session" if resumed else (", new session" if fresh else "")
+        label += "  (attempt {0}{1})".format(attempt, note)
     print("\n{0}\n{1}".format(label, reporter.rule()), flush=True)
 
 
@@ -1338,6 +1446,21 @@ def add_parser(sub: Any) -> Any:
         default=None,
         help="for implement/test, e.g. bypassPermissions (plan stays readonly)",
     )
+    cmd.add_argument(
+        "--allow-tool",
+        action="append",
+        default=[],
+        dest="allow_tools",
+        metavar="RULE",
+        help="extra permission rule for implement/test, e.g. --allow-tool 'Bash(npx vitest:*)'",
+    )
+    cmd.add_argument(
+        "--session-reset-after",
+        type=int,
+        default=DEFAULT_SESSION_RESET_AFTER,
+        metavar="N",
+        help="start a fresh session after N consecutive non-quota failures of the same stage",
+    )
     cmd.add_argument("--claude-bin", default="claude")
     cmd.add_argument("--claude-arg", action="append", default=[], dest="claude_args")
     cmd.add_argument("--no-live", action="store_true", help="disable the live panel")
@@ -1373,10 +1496,13 @@ def _dispatch(args: Any) -> int:
         raise PipelineError("--repo not found: {0}".format(repo))
     data_dir = (getattr(args, "data_dir", None) or default_data_dir()).expanduser()
 
+    # Whether the repo was chosen or merely defaulted to, so an empty answer can
+    # say which of the two it is.
+    repo_given = args.repo is not None
     if args.list_slices:
-        return list_slices(repo)
+        return list_slices(repo, repo_given)
     if args.resume_slice:
-        return resume_slice(args, repo, data_dir)
+        return resume_slice(args, repo, data_dir, repo_given)
     if args.requirement:
         return start_slice(args, repo, data_dir)
     raise PipelineError("one of --requirement, --resume-slice or --list is required")
@@ -1396,6 +1522,8 @@ def _config(args: Any, repo: Path, data_dir: Path) -> PipelineConfig:
         approval_timeout=args.approval_timeout,
         quota_wait_s=args.quota_wait,
         quota_max_retries=args.quota_max_retries,
+        allow_tools=list(getattr(args, "allow_tools", None) or []),
+        session_reset_after=getattr(args, "session_reset_after", DEFAULT_SESSION_RESET_AFTER),
     )
 
 
@@ -1454,8 +1582,8 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     return _finish(_config(args, repo, data_dir), rec, state, body)
 
 
-def resume_slice(args: Any, repo: Path, data_dir: Path) -> int:
-    rec = find_slice(repo, args.resume_slice)
+def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
+    rec = find_slice(repo, args.resume_slice, repo_given)
     state = rec.read_state()
     if state is None:
         raise PipelineError("no readable state.json in {0}".format(rec.dir))
@@ -1518,7 +1646,17 @@ def slice_touched_at(rec: SliceRecord) -> float:
         return 0.0
 
 
-def find_slice(repo: Path, slice_id: str) -> SliceRecord:
+def _repo_hint(repo: Path, repo_given: bool) -> str:
+    """An empty answer from the default repo says why it is empty, not just that."""
+    if repo_given or (Path(repo) / AIDEV_DIRNAME).is_dir():
+        return ""
+    return (
+        "\n    no {0}/ here - this is probably not the target repository."
+        "\n    pass --repo <path>".format(AIDEV_DIRNAME)
+    )
+
+
+def find_slice(repo: Path, slice_id: str, repo_given: bool = True) -> SliceRecord:
     """Exact id, then unique prefix, then unique substring. ``last`` is by time.
 
     An ambiguous pattern is refused rather than resolved: picking the wrong
@@ -1526,7 +1664,9 @@ def find_slice(repo: Path, slice_id: str) -> SliceRecord:
     """
     records = _existing_slices(slices_root(repo))
     if not records:
-        raise PipelineError("no slices in {0}".format(slices_root(repo)))
+        raise PipelineError(
+            "no slices in {0}{1}".format(slices_root(repo), _repo_hint(repo, repo_given))
+        )
     if slice_id in ("last", "latest", "-"):
         return max(records, key=lambda rec: (slice_touched_at(rec), rec.slice_id))
 
@@ -1548,10 +1688,10 @@ def find_slice(repo: Path, slice_id: str) -> SliceRecord:
     raise PipelineError("no slice matching '{0}' in {1}".format(slice_id, slices_root(repo)))
 
 
-def list_slices(repo: Path) -> int:
+def list_slices(repo: Path, repo_given: bool = True) -> int:
     records = _existing_slices(slices_root(repo))
     if not records:
-        print("(no slices in {0})".format(slices_root(repo)))
+        print("(no slices in {0}){1}".format(slices_root(repo), _repo_hint(repo, repo_given)))
         return EXIT_DONE
     widths = (34, 26, 34)
     print(_list_row(("SLICE", "STATUS", "STAGES"), widths, "UPDATED"))

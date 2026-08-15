@@ -1,7 +1,13 @@
 import json
+import os
 import sqlite3
+import threading
+import time
 from datetime import datetime
 
+import pytest
+
+from aidev import storage
 from aidev.storage import (
     Database,
     RunStore,
@@ -9,6 +15,7 @@ from aidev.storage import (
     make_run_id,
     resolve_run_dir,
     slugify,
+    write_json_atomic,
 )
 
 
@@ -97,6 +104,75 @@ def test_database_migrates_an_older_schema(tmp_path, filled_telemetry):
         row = db.recent_runs()[0]
         assert row["peak_context_tokens"] == 160
         assert row["safety_profile"] == "default"
+
+
+# -------------------------------------------------- windows replace collisions
+
+
+def test_write_json_atomic_retries_a_locked_replace(tmp_path, monkeypatch):
+    """A reader holding live.json makes os.replace fail; that is a wait, not a crash."""
+    path = tmp_path / "live.json"
+    real_replace = os.replace
+    calls = []
+    slept = []
+
+    def locked_twice(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(5, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", locked_twice)
+    monkeypatch.setattr(storage, "_sleep", lambda seconds: slept.append(seconds))
+    write_json_atomic(path, {"status": "running", "turns": 3})
+
+    assert len(calls) == 3
+    assert slept == [storage._REPLACE_RETRY_S] * 2
+    assert sum(slept) <= 1.0
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "running", "turns": 3}
+    assert not path.with_name("live.json.tmp").exists()
+
+
+def test_write_json_atomic_gives_up_after_a_second(tmp_path, monkeypatch):
+    """A handle that is never released ends in the original error, not silence."""
+    slept = []
+
+    def always_locked(_src, _dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(storage.os, "replace", always_locked)
+    monkeypatch.setattr(storage, "_sleep", lambda seconds: slept.append(seconds))
+    with pytest.raises(PermissionError):
+        write_json_atomic(tmp_path / "live.json", {"status": "running"})
+
+    assert len(slept) == storage._REPLACE_RETRIES - 1
+    assert sum(slept) <= 1.0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses the replace")
+def test_write_json_atomic_survives_a_real_windows_reader(tmp_path):
+    """No monkeypatch: a genuine open handle, a genuine WinError 5, and it still lands."""
+    path = tmp_path / "live.json"
+    write_json_atomic(path, {"status": "running"})
+
+    opened = threading.Event()
+
+    def hold():
+        with path.open("r", encoding="utf-8") as handle:
+            handle.read()
+            opened.set()
+            time.sleep(0.15)
+
+    reader = threading.Thread(target=hold)
+    reader.start()
+    opened.wait(2.0)
+    try:
+        write_json_atomic(path, {"status": "completed"})
+    finally:
+        reader.join(5.0)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "completed"}
+    assert not path.with_name("live.json.tmp").exists()
 
 
 def test_resolve_run_dir(tmp_path):

@@ -161,6 +161,11 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 `failed`, stage status는 `pending` / `running` / `done` / `failed`다. **stages의 키
 집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는 모르는 키를 그대로 표시해야 한다.
 
+Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 WinError 5로 죽는다
+(CPython의 `open()`이 delete 공유를 주지 않는다). 지연이 아니라 순간 충돌이므로
+`write_json_atomic`이 최대 1초(20회 × 0.05초) 다시 시도하고, 그래도 안 되면 예외를
+그대로 올린다 — 삼키지 않는다. `state.json`, `runs.json`, `live.json` 전부에 적용된다.
+
 ### 테스트 판정
 
 `claude` 프로세스는 테스트가 빨갛게 떠도 "정상 종료"한다. 그래서 exit code로는
@@ -186,7 +191,15 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 아니라 **마지막 result 이벤트와 stderr만** 본다 (모델이 rate limit을 *말하는* 것과
 실제로 걸리는 것은 다르다).
 
-같은 단계 복구는 기존 session을 resume하고, 다음 단계는 새 session으로 간다.
+세션 정책은 **왜 멈췄는지**로 갈린다. 쿼터 대기는 세션이 *중단*된 것뿐이라 같은
+session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / FAIL"이라는 **결론**을
+갖고 있어서, 그 세션을 물려주면 환경이 바뀌어도 낡은 기억으로 몇 턴 만에 같은
+결론을 재확정한다(실측). 그래서 같은 단계가 비쿼터 실패를 `--session-reset-after`회
+(기본 1회) 연속하면 재시도는 **새 session**으로 시작하고, 프롬프트에 "이전 시도의
+기억이 없으니 지금의 repo를 보고 판단하라"고 명시한다. 다음 단계는 언제나 새 session이다.
+
+첫 시도 도중 프로세스가 죽은 경우(`failures`가 0인데 session_id는 있음)는 *진행 중인
+작업*이므로 그대로 resume한다. 옛 동작이 필요하면 `--session-reset-after`를 크게 준다.
 
 ### 안전핀
 
@@ -205,6 +218,23 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
   규약이 규약이 아니라 강제가 된다. 프로세스가 강제 종료돼 lock이 남으면 지우라고
   경로를 알려준다.
 - `--permission-mode`는 implement/test에만 먹는다. plan은 무슨 값을 줘도 readonly다.
+- **테스트 명령은 규칙 단위로만 허용한다.** `acceptEdits`는 편집만 자동 승인하고
+  Bash는 여전히 승인 대상이라, 규칙이 없으면 test 단계가 테스트를 **한 번도 못 돌린
+  채** 끝난다(v0.2 실측). 그래서 implement/test에는 `--allowedTools`로 아래 규칙만
+  얹는다. `--dangerously-skip-permissions` 같은 무제한 Bash는 쓰지 않는다.
+
+  ```text
+  Bash(npm test)   Bash(npm test:*)   Bash(npm run test:*)
+  Bash(node --test)   Bash(node --test:*)
+  Bash(pytest)   Bash(pytest:*)   Bash(python -m pytest:*)
+  ```
+
+  대상 repo의 `.claude/settings.json`은 **건드리지 않는다** — 파이프라인이 tracked
+  파일을 만들면 dirty 검사와 정면으로 충돌한다. 사람이 영속 규칙을 원하면
+  `.claude/settings.local.json`을 직접 두면 되고, 위 규칙은 거기에 *더해진다*.
+  다른 명령이 필요하면 `--allow-tool 'Bash(npx vitest:*)'`처럼 추가한다.
+  같은 목록이 프롬프트에도 그대로 들어가므로, 모델이 아는 명령과 실제로 허용된
+  명령이 어긋날 수 없다.
 - 단계별 `--max-turns` 기본 80.
 
 주요 옵션:
@@ -216,6 +246,8 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 | `--list` | slice 목록과 상태 |
 | `--max-turns` | 단계별 상한 (기본 80) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
+| `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
+| `--session-reset-after` | 같은 단계가 비쿼터 실패 N회면 새 session (기본 1) |
 | `--poll-interval` | 승인 파일 polling 간격 (기본 3초) |
 | `--approval-timeout` | 승인 대기 포기 시간 (기본 0 = 무한 대기) |
 | `--quota-wait` | reset 시각을 못 읽을 때의 재시도 간격 (기본 900초) |
@@ -528,5 +560,6 @@ Planner(에픽→slice 자동 분해)를 뒤로 미룬 이유: 그건 지금 사
 작업이 멈춘다. 병목부터 풀었다. 구 로드맵의 "HTML Dashboard"는 Pluto IDE가
 같은 화면을 담당하므로 제거했다.
 
-세션 정책: **같은 단계의 실패 복구는 기존 session resume, 다음 단계는 새 session.**
+세션 정책: **쿼터 대기는 기존 session resume, 결론을 낸 실패 뒤의 재시도는 새 session,
+다음 단계는 언제나 새 session.**
 v0.2의 쿼터 재시도가 이 정책을 그대로 쓴다.

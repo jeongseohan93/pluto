@@ -6,11 +6,17 @@ the pipeline has to survive.
 
     AIDEV_FAKE_LOG        append one JSON line per invocation: argv, cwd, prompt
     AIDEV_FAKE_SESSION    session id to report (default: pipe-session)
-    AIDEV_FAKE_MODE       ok | quota | fail | touch      (default: ok)
+    AIDEV_FAKE_MODE       ok | quota | fail | touch | forge | requires_approval
+                          (default: ok)
                           quota  - report a usage limit for the first
                                    AIDEV_FAKE_QUOTA_FAILS invocations
                           fail   - report a plain error
                           touch  - write a file into cwd, then succeed
+                          forge  - self-approve the plan gate from inside .aidev/
+                          requires_approval
+                                 - behave like the real CLI without a rule for
+                                   the test command: refuse it and report FAIL,
+                                   unless argv carries Bash(npm run test:*)
     AIDEV_FAKE_QUOTA_FAILS  how many invocations fail with a limit (default: 1)
     AIDEV_FAKE_RESET_IN     seconds from now to advertise as the reset moment
     AIDEV_FAKE_TEXT         final text to emit instead of the per-stage default
@@ -55,9 +61,42 @@ def test_report():
     return "{0}\nTEST_RESULT: {1}".format(body, verdict)
 
 
+TEST_RULE = "Bash(npm run test:*)"
+
+
+def has_test_rule():
+    """Did a rule for the project's test command reach this process?
+
+    The real CLI only sees --allowedTools; nothing else in argv can stand in for
+    it, so looking at exactly that is what makes the check honest.
+    """
+    for index, arg in enumerate(sys.argv):
+        if arg == "--allowedTools" and index + 1 < len(sys.argv):
+            if TEST_RULE in sys.argv[index + 1].split(","):
+                return True
+    return False
+
+
+def approval_report():
+    """What the test stage reports with, and without, permission to run the suite."""
+    if not has_test_rule():
+        return (
+            "I tried to run: npm run test:guards\n"
+            "This command requires approval\n"
+            "TEST_RESULT: FAIL"
+        )
+    return "Ran: npm run test:guards\n345 passing, 0 failing.\nTEST_RESULT: PASS"
+
+
 def emit(event):
     sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def final_text(stage, mode):
+    if stage != "test":
+        return STAGE_TEXT[stage]
+    return approval_report() if mode == "requires_approval" else test_report()
 
 
 def detect_stage(prompt):
@@ -192,8 +231,7 @@ def main():
                 "cache_read_input_tokens": 900,
                 "output_tokens": 40,
             },
-            "result": os.environ.get("AIDEV_FAKE_TEXT")
-            or (test_report() if stage == "test" else STAGE_TEXT[stage]),
+            "result": os.environ.get("AIDEV_FAKE_TEXT") or final_text(stage, mode),
         }
     )
     return 0

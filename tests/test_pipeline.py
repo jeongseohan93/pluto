@@ -153,6 +153,63 @@ def test_stage_policies_reach_the_claude_command(repo, tmp_path, claude_bin, log
     assert "--disallowedTools" not in implement
     assert plan[plan.index("--max-turns") + 1] == "80"
 
+    # acceptEdits does not cover Bash, so the verification commands are granted
+    # by rule - and plan, which may run nothing at all, is granted none.
+    assert "--allowedTools" not in plan
+    for stage_argv in (implement, test):
+        rules = stage_argv[stage_argv.index("--allowedTools") + 1].split(",")
+        # the exact strings survive the shell, including spaces, '*' and parentheses
+        assert {"Bash(npm test)", "Bash(npm run test:*)", "Bash(node --test)"} <= set(rules)
+        assert "Bash" not in rules  # rule-scoped, never a blanket unlock
+
+
+def test_allowed_tools_for_grants_only_the_command_stages(tmp_path):
+    cfg = pipeline.PipelineConfig(repo=tmp_path, data_dir=tmp_path / "data")
+    assert pipeline.allowed_tools_for("plan", cfg) == ()
+    for stage in ("implement", "test"):
+        assert "Bash(npm run test:*)" in pipeline.allowed_tools_for(stage, cfg)
+        assert "Bash(pytest:*)" in pipeline.allowed_tools_for(stage, cfg)
+
+    # an extra rule is appended, and a duplicate of a built-in one is not repeated
+    cfg.allow_tools = ["Bash(npx vitest:*)", "Bash(npm test)"]
+    rules = pipeline.allowed_tools_for("test", cfg)
+    assert rules[-1] == "Bash(npx vitest:*)"
+    assert rules.count("Bash(npm test)") == 1
+    assert pipeline.allowed_tools_for("plan", cfg) == ()  # an override cannot open plan
+
+
+def test_the_test_stage_can_actually_run_the_suite(repo, tmp_path, claude_bin, log, monkeypatch):
+    """The measured v0.2 defect: without a rule the command is refused and never runs."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "requires_approval")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert state["test_verdict"] == "pass"
+
+    runs = json.loads((slice_dir(repo) / "runs.json").read_text(encoding="utf-8"))["runs"]
+    assert "345 passing" in runs[-1]["summary"]
+    assert "requires approval" not in runs[-1]["summary"]
+    # the stage was told what it may run, from the same list that was granted
+    assert "Bash(npm run test:*)" in invocations(log)[-1]["prompt"]
+
+
+def test_without_the_rule_the_test_command_is_refused(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Proof the test above depends on the rule: take it away and the stage fails."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "requires_approval")
+    monkeypatch.setattr(pipeline, "TEST_COMMAND_TOOLS", ())
+
+    code = main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md"))
+    assert code == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert state["test_verdict"] == "fail"
+    assert "--allowedTools" not in invocations(log)[-1]["argv"]
+
 
 def test_permission_mode_override_never_unlocks_plan(repo, tmp_path, claude_bin, log):
     requirement(repo, front="approval: none")
@@ -310,6 +367,83 @@ def test_resume_slice_continues_after_the_process_is_killed(
     calls = invocations(log)
     assert len(calls) == 3  # plan was not run twice
     assert "IMPLEMENT stage" in calls[1]["prompt"]
+
+
+def test_a_failed_stage_retries_in_a_new_session(repo, tmp_path, claude_bin, log, monkeypatch):
+    """A session that concluded 'blocked' must not be the one that judges the retry."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "fail")
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+
+    plan_entry = state_of(repo)["stages"]["plan"]
+    assert plan_entry["failures"] == 1
+    assert plan_entry["session_id"] == "pipe-session"  # it exists, and is still not resumed
+
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "ok")
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+
+    retry = invocations(log)[1]
+    assert "--resume" not in retry["argv"]
+    assert "has been resumed" not in retry["prompt"]
+    assert "NEW session with no memory" in retry["prompt"]
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert state["stages"]["plan"]["failures"] == 0  # cleared by the attempt that worked
+
+
+def test_session_reset_after_can_be_raised_back_to_the_old_behaviour(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "fail")
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "ok")
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--resume-slice", "last", "--session-reset-after", "5")
+    ) == 0
+
+    retry = invocations(log)[1]
+    assert retry["argv"][retry["argv"].index("--resume") + 1] == "pipe-session"
+
+
+def test_a_test_verdict_fail_counts_as_a_stage_failure(repo, tmp_path, claude_bin, log, monkeypatch):
+    """The shape of the real regression: FAIL is a conclusion, so the retry starts clean."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_VERDICT", "FAIL")
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+    assert state_of(repo)["stages"]["test"]["failures"] == 1
+
+    monkeypatch.setenv("AIDEV_FAKE_VERDICT", "PASS")
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+
+    calls = invocations(log)
+    assert len(calls) == 4  # only the test stage re-ran
+    assert "TEST STAGE" in calls[3]["prompt"].upper()
+    assert "--resume" not in calls[3]["argv"]
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert state["test_verdict"] == "pass"
+
+
+def test_a_quota_failure_does_not_count_as_a_stage_failure(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Giving up on a usage limit interrupted the session; it did not conclude it."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "quota")
+    monkeypatch.setenv("AIDEV_FAKE_QUOTA_FAILS", "99")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: None)
+
+    assert main(
+        argv(
+            repo, tmp_path, claude_bin,
+            "--requirement", "tasks/doctor.md",
+            "--quota-wait", "1",
+            "--quota-max-retries", "1",
+        )
+    ) == 1
+    assert state_of(repo)["stages"]["plan"].get("failures", 0) == 0
 
 
 def test_resume_by_prefix_and_repeat_resume_of_a_done_slice(repo, tmp_path, claude_bin, log):
@@ -501,6 +635,34 @@ def test_list_survives_unknown_stage_keys(repo, tmp_path, claude_bin, capsys):
     assert "namedone" not in out
     for line in out.splitlines():
         assert " " in line[30:36], line  # the column gap survives
+
+
+def test_list_without_repo_says_which_repo_it_looked_in(tmp_path, capsys, monkeypatch):
+    """An empty answer from the default cwd explains itself instead of just being empty."""
+    elsewhere = tmp_path / "not-the-target"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "no slices in" in out
+    assert "--repo" in out
+
+    # a chosen repo that happens to be empty is not a mistake, so it stays quiet
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--repo", str(elsewhere),
+                 "--list"]) == 0
+    assert "--repo <path>" not in capsys.readouterr().out
+
+
+def test_resume_without_repo_points_at_the_repo_flag(tmp_path, capsys, monkeypatch):
+    elsewhere = tmp_path / "not-the-target"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--resume-slice", "last"]) == 2
+    err = capsys.readouterr().err
+    assert "no slices in" in err
+    assert "pass --repo <path>" in err
 
 
 def test_dry_run_touches_nothing(repo, tmp_path, claude_bin, capsys):
