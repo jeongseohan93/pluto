@@ -1,5 +1,6 @@
 ---
 approval: plan
+max_turns: implement=140
 ---
 # Pipeline 자기수리 2차 — 실측 결함 4건 + 신규 채널 1건 + 빈칸 5개
 
