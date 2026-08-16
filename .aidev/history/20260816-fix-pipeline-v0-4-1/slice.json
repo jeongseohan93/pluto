@@ -1,0 +1,26 @@
+{
+  "slice_id": "20260816-fix-pipeline-v0-4-1",
+  "status": "pending",
+  "branch": "slice/20260816-fix-pipeline-v0-4-1",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9a9aca1ee2a8e9208e57da2b56b2067fc008735e",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-16T20:28:14+09:00"
+}
