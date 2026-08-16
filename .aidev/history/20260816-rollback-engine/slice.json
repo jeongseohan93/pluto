@@ -1,0 +1,28 @@
+{
+  "slice_id": "20260816-rollback-engine",
+  "status": "pending",
+  "branch": "slice/20260816-rollback-engine",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9269167931728f0446587f030db7597cd595919e",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-16T22:35:15+09:00"
+}
