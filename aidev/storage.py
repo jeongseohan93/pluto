@@ -117,6 +117,72 @@ def default_data_dir() -> Path:
     return Path.cwd() / "data"
 
 
+# ------------------------------------------------------------- recent repos
+#
+# Which repositories this tool has been pointed at. Only ever used to *offer*
+# candidates when a command was given no --repo: naming the repo stays the
+# human's, so nothing here is ever applied automatically.
+
+RECENT_REPOS_FILENAME = "repos.json"
+RECENT_REPOS_SCHEMA = 1
+RECENT_REPOS_LIMIT = 10
+
+
+def recent_repos_path(data_dir: Path) -> Path:
+    return Path(data_dir) / RECENT_REPOS_FILENAME
+
+
+def remember_repo(data_dir: Path, repo: Path) -> None:
+    """Record a repo the tool was pointed at. Best effort: this never raises.
+
+    A read-only or full data directory must not be what stops a pipeline
+    command; the candidate list is a convenience, not state anything depends on.
+    """
+    try:
+        path = recent_repos_path(data_dir)
+        current = str(Path(repo))
+        entry = {
+            "path": current,
+            "last_used": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        data = read_json_tolerant(path) or {}
+        kept = [
+            e
+            for e in (data.get("repos") or [])
+            if isinstance(e, dict)
+            and isinstance(e.get("path"), str)
+            and os.path.normcase(e["path"]) != os.path.normcase(current)
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            path,
+            {"schema": RECENT_REPOS_SCHEMA, "repos": ([entry] + kept)[:RECENT_REPOS_LIMIT]},
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def recent_repos(data_dir: Path, limit: int = 5) -> List[str]:
+    """Most recently used first. Paths that no longer exist are dropped."""
+    data = read_json_tolerant(recent_repos_path(data_dir)) or {}
+    found: List[str] = []
+    for entry in data.get("repos") or []:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("path")
+        if not isinstance(raw, str) or not raw or raw in found:
+            continue
+        try:
+            if not Path(raw).is_dir():
+                continue
+        except OSError:
+            continue
+        found.append(raw)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
     return slug[:40] or "run"

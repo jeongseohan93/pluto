@@ -303,6 +303,11 @@ def test_setup_tool_rules_grant_the_exact_and_the_prefix_form():
     assert rules == ("Bash(npm ci --prefix backend)", "Bash(npm ci:*)")
     assert pipeline.setup_tool_rules("bootstrap") == ("Bash(bootstrap)", "Bash(bootstrap:*)")
     assert pipeline.setup_tool_rules(None) == ()
+    # setup: is one command among others now, granted by the same function
+    assert pipeline.command_tool_rules("npm run test:guards") == (
+        "Bash(npm run test:guards)",
+        "Bash(npm run:*)",
+    )
 
 
 @pytest.mark.parametrize(
@@ -334,3 +339,166 @@ def test_a_setup_line_that_needs_a_shell_is_refused(front):
     fields, _ = pipeline.parse_front_matter("---\n{0}\n---\nbody\n".format(front))
     with pytest.raises(pipeline.PipelineError):
         pipeline.resolve_setup(fields)
+
+
+def front_matter(front):
+    fields, _ = pipeline.parse_front_matter("---\n{0}\n---\nbody\n".format(front))
+    return fields
+
+
+@pytest.mark.parametrize(
+    "front, expected",
+    [
+        ("approval: none", ()),
+        ("test_commands: npm run test:guards", ("npm run test:guards",)),
+        (
+            "test_commands: npm run test:guards, npm run lint",
+            ("npm run test:guards", "npm run lint"),
+        ),
+        # repeated lines accumulate; setup: beside it stays last-wins
+        (
+            "setup: npm ci\ntest_commands: npm run test:guards\ntest_commands: npx vitest run",
+            ("npm run test:guards", "npx vitest run"),
+        ),
+        ("test_commands: pytest -q   # 파이썬 쪽", ("pytest -q",)),
+        # the same command twice is one rule, not two
+        ("test_commands: pytest, pytest", ("pytest",)),
+    ],
+)
+def test_test_commands_are_read_from_front_matter(front, expected):
+    assert pipeline.resolve_test_commands(front_matter(front)) == expected
+
+
+@pytest.mark.parametrize(
+    "front",
+    [
+        "test_commands:",
+        "test_commands: ,",
+        "test_commands: npm test && rm -rf /",
+        "test_commands: npm test | tee log",
+        "test_commands: echo $(whoami)",
+    ],
+)
+def test_a_test_command_that_needs_a_shell_is_refused(front):
+    """Same rule as setup: a chained command could never match a permission rule."""
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.resolve_test_commands(front_matter(front))
+
+
+def test_repeated_lines_only_accumulate_for_the_keys_that_declared_it():
+    fields = front_matter("approval: plan\napproval: none\nsetup: a\nsetup: b")
+    assert fields["approval"] == "none"  # last-wins, unchanged
+    assert fields["setup"] == "b"
+
+
+@pytest.mark.parametrize(
+    "front, expected",
+    [
+        ("approval: none", (None, {})),
+        ("max_turns: 120", (120, {})),
+        ("max_turns: implement=140", (None, {"implement": 140})),
+        ("max_turns: implement=140, test=60", (None, {"implement": 140, "test": 60})),
+        ("max_turns: 100, implement=140", (100, {"implement": 140})),
+        # a dash and an underscore are the same key
+        ("max-turns: implement=140", (None, {"implement": 140})),
+        ("max_turns: implement=140   # 큰 slice", (None, {"implement": 140})),
+        # the same stage twice with the same number is not a contradiction
+        ("max_turns: implement=140 implement=140", (None, {"implement": 140})),
+    ],
+)
+def test_resolve_max_turns_syntax(front, expected):
+    assert pipeline.resolve_max_turns(front_matter(front)) == expected
+
+
+@pytest.mark.parametrize(
+    "front",
+    [
+        "max_turns:",  # meant to do something, does nothing
+        "max_turns: planz=10",  # a typo must not be a stage nobody runs
+        "max_turns: abc",
+        "max_turns: 0",
+        "max_turns: -5",
+        "max_turns: implement=0",
+        "max_turns: implement=140, implement=60",  # two answers for one stage
+    ],
+)
+def test_a_max_turns_line_that_cannot_be_honoured_is_refused(front):
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.resolve_max_turns(front_matter(front))
+
+
+def test_the_stage_option_form_refuses_a_bare_number():
+    """--max-turns-stage sets one stage; a bare number is what --max-turns is for."""
+    assert pipeline.parse_turn_tokens(["implement=140"], allow_base=False) == (
+        None,
+        {"implement": 140},
+    )
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.parse_turn_tokens(["140"], allow_base=False)
+
+
+def test_plan_scale_counts_files_and_tests():
+    text = (
+        "| `aidev/pipeline.py` | front matter |\n"
+        "| `aidev/workspace.py` | push |\n"
+        "| `./aidev/pipeline.py` | the same file again |\n"
+        r"| `tests\test_pipeline.py` | new tests |" + "\n"
+        "| `tests/test_epic.py` | one test |\n"
+        "| `src/__tests__/guards.ts` | a suite |\n"
+        "| `web/app.spec.tsx` | another |\n"
+        "| `README.md` | prose |\n"
+        "Prose that names no path at all.\n"
+    )
+    scale = pipeline.plan_scale(text)
+    # the duplicate './aidev/pipeline.py' is the same file, counted once
+    assert scale["files"] == 7
+    assert scale["test_files"] == 4
+    assert pipeline.plan_scale("") == {"files": 0, "test_files": 0}
+
+
+def test_only_a_plan_over_the_threshold_gets_a_note():
+    small = {"files": 3, "test_files": 1, "budget": 80, "warn": False}
+    assert pipeline.plan_scale_note(small) == ""
+    assert pipeline.plan_scale_note(None) == ""
+    big = {"files": 18, "test_files": 6, "budget": 80, "warn": True}
+    note = pipeline.plan_scale_note(big)
+    assert "18 file(s), 6 of them tests" in note
+    assert "max_turns: implement={0}".format(pipeline.PLAN_SUGGESTED_TURNS) in note
+    assert "--max-turns-stage implement={0}".format(pipeline.PLAN_SUGGESTED_TURNS) in note
+
+
+# ------------------------------------------------------------------- push
+#
+# --merge --push backs the merge up. Every test here pushes to a bare repo on
+# disk, so nothing resolves a hostname.
+
+
+@pytest.fixture
+def bare_remote(repo, tmp_path):
+    path = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True)
+    git(repo, "remote", "add", "origin", str(path))
+    return path
+
+
+def test_push_branch_pushes_that_branch_and_nothing_else(repo, tmp_path, bare_remote):
+    git(repo, "branch", "slice/20260816-doctor")
+    workspace.push_branch(repo, "origin", BASE_BRANCH)
+
+    refs = git(repo, "ls-remote", "origin").stdout
+    assert "refs/heads/{0}".format(BASE_BRANCH) in refs
+    assert "slice/20260816-doctor" not in refs
+    # a backup, not a change of configuration
+    assert workspace.branch_remote(repo, BASE_BRANCH) is None
+
+
+def test_remote_lookups_answer_for_a_repo_with_no_remote(repo):
+    assert workspace.remote_exists(repo, "origin") is False
+    assert workspace.branch_remote(repo, BASE_BRANCH) is None
+
+
+def test_pushing_to_a_remote_that_is_not_there_raises(repo, tmp_path):
+    git(repo, "remote", "add", "origin", str(tmp_path / "nowhere.git"))
+    assert workspace.remote_exists(repo, "origin") is True
+    with pytest.raises(workspace.GitError):
+        workspace.push_branch(repo, "origin", BASE_BRANCH)

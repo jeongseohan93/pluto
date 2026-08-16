@@ -57,6 +57,8 @@ from .storage import (
     default_data_dir,
     make_run_id,
     read_json_tolerant,
+    recent_repos,
+    remember_repo,
     slugify,
     write_json_atomic,
 )
@@ -108,6 +110,14 @@ SLICE_BRANCH_PREFIX = "slice/"
 HISTORY_DIR = "history"
 REQUIREMENT_STAGE = "requirement"
 COMMIT_MESSAGE = "slice({0}): {1}"
+
+# An amend re-opens these stages of a finished slice. plan is not among them:
+# the amendment itself is that cycle's plan, and re-planning a finished slice
+# would cost a whole readonly stage plus a gate on every correction.
+AMEND_STAGES: Tuple[str, ...] = ("implement", "test")
+# The label an amended stage commits under. The 'slice(<id>): ' prefix is
+# unchanged, so every existing reader of these commits keeps working.
+AMEND_LABEL = "amend{0}/{1}"
 
 # A stage commit that would sweep in this many files is a mistake, not a stage:
 # an unignored node_modules/ from a setup command would otherwise ride the merge
@@ -167,6 +177,11 @@ class PipelineError(RuntimeError):
 
 _FRONT_MATTER_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", re.DOTALL)
 
+# Only these keys accumulate across repeated lines, joined with a newline.
+# Everything else stays last-wins, which is what approval: and setup: have
+# always been and what their tests pin down.
+_MULTI_FIELDS: Tuple[str, ...] = ("test_commands",)
+
 
 def parse_front_matter(text: str) -> Tuple[Dict[str, str], str]:
     """Split a leading ``---`` block off the requirement; the body is untouched."""
@@ -180,7 +195,14 @@ def parse_front_matter(text: str) -> Tuple[Dict[str, str], str]:
         if not line or line.startswith("#") or ":" not in line:
             continue
         key, _, value = line.partition(":")
-        fields[key.strip().lower()] = _strip_inline_comment(value)
+        # A dash and an underscore are the same key: nothing today uses a dash,
+        # so accepting 'max-turns:' beside 'max_turns:' can only add.
+        key = key.strip().lower().replace("-", "_")
+        value = _strip_inline_comment(value)
+        if key in _MULTI_FIELDS and key in fields:
+            fields[key] = "{0}\n{1}".format(fields[key], value)
+        else:
+            fields[key] = value
     return fields, text[match.end() :]
 
 
@@ -248,6 +270,123 @@ def resolve_setup(fields: Dict[str, str]) -> Optional[str]:
     return command
 
 
+def resolve_test_commands(fields: Dict[str, str]) -> Tuple[str, ...]:
+    """The verification commands this slice declares. Empty means: use the built-ins.
+
+    Measured 2026-08-15: ``setup: npm ci --prefix backend`` granted ``Bash(npm
+    ci:*)`` and nothing that could run the project's frontend tests, so the
+    agent could not verify anything and left the plan. Deriving the verification
+    rules from the setup command was the mistake; they are declared separately.
+
+    Commas separate commands and repeated ``test_commands:`` lines accumulate, so
+    a command containing a comma cannot be expressed - use ``--allow-tool``.
+    """
+    raw = fields.get("test_commands")
+    if raw is None:
+        return ()
+    commands: List[str] = []
+    for part in re.split(r"[\n,]", raw):
+        command = part.strip()
+        if not command:
+            continue
+        for token in _SHELL_METACHARS:
+            if token in command:
+                raise PipelineError(
+                    "test_commands: '{0}' is not allowed - a permission rule matches one "
+                    "plain command, so a chained one could never be approved "
+                    "(found {1!r})".format(command, token)
+                )
+        if not split_command(command):
+            raise PipelineError(
+                "test_commands: could not read a command from {0!r}".format(command)
+            )
+        if command not in commands:
+            commands.append(command)
+    if not commands:
+        raise PipelineError("test_commands: needs a command, or leave the line out entirely")
+    return tuple(commands)
+
+
+def resolve_max_turns(
+    fields: Dict[str, str], stages: Sequence[str] = STAGES
+) -> Tuple[Optional[int], Dict[str, int]]:
+    """``(base, per-stage)`` from ``max_turns:``. ``(None, {})`` when absent.
+
+    Measured 2026-08-15/16: three implement stages died at turn 81 with the work
+    half done, each costing a resume. One budget for every stage was the wrong
+    shape - plan and test finish comfortably inside 80, implement is the one that
+    needs room::
+
+        max_turns: 120                  every stage
+        max_turns: implement=140        one stage
+        max_turns: 100, implement=140   a base plus an override
+    """
+    raw = fields.get("max_turns")
+    if raw is None:
+        return None, {}
+    if not raw.strip():
+        raise PipelineError(
+            "max_turns: needs a number, or <stage>=<number>, or leave the line out entirely"
+        )
+    return parse_turn_tokens([raw], stages, "max_turns:")
+
+
+def parse_turn_tokens(
+    tokens: Sequence[str],
+    stages: Sequence[str] = STAGES,
+    where: str = "max_turns:",
+    allow_base: bool = True,
+) -> Tuple[Optional[int], Dict[str, int]]:
+    """Read ``120`` / ``implement=140`` tokens the same way for the file and the flag."""
+    base: Optional[int] = None
+    per_stage: Dict[str, int] = {}
+    for raw in tokens:
+        for token in re.split(r"[,\s]+", str(raw).strip()):
+            if not token:
+                continue
+            name, sep, value = token.partition("=")
+            if not sep:
+                if not allow_base:
+                    raise PipelineError(
+                        "{0} needs <stage>=<number>, got {1!r} (stages: {2})".format(
+                            where, token, ", ".join(stages)
+                        )
+                    )
+                base = _turn_count(token, where)
+                continue
+            name = name.strip().lower()
+            if name not in stages:
+                raise PipelineError(
+                    "unknown stage '{0}' in {1} (stages: {2})".format(
+                        name, where, ", ".join(stages)
+                    )
+                )
+            count = _turn_count(value, where)
+            if per_stage.get(name, count) != count:
+                # Two different answers for one stage: guessing which was meant
+                # would silently pick a budget nobody asked for.
+                raise PipelineError(
+                    "{0} sets '{1}' twice, to {2} and {3}".format(
+                        where, name, per_stage[name], count
+                    )
+                )
+            per_stage[name] = count
+    return base, per_stage
+
+
+def _turn_count(value: str, where: str) -> int:
+    text = str(value).strip()
+    try:
+        count = int(text)
+    except ValueError:
+        count = 0
+    if count <= 0:
+        raise PipelineError(
+            "{0} needs a positive whole number, got {1!r}".format(where, text)
+        )
+    return count
+
+
 def split_command(command: str) -> List[str]:
     """Split a declared command into argv. Windows keeps its backslashes."""
     if os.name == "nt":
@@ -258,8 +397,8 @@ def split_command(command: str) -> List[str]:
     return shlex.split(command)
 
 
-def setup_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
-    """Permission rules for a declared setup command - exact form and prefix form.
+def command_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
+    """Permission rules for one declared command - exact form and prefix form.
 
     Both, for the same reason ``TEST_COMMAND_TOOLS`` holds both: whether a bare
     command matches a ``:*`` rule depends on the CLI version.
@@ -275,6 +414,77 @@ def setup_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(rules))
 
 
+def setup_tool_rules(command: Optional[str]) -> Tuple[str, ...]:
+    """The setup command's own rules. Same shape as any other declared command."""
+    return command_tool_rules(command)
+
+
+# --------------------------------------------------------------- plan scale
+#
+# Measured 2026-08-15/16: three implement stages died at turn 81 with the work
+# half done. What those three plans had in common is how much work they named,
+# so that is the trigger. This is a text heuristic over a document that lists
+# file paths: it only ever adds one advisory line, never blocks and never
+# changes a budget by itself.
+
+PLAN_FILE_WARN = 12
+PLAN_TEST_WARN = 5
+# Twice the default, which is roughly what the three resumes actually cost.
+PLAN_SUGGESTED_TURNS = 160
+
+_PLAN_PATH_RE = re.compile(
+    r"[\w./\\-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|json|toml|ya?ml|md|css|html)\b"
+)
+_TEST_SEGMENTS = ("test", "tests", "spec", "__tests__")
+
+
+def plan_scale(text: str) -> Dict[str, int]:
+    """How much work plan.md names: distinct file paths, and how many are tests."""
+    paths: List[str] = []
+    for match in _PLAN_PATH_RE.finditer(text or ""):
+        path = match.group(0).replace("\\", "/").lower()
+        while path.startswith("./"):
+            path = path[2:]
+        if path and path not in paths:
+            paths.append(path)
+    return {
+        "files": len(paths),
+        "test_files": len([path for path in paths if _looks_like_test(path)]),
+    }
+
+
+def _looks_like_test(path: str) -> bool:
+    segments = path.split("/")
+    if any(segment in _TEST_SEGMENTS for segment in segments):
+        return True
+    stem = segments[-1].rsplit(".", 1)[0]
+    return (
+        stem.startswith("test_")
+        or stem.endswith("_test")
+        or stem.endswith(".test")
+        or stem.endswith(".spec")
+    )
+
+
+def plan_scale_note(scale: Optional[Dict[str, Any]]) -> str:
+    """The warning a plan too big for its turn budget gets. Empty when it fits."""
+    if not isinstance(scale, dict) or not scale.get("warn"):
+        return ""
+    return (
+        "warning: this plan names {0} file(s), {1} of them tests - the budget of {2}\n"
+        "         turns may not be enough (three slices this size died at turn 81,\n"
+        "         measured 2026-08-15)\n"
+        "         raise it before approving:\n"
+        "           max_turns: implement={3}     in the requirement front matter\n"
+        "           --max-turns-stage implement={3}".format(
+            scale.get("files", 0),
+            scale.get("test_files", 0),
+            scale.get("budget", DEFAULT_MAX_TURNS),
+            PLAN_SUGGESTED_TURNS,
+        )
+    )
+
+
 # ------------------------------------------------------------------ approvals
 
 APPROVAL_TEMPLATE = """\
@@ -287,7 +497,7 @@ APPROVAL_TEMPLATE = """\
 #
 # You may edit {artifact} before approving - what follows reads {artifact} as it
 # is at the moment of approval.
-"""
+{note}"""
 
 
 @dataclass
@@ -366,6 +576,13 @@ class SliceRecord:
     @property
     def approvals_dir(self) -> Path:
         return self.dir / "approvals"
+
+    @property
+    def amends_dir(self) -> Path:
+        return self.dir / "amends"
+
+    def amend_path(self, number: int) -> Path:
+        return self.amends_dir / "{0:03d}.md".format(number)
 
     @property
     def slug(self) -> str:
@@ -548,6 +765,78 @@ def stage_entry(state: Dict[str, Any], stage: str) -> Dict[str, Any]:
         entry = {"status": "pending"}
         stages[stage] = entry
     return entry
+
+
+# ---------------------------------------------------------------- amendments
+#
+# An amend is neither a new stage nor a new slice: it is a new *cycle* over the
+# same record, re-opening the stages a correction can change. Every key it adds
+# is optional, which is why STATE_SCHEMA stays 2 - a reader that does not know
+# about them is not wrong, it is only older.
+
+
+def current_amend(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The amend this slice is inside, or ``None`` when it is not inside one."""
+    if not state.get("amend_open"):
+        return None
+    amends = state.get("amends")
+    if not isinstance(amends, list) or not amends:
+        return None
+    entry = amends[-1]
+    return entry if isinstance(entry, dict) else None
+
+
+def previous_result(rec: SliceRecord) -> Optional[Dict[str, Any]]:
+    """The last thing this slice reported - the RESULT an amend is answering."""
+    for entry in reversed(rec.runs()):
+        summary = entry.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return {
+                "stage": entry.get("stage"),
+                "run_id": entry.get("run_id"),
+                "summary": summary,
+            }
+    return None
+
+
+def open_amend(
+    rec: SliceRecord, state: Dict[str, Any], instruction: str, stages: Sequence[str]
+) -> Dict[str, Any]:
+    """Re-open ``stages`` for one more cycle and record why. Append-only."""
+    amends = state.get("amends")
+    if not isinstance(amends, list):
+        amends = []
+        state["amends"] = amends
+    entry = {
+        "n": len(amends) + 1,
+        "instruction": instruction,
+        "stages": list(stages),
+        "opened_at": now_iso(),
+        "previous_result": previous_result(rec),
+    }
+    amends.append(entry)
+    state["amend_open"] = True
+    for stage in stages:
+        stage_state = stage_entry(state, stage)
+        stage_state["status"] = "pending"
+        # A session that concluded "I finished" must not be resumed with a new
+        # instruction: it would judge the amendment against a stale memory.
+        stage_state.pop("session_id", None)
+        stage_state.pop("verdict", None)
+        stage_state["failures"] = 0
+    state.pop("test_verdict", None)
+    rec.amends_dir.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(rec.amend_path(entry["n"]), instruction.strip() + "\n")
+    rec.write_state(state)
+    return entry
+
+
+def close_amend(state: Dict[str, Any]) -> None:
+    """Only a finished cycle closes. A failed one stays open so a resume continues it."""
+    amend = current_amend(state)
+    if amend is not None:
+        amend["closed_at"] = now_iso()
+    state["amend_open"] = False
 
 
 def stage_order(state: Dict[str, Any]) -> List[str]:
@@ -808,7 +1097,7 @@ markdown - no preamble, no closing question.
 _IMPLEMENT_PROMPT = """\
 You are the IMPLEMENT stage of an unattended pipeline running on this repository.
 Nobody is watching: never ask a question, make the change.
-
+{amend}
 REQUIREMENT
 -----------
 {requirement}
@@ -831,7 +1120,7 @@ Finish with a short summary: files changed and anything the plan got wrong.
 _TEST_PROMPT = """\
 You are the TEST stage of an unattended pipeline running on this repository.
 Nobody is watching: never ask a question.
-
+{amend}
 REQUIREMENT
 -----------
 {requirement}
@@ -884,6 +1173,34 @@ _ALLOWED_NOTE = """\
 {rules}
 """
 
+# The other half of the measured defect: the agent left the plan because it had
+# concluded verification was impossible. When the requirement says what the
+# commands are, the stage is told so in as many words.
+_TEST_COMMANDS_NOTE = """\
+- This project's verification commands are declared by the requirement:
+{commands}
+  Run these. Do not go looking for another command, and do not conclude the
+  project cannot be verified.
+"""
+
+# What an amend cycle puts in front of implement and test: the instruction, and
+# what the cycle before it reported.
+_AMEND_NOTE = """\
+
+AMENDMENT - THIS IS WHAT YOU MUST DO NOW
+----------------------------------------
+{instruction}
+
+WHAT THE PREVIOUS CYCLE REPORTED ({stage})
+------------------------------------------
+{previous}
+
+The REQUIREMENT and PLAN below are history: they describe what this slice already
+built and are here so you understand the code you are changing. The amendment
+above is the change being asked for now. Do only that, and do not undo work the
+amendment does not mention.
+"""
+
 # Only rendered when the slice is isolated, so the un-isolated path reads exactly
 # as it did in v0.2.
 _WORKSPACE_NOTE = """\
@@ -916,6 +1233,8 @@ def build_prompt(
     allowed: Sequence[str] = (),
     branch: Optional[str] = None,
     base: Optional[str] = None,
+    test_commands: Sequence[str] = (),
+    amend: Optional[Dict[str, Any]] = None,
 ) -> str:
     if stage == "plan":
         return _PLAN_PROMPT.format(requirement=requirement.strip())
@@ -923,6 +1242,10 @@ def build_prompt(
     note = ""
     if allowed:
         note = _ALLOWED_NOTE.format(rules="\n".join("    " + rule for rule in allowed))
+    if test_commands:
+        note += _TEST_COMMANDS_NOTE.format(
+            commands="\n".join("    " + command for command in test_commands)
+        )
     where = ""
     if branch:
         where = _WORKSPACE_NOTE.format(branch=branch, base=base or "the repository's HEAD")
@@ -931,6 +1254,19 @@ def build_prompt(
         plan=(plan.strip() or "(no plan recorded)"),
         allowed=note,
         workspace=where,
+        amend=_amend_note(amend),
+    )
+
+
+def _amend_note(amend: Optional[Dict[str, Any]]) -> str:
+    if not amend:
+        return ""
+    previous = amend.get("previous_result")
+    previous = previous if isinstance(previous, dict) else {}
+    return _AMEND_NOTE.format(
+        instruction=str(amend.get("instruction") or "").strip(),
+        stage=str(previous.get("stage") or "unknown stage"),
+        previous=str(previous.get("summary") or "(nothing was recorded)").strip(),
     )
 
 
@@ -941,7 +1277,10 @@ def build_prompt(
 class PipelineConfig:
     repo: Path
     data_dir: Path
+    # The base budget, already resolved from the flag and the front matter.
     max_turns: int = DEFAULT_MAX_TURNS
+    # Per-stage overrides of it: implement is the one that outgrew 80.
+    stage_max_turns: Dict[str, int] = field(default_factory=dict)
     model: Optional[str] = None
     permission_mode: Optional[str] = None
     claude_cmd: List[str] = field(default_factory=lambda: ["claude"])
@@ -956,6 +1295,7 @@ class PipelineConfig:
     # None = in-place, which is v0.2's behaviour: a legacy slice or --no-worktree.
     workspace: Optional[workspace.Workspace] = None
     setup_command: Optional[str] = None
+    test_commands: List[str] = field(default_factory=list)
     setup_timeout: float = SETUP_TIMEOUT_S
     commit_file_limit: int = MAX_COMMIT_FILES
 
@@ -963,6 +1303,9 @@ class PipelineConfig:
     def cwd(self) -> Path:
         """Where Claude actually runs: the worktree when isolated, the repo otherwise."""
         return self.workspace.path if self.workspace is not None else self.repo
+
+    def turns_for(self, stage: str) -> int:
+        return self.stage_max_turns.get(stage, self.max_turns)
 
 
 def allowed_tools_for(stage: str, cfg: PipelineConfig) -> Tuple[str, ...]:
@@ -975,7 +1318,16 @@ def allowed_tools_for(stage: str, cfg: PipelineConfig) -> Tuple[str, ...]:
     if stage not in STAGES_WITH_TEST_COMMANDS:
         return ()
     rules: List[str] = []
-    declared = tuple(TEST_COMMAND_TOOLS) + setup_tool_rules(cfg.setup_command)
+    if cfg.test_commands:
+        # Declared: only these. The measured defect is exactly the setup-derived
+        # rule crowding out the real test command until the agent believed the
+        # project could not be verified at all.
+        declared = tuple(
+            rule for command in cfg.test_commands for rule in command_tool_rules(command)
+        )
+    else:
+        declared = tuple(TEST_COMMAND_TOOLS) + setup_tool_rules(cfg.setup_command)
+    # --allow-tool is an explicit human override in either branch, never dropped.
     for rule in declared + tuple(cfg.allow_tools):
         rule = str(rule).strip()
         if rule and rule not in rules:
@@ -1108,7 +1460,7 @@ def execute_stage(
         phase=spec.phase,
         project=cfg.repo.name,
         task=task,
-        max_turns=cfg.max_turns,
+        max_turns=cfg.turns_for(spec.stage),
         model=cfg.model,
         permission_mode=permission_mode,
         # Rule-scoped, never a blanket Bash unlock: acceptEdits alone would leave
@@ -1197,6 +1549,7 @@ def run_stage(
     stage: str,
     requirement: str,
     spec: Optional[StageSpec] = None,
+    amend: Optional[Dict[str, Any]] = None,
 ) -> StageRun:
     """Run one stage, waiting out usage limits on the same session as it goes."""
     spec = spec or StageSpec.for_slice(stage, cfg)
@@ -1235,6 +1588,8 @@ def run_stage(
             # What the worktree was actually cut from, which in an epic chain is
             # the previous slice's branch rather than the base it merges into.
             base=(cfg.workspace.start or cfg.workspace.base) if cfg.workspace else None,
+            test_commands=cfg.test_commands,
+            amend=amend,
         )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
@@ -1409,6 +1764,8 @@ def history_snapshot(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
         "epic": state.get("epic"),
         "gates": state.get("gates"),
         "setup": state.get("setup"),
+        "plan_scale": state.get("plan_scale"),
+        "amends": state.get("amends"),
         "stages": stages,
         "runs": runs,
         "updated_at": now_iso(),
@@ -1430,6 +1787,16 @@ def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any])
     plan = rec.read_plan()
     if plan.strip():
         write_text_atomic(directory / "plan.md", plan)
+    for entry in state.get("amends") or []:
+        if not isinstance(entry, dict) or not entry.get("n"):
+            continue
+        source = rec.amend_path(int(entry["n"]))
+        try:
+            text = source.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        (directory / "amends").mkdir(parents=True, exist_ok=True)
+        write_text_atomic(directory / "amends" / source.name, text)
     write_json_atomic(directory / "slice.json", history_snapshot(rec, state))
     return directory
 
@@ -1456,16 +1823,25 @@ def _explosion_reason(cfg: PipelineConfig, stage: str, paths: Sequence[str]) -> 
 
 
 def commit_stage(
-    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any], stage: str
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    stage: str,
+    label: Optional[str] = None,
 ) -> Optional[str]:
     """One commit per stage, made by the pipeline - never by the agent.
 
     Returns a reason to fail the slice, or None. A failed stage is not committed:
     whatever it left behind rides along with the next stage that succeeds, where
     a human sees it in one diff at merge time.
+
+    ``label`` is what the commit is called and how it is keyed in ``commits``;
+    it defaults to the stage. An amend cycle passes ``amend1/implement``, so the
+    original ``implement`` commit survives beside it.
     """
     if cfg.workspace is None:
         return None
+    label = label or stage
     mirror_history(cfg, rec, state)
     pending = _pending_files(cfg.cwd)
     if cfg.commit_file_limit and len(pending) > cfg.commit_file_limit:
@@ -1473,18 +1849,18 @@ def commit_stage(
     history = "{0}/{1}/{2}".format(AIDEV_DIRNAME, HISTORY_DIR, rec.slice_id)
     try:
         sha = workspace.commit_all(
-            cfg.cwd, COMMIT_MESSAGE.format(rec.slice_id, stage), force_paths=(history,)
+            cfg.cwd, COMMIT_MESSAGE.format(rec.slice_id, label), force_paths=(history,)
         )
     except workspace.GitError as exc:
         return "could not commit stage '{0}': {1}".format(stage, exc)
     commits = state.setdefault("commits", {})
     if isinstance(commits, dict) and sha:
-        commits[stage] = sha
+        commits[label] = sha
     if sha:
         # 'requirement' is a commit, not a stage: it must not appear in stages{}.
         if stage in stage_order(state):
             stage_entry(state, stage)["commit"] = sha
-        say("committed {0} ({1})".format(COMMIT_MESSAGE.format(rec.slice_id, stage), sha[:7]))
+        say("committed {0} ({1})".format(COMMIT_MESSAGE.format(rec.slice_id, label), sha[:7]))
     return None
 
 
@@ -1515,12 +1891,15 @@ def await_approval(
     state: Dict[str, Any],
     stage: str,
     artifact: str = "plan.md",
+    note: str = "",
 ) -> Decision:
     """Block until ``approvals/<stage>.md`` says approved or rejected.
 
     The file is the durable record, so a process killed while waiting resumes
     into exactly this function and reads the same answer. ``artifact`` is what
     the human may edit first - plan.md for a slice, slices.md for an epic.
+    ``note`` is advice the deciding human should see: it is printed here and
+    rendered into the template as comment lines, which ``read_decision`` ignores.
     """
     path = rec.approval_path(stage)
     decision = read_decision(path)
@@ -1528,12 +1907,16 @@ def await_approval(
         rec.approvals_dir.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             write_text_atomic(
-                path, APPROVAL_TEMPLATE.format(stage=stage, label=rec.label, artifact=artifact)
+                path,
+                APPROVAL_TEMPLATE.format(
+                    stage=stage, label=rec.label, artifact=artifact, note=_comment_lines(note)
+                ),
             )
         set_status(rec, state, "waiting_approval:{0}".format(stage))
         say("waiting for approval of '{0}'".format(stage))
         say("  edit {0}".format(path))
         say("  write 'approved' or 'rejected: <reason>' on its own line")
+        say_lines(note)
         deadline = time.time() + cfg.approval_timeout if cfg.approval_timeout else None
         while decision.verdict == PENDING:
             if deadline is not None and time.time() >= deadline:
@@ -1574,6 +1957,8 @@ def finish_stage(
             )
         rec.write_plan(run.text)
         say("plan saved: {0}".format(rec.plan_path))
+        state["plan_scale"] = _measure_plan(cfg, run.text)
+        say_lines(plan_scale_note(state["plan_scale"]))
 
     if run.stage == "test":
         verdict = parse_test_verdict(run.text)
@@ -1586,6 +1971,19 @@ def finish_stage(
             # but it must never read as a pass.
             say("warning: the test stage gave no TEST_RESULT line; result is unknown")
     return None
+
+
+def _measure_plan(cfg: PipelineConfig, text: str) -> Dict[str, Any]:
+    """What plan.md names, and whether that is more than implement's budget fits."""
+    scale: Dict[str, Any] = dict(plan_scale(text))
+    budget = cfg.turns_for("implement")
+    scale["budget"] = budget
+    scale["warn"] = bool(
+        (scale["files"] >= PLAN_FILE_WARN or scale["test_files"] >= PLAN_TEST_WARN)
+        # Already raised: there is nothing left to advise.
+        and budget < PLAN_SUGGESTED_TURNS
+    )
+    return scale
 
 
 def _diff_lines(before: str, after: str) -> str:
@@ -1623,7 +2021,13 @@ def run_pipeline(
     state.pop("reason", None)
     resume_quota_wait(cfg, rec, state)
     gates = {str(name) for name in (state.get("gates") or ())}
+    # Inside an amend only that cycle's stages run, so plan is history and its
+    # gate is never re-read - which is also what lets a rejected slice be amended.
+    amend = current_amend(state)
+    amend_stages = tuple(amend.get("stages") or ()) if amend is not None else ()
     for stage in stage_order(state):
+        if amend is not None and stage not in amend_stages:
+            continue
         entry = stage_entry(state, stage)
         if entry.get("status") != "done":
             readonly = STAGE_POLICY.get(stage, {}).get("safety_profile") == "readonly"
@@ -1653,7 +2057,7 @@ def run_pipeline(
                 if reason is not None:
                     return fail_slice(rec, state, reason)
             try:
-                run = run_stage(cfg, rec, state, stage, requirement)
+                run = run_stage(cfg, rec, state, stage, requirement, amend=amend)
             except PipelineError as exc:
                 # The run never produced a result, so leave the slice failed
                 # rather than frozen at running:<stage>.
@@ -1682,7 +2086,8 @@ def run_pipeline(
                 # FAIL verdict lands here, and that is a session conclusion too.
                 note_stage_failure(state, stage)
                 return fail_slice(rec, state, reason)
-            reason = commit_stage(cfg, rec, state, stage)
+            label = AMEND_LABEL.format(amend["n"], stage) if amend is not None else None
+            reason = commit_stage(cfg, rec, state, stage, label=label)
             if reason is not None:
                 # The stage itself succeeded and stays done; what failed is the
                 # snapshot, and a human has to say what belongs on the branch.
@@ -1692,7 +2097,8 @@ def run_pipeline(
         # Stage-independent: the same question after every stage, and the front
         # matter only decided which gates are on.
         if stage in gates:
-            decision = await_approval(cfg, rec, state, stage)
+            note = plan_scale_note(state.get("plan_scale")) if stage == "plan" else ""
+            decision = await_approval(cfg, rec, state, stage, note=note)
             if decision.verdict == REJECTED:
                 state["reason"] = "rejected at '{0}': {1}".format(
                     stage, decision.reason or "(no reason given)"
@@ -1703,6 +2109,8 @@ def run_pipeline(
             if decision.verdict != APPROVED:
                 return fail_slice(rec, state, "timed out waiting for approval of '{0}'".format(stage))
 
+    if amend is not None:
+        close_amend(state)
     set_status(rec, state, STATUS_DONE)
     return EXIT_DONE
 
@@ -1712,6 +2120,19 @@ def run_pipeline(
 
 def say(message: str) -> None:
     print("[pipeline] {0}".format(message), flush=True)
+
+
+def say_lines(text: str) -> None:
+    """A multi-line note, every line carrying the prefix. Silent when empty."""
+    for line in (text or "").splitlines():
+        say(line)
+
+
+def _comment_lines(text: str) -> str:
+    """The same note as '#' lines, so it can sit inside an approval file inertly."""
+    if not text:
+        return ""
+    return "#\n" + "".join(("# " + line).rstrip() + "\n" for line in text.splitlines())
 
 
 def banner(
@@ -1788,6 +2209,12 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     if verdict:
         note = {"pass": "", "fail": "  <- tests failed", "unknown": "  <- no TEST_RESULT line"}
         lines.append("Tests     {0}{1}".format(str(verdict).upper(), note.get(verdict, "")))
+    amends = [entry for entry in (state.get("amends") or []) if isinstance(entry, dict)]
+    if amends:
+        said = str(amends[-1].get("instruction") or "").strip().splitlines()
+        lines.append(
+            "Amends    {0}  (last: {1})".format(len(amends), _clip(said[0] if said else "", 48))
+        )
     if state.get("reason"):
         lines.append("Reason    {0}".format(state["reason"]))
     lines.extend(_workspace_lines(state))
@@ -1813,6 +2240,8 @@ def _workspace_lines(state: Dict[str, Any]) -> List[str]:
     commits = state.get("commits")
     if isinstance(commits, dict) and commits:
         order = [REQUIREMENT_STAGE] + stage_order(state)
+        # The amend keys are not stages, so they come after rather than vanish.
+        order += [name for name in commits if name not in order]
         shown = [
             "{0} {1}".format(name, str(commits[name])[:7]) for name in order if commits.get(name)
         ]
@@ -1832,6 +2261,11 @@ def _workspace_lines(state: Dict[str, Any]) -> List[str]:
         lines.append("Next      aidev pipeline --repo {0} --merge {1}".format(repo, slice_id))
         lines.append("          aidev pipeline --repo {0} --discard {1}".format(repo, slice_id))
     return lines
+
+
+def _clip(text: str, limit: int) -> str:
+    mark = reporter.glyph("ellipsis")
+    return text if len(text) <= limit else text[: max(0, limit - len(mark))] + mark
 
 
 def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
@@ -1884,7 +2318,18 @@ def add_parser(sub: Any) -> Any:
     )
     cmd.add_argument("--merge", default=None, metavar="SLICE", help="merge a finished slice into its base")
     cmd.add_argument(
+        "--push",
+        action="store_true",
+        help="with --merge: push the base branch to its remote (never the slice branch)",
+    )
+    cmd.add_argument(
         "--discard", default=None, metavar="SLICE", help="remove a slice's worktree and branch"
+    )
+    cmd.add_argument(
+        "--amend",
+        default=None,
+        metavar="SLICE",
+        help="run a fix cycle on a finished slice, on the branch it already owns",
     )
     cmd.add_argument(
         "--base",
@@ -1918,7 +2363,17 @@ def add_parser(sub: Any) -> Any:
         metavar="N",
         help="refuse a stage commit touching more files than this (default 2000)",
     )
-    cmd.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help="per stage (default 80)")
+    # No default: 'the user said 80' and 'the user said nothing' have to be told
+    # apart, because the front matter sits between them in the precedence order.
+    cmd.add_argument("--max-turns", type=int, default=None, help="per stage (default 80)")
+    cmd.add_argument(
+        "--max-turns-stage",
+        action="append",
+        default=[],
+        dest="stage_turns",
+        metavar="STAGE=N",
+        help="budget for one stage, e.g. --max-turns-stage implement=140 (repeatable)",
+    )
     cmd.add_argument("--model", default=None)
     cmd.add_argument(
         "--permission-mode",
@@ -1957,6 +2412,10 @@ def add_parser(sub: Any) -> Any:
     )
     cmd.add_argument("--quota-max-retries", type=int, default=DEFAULT_QUOTA_MAX_RETRIES)
     cmd.add_argument("--dry-run", action="store_true", help="print what would run and exit")
+    # Optional, so every invocation that existed before this argument still parses.
+    cmd.add_argument(
+        "instruction", nargs="?", default=None, help="what to change (only with --amend)"
+    )
     cmd.set_defaults(func=cmd_pipeline)
     return cmd
 
@@ -1978,11 +2437,16 @@ def _dispatch(args: Any) -> int:
     # Whether the repo was chosen or merely defaulted to, so an empty answer can
     # say which of the two it is.
     repo_given = args.repo is not None
+    # A repo without .aidev/ is almost certainly a junk cwd, and offering it back
+    # later as a candidate would be worse than offering nothing.
+    if (repo / AIDEV_DIRNAME).is_dir():
+        remember_repo(data_dir, repo)
     # Each of these is a whole command, not a modifier of another one.
     modes = (
         ("list_slices", "--list"),
         ("merge", "--merge"),
         ("discard", "--discard"),
+        ("amend", "--amend"),
         ("resume_slice", "--resume-slice"),
         ("resume_epic", "--resume-epic"),
         ("requirement", "--requirement"),
@@ -1991,17 +2455,27 @@ def _dispatch(args: Any) -> int:
     chosen = [flag for attr, flag in modes if getattr(args, attr, None)]
     if len(chosen) > 1:
         raise PipelineError("these cannot be combined: {0}".format(", ".join(chosen)))
+    instruction = getattr(args, "instruction", None)
+    if instruction is not None and not getattr(args, "amend", None):
+        raise PipelineError(
+            "unexpected argument {0!r} - a bare argument is the instruction for --amend, "
+            "and there is no --amend here".format(instruction)
+        )
+    if getattr(args, "push", False) and not getattr(args, "merge", None):
+        raise PipelineError("--push only makes sense with --merge")
     # Local, and only here: the epic module is a layer built on this one, so it
     # imports pipeline at the top. Importing it back at module level would be a cycle.
     from . import epic as epic_module
 
     if args.list_slices:
         epic_module.list_epics(repo)
-        return list_slices(repo, repo_given)
+        return list_slices(repo, repo_given, data_dir)
     if getattr(args, "merge", None):
-        return merge_slice(args, repo, repo_given)
+        return merge_slice(args, repo, repo_given, data_dir)
     if getattr(args, "discard", None):
-        return discard_slice(args, repo, repo_given)
+        return discard_slice(args, repo, repo_given, data_dir)
+    if getattr(args, "amend", None):
+        return amend_slice(args, repo, data_dir, repo_given)
     if args.resume_slice:
         return resume_slice(args, repo, data_dir, repo_given)
     if getattr(args, "resume_epic", None):
@@ -2010,7 +2484,7 @@ def _dispatch(args: Any) -> int:
         return start_slice(args, repo, data_dir)
     if getattr(args, "epic", None):
         return epic_module.start_epic(args, repo, data_dir)
-    raise PipelineError("one of --requirement, --epic, --resume-slice or --list is required")
+    raise PipelineError("one of --requirement, --epic, --amend, --resume-slice or --list is required")
 
 
 def _config(
@@ -2019,11 +2493,28 @@ def _config(
     data_dir: Path,
     ws: Optional[workspace.Workspace] = None,
     setup_command: Optional[str] = None,
+    fields: Optional[Dict[str, str]] = None,
 ) -> PipelineConfig:
+    """The one place turn budgets are resolved, so every entry point agrees.
+
+    CLI stage > front-matter stage > CLI base > front-matter base > the default.
+    A caller with no front matter to offer (an epic's own decompose) gets exactly
+    what it got before.
+    """
+    fields = fields or {}
+    front_base, front_stage = resolve_max_turns(fields)
+    _, cli_stage = parse_turn_tokens(
+        getattr(args, "stage_turns", None) or [], STAGES, "--max-turns-stage", allow_base=False
+    )
+    stage_turns = dict(front_stage)
+    stage_turns.update(cli_stage)
+    cli_base = getattr(args, "max_turns", None)
+    base = cli_base if cli_base is not None else front_base
     return PipelineConfig(
         repo=repo,
         data_dir=data_dir,
-        max_turns=args.max_turns,
+        max_turns=DEFAULT_MAX_TURNS if base is None else base,
+        stage_max_turns=stage_turns,
         model=args.model,
         permission_mode=args.permission_mode,
         claude_cmd=[args.claude_bin],
@@ -2037,6 +2528,7 @@ def _config(
         session_reset_after=getattr(args, "session_reset_after", DEFAULT_SESSION_RESET_AFTER),
         workspace=ws,
         setup_command=setup_command,
+        test_commands=list(resolve_test_commands(fields)),
         setup_timeout=getattr(args, "setup_timeout", SETUP_TIMEOUT_S),
         commit_file_limit=getattr(args, "commit_file_limit", MAX_COMMIT_FILES),
     )
@@ -2074,6 +2566,8 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
             raise PipelineError("requirement has front matter but no body: {0}".format(source))
         gates = resolve_gates(fields)
         setup_command = resolve_setup(fields)
+        test_commands = resolve_test_commands(fields)
+        turns = _config(args, repo, data_dir, fields=fields)
         root = slices_root(repo)
         slice_id = make_slice_id(source.stem, root)
         rec = SliceRecord(root, slice_id)
@@ -2090,7 +2584,13 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
         else:
             print("worktree  (none: --no-worktree runs in the repo itself)")
         print("setup     {0}".format(setup_command or "(none declared: nothing runs)"))
+        print("tests     {0}".format(
+            ", ".join(test_commands) or "(none declared: the built-in rules apply)"
+        ))
         print("stages    {0}".format(" -> ".join(STAGES)))
+        print("turns     {0}".format(
+            "  ".join("{0}={1}".format(name, turns.turns_for(name)) for name in STAGES)
+        ))
         print("gates     {0}".format(", ".join(gates) or "(none: fully unattended)"))
         print("slice dir {0}".format(rec.dir))
         print("run dir   {0}".format(data_dir / "runs"))
@@ -2122,6 +2622,9 @@ def launch_slice(
         raise PipelineError("requirement has front matter but no body: {0}".format(name))
     gates = resolve_gates(fields)
     setup_command = resolve_setup(fields)
+    # Read up front, so a typo in either line is refused before a worktree exists.
+    resolve_test_commands(fields)
+    resolve_max_turns(fields)
 
     root = slices_root(repo)
     unfinished = [
@@ -2158,7 +2661,7 @@ def launch_slice(
         ws = _open_workspace(repo, plan, rec, state)
     rec.write_state(state)
 
-    code = _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+    code = _finish(_config(args, repo, data_dir, ws, setup_command, fields), rec, state, body)
     return SliceOutcome(code=code, rec=rec, state=state)
 
 
@@ -2253,7 +2756,7 @@ def _rollback_workspace(repo: Path, ws: workspace.Workspace) -> None:
 
 
 def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
-    rec = find_slice(repo, args.resume_slice, repo_given)
+    rec = find_slice(repo, args.resume_slice, repo_given, data_dir)
     if args.dry_run:
         state = rec.read_state()
         if state is None:
@@ -2307,12 +2810,105 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
                 )
             )
 
-    say("resuming slice {0} (was {1})".format(rec.slice_id, status))
+    amend = current_amend(state)
+    if amend is not None:
+        # An amend that failed left its cycle open, so this continues the cycle
+        # rather than the whole slice: the stages it did not re-open stay done.
+        say("resuming amend #{0} of slice {1} (was {2})".format(
+            amend.get("n"), rec.slice_id, status
+        ))
+    else:
+        say("resuming slice {0} (was {1})".format(rec.slice_id, status))
     if status == STATUS_REJECTED:
         # The approval file is the record: a rejection stands until a human edits it.
         say("this slice was rejected: {0}".format(state.get("reason", "")))
     state.setdefault("quota", {"waiting": False, "resume_at": None, "retries": 0})
-    return _finish(_config(args, repo, data_dir, ws, setup_command), rec, state, body)
+    return _finish(_config(args, repo, data_dir, ws, setup_command, fields), rec, state, body)
+
+
+# ------------------------------------------------------------------- amend
+#
+# The 사후 감독 channel: a finished slice is corrected by throwing one more
+# instruction at it, not by writing a second requirement. This is the most
+# frequent action once a slice runs unattended, so it is a command of its own.
+
+
+def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
+    """Run one more implement -> test cycle on a slice, on the branch it already owns."""
+    instruction = (getattr(args, "instruction", None) or "").strip()
+    if not instruction:
+        raise PipelineError(
+            "--amend needs an instruction, as one argument:\n"
+            '    aidev pipeline --repo {0} --amend <slice-id> "<what to change>"'.format(repo)
+        )
+    rec = find_slice(repo, args.amend, repo_given, data_dir)
+    state = rec.read_state()
+    if state is None:
+        raise PipelineError("no readable state.json in {0}".format(rec.dir))
+    status = str(state.get("status", ""))
+    if status == STATUS_DISCARDED:
+        raise PipelineError(
+            "slice {0} is discarded - its worktree and branch are gone, so there is "
+            "nothing to amend".format(rec.slice_id)
+        )
+
+    fields, body = parse_front_matter(rec.requirement_path.read_text(encoding="utf-8"))
+    setup_command = resolve_setup(fields)
+    ws = workspace.Workspace.from_dict(state.get("workspace"))
+    if ws is None:
+        # Same as a resume: a slice from before v0.3 is amended where its earlier
+        # stages actually ran, not in a worktree invented after the fact.
+        say("note: this slice has no workspace - amending in {0} (v0.2 behaviour)".format(repo))
+    else:
+        broken = workspace.verify(repo, ws)
+        if broken is not None:
+            raise PipelineError(
+                "{0}\n"
+                "    aidev does not re-create it: the stage commits already on '{1}' were made "
+                "there.\n"
+                "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
+                    broken, ws.branch, repo, rec.slice_id
+                )
+            )
+
+    stages = [name for name in stage_order(state) if name in AMEND_STAGES]
+    if not stages:
+        raise PipelineError(
+            "slice {0} has none of the stages an amend re-runs ({1})".format(
+                rec.slice_id, ", ".join(AMEND_STAGES)
+            )
+        )
+    number = len([e for e in (state.get("amends") or []) if isinstance(e, dict)]) + 1
+
+    if args.dry_run:
+        print("slice     {0}  ({1})".format(rec.slice_id, status or "?"))
+        print("amend     #{0}".format(number))
+        print("work      {0}".format(ws.path if ws else "{0} (no worktree)".format(repo)))
+        print("stages    {0}   (plan is not re-run: the instruction is the plan)".format(
+            " -> ".join(stages)
+        ))
+        print("commits   {0}".format(
+            COMMIT_MESSAGE.format(rec.slice_id, AMEND_LABEL.format(number, "<stage>"))
+        ))
+        print("says      {0}".format(instruction))
+        return EXIT_DONE
+
+    entry = open_amend(rec, state, instruction, stages)
+    say("amend #{0} of slice {1} (was {2})".format(entry["n"], rec.slice_id, status or "?"))
+    say("  {0}".format(_clip(instruction.splitlines()[0], 70)))
+    say("  stages {0} (plan is history: the instruction is this cycle's plan)".format(
+        ", ".join(stages)
+    ))
+    if status == STATUS_MERGED:
+        say("note: this slice was already merged, so the branch now has commits the base "
+            "does not - merge it again when the amend is done:")
+        say("      aidev pipeline --repo {0} --merge {1}".format(repo, rec.slice_id))
+    epic = state.get("epic")
+    if isinstance(epic, dict) and epic.get("epic_id"):
+        say("note: this slice is part of epic {0}; later slices were branched from its "
+            "earlier tip and do not contain this amend".format(epic["epic_id"]))
+    state.setdefault("quota", {"waiting": False, "resume_at": None, "retries": 0})
+    return _finish(_config(args, repo, data_dir, ws, setup_command, fields), rec, state, body)
 
 
 # ------------------------------------------------------- merge and discard
@@ -2322,9 +2918,9 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
 
 
 def _finished_workspace(
-    repo: Path, slice_id: str, repo_given: bool
+    repo: Path, slice_id: str, repo_given: bool, data_dir: Optional[Path] = None
 ) -> Tuple[SliceRecord, Dict[str, Any], workspace.Workspace]:
-    rec = find_slice(repo, slice_id, repo_given)
+    rec = find_slice(repo, slice_id, repo_given, data_dir)
     state = rec.read_state()
     if state is None:
         raise PipelineError("no readable state.json in {0}".format(rec.dir))
@@ -2337,9 +2933,11 @@ def _finished_workspace(
     return rec, state, ws
 
 
-def merge_slice(args: Any, repo: Path, repo_given: bool = True) -> int:
+def merge_slice(
+    args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> int:
     """Land a finished slice on its base branch. A conflict stops, it is never resolved."""
-    rec, state, ws = _finished_workspace(repo, args.merge, repo_given)
+    rec, state, ws = _finished_workspace(repo, args.merge, repo_given, data_dir)
     status = str(state.get("status", ""))
     if status != STATUS_DONE:
         raise PipelineError(
@@ -2404,16 +3002,56 @@ def merge_slice(args: Any, repo: Path, repo_given: bool = True) -> int:
             "base": ws.base,
         }
         set_status(rec, state, STATUS_MERGED)
+        push = _push_base(repo, ws, state, rec) if getattr(args, "push", False) else None
 
     say("merged {0} into {1} ({2})".format(ws.branch, ws.base, (result.commit or "?")[:7]))
     say("the worktree is still there - aidev does not remove what it did not just create:")
     say("  aidev pipeline --repo {0} --discard {1}".format(repo, rec.slice_id))
+    if push is not None and push["status"] != "pushed":
+        # The merge itself stands - the commit is real and state says 'merged'.
+        # But the whole point of --push is "if you forget, the only copy is local",
+        # so a failed backup must not read as success.
+        say("PUSH FAILED - {0}".format(push.get("error", "")))
+        say("  the merge stands; only the backup did not happen")
+        say("  retry it yourself: git -C {0} push {1} {2}".format(repo, push["remote"], ws.base))
+        return EXIT_FAILED
+    if push is not None:
+        say("pushed {0} to {1} (the slice branch was not pushed)".format(ws.base, push["remote"]))
     return EXIT_DONE
 
 
-def discard_slice(args: Any, repo: Path, repo_given: bool = True) -> int:
+def _push_base(
+    repo: Path, ws: workspace.Workspace, state: Dict[str, Any], rec: SliceRecord
+) -> Dict[str, Any]:
+    """Back the merge up to a remote - the base branch only, never the slice branch."""
+    remote = workspace.branch_remote(repo, ws.base) or "origin"
+    if not workspace.remote_exists(repo, remote):
+        push: Dict[str, Any] = {
+            "status": "failed",
+            "remote": remote,
+            "error": "no git remote named '{0}'".format(remote),
+        }
+    else:
+        try:
+            workspace.push_branch(repo, remote, ws.base)
+            push = {
+                "status": "pushed",
+                "remote": remote,
+                "branch": ws.base,
+                "at": now_iso(),
+            }
+        except workspace.GitError as exc:
+            push = {"status": "failed", "remote": remote, "error": str(exc)}
+    state["merge"]["push"] = push
+    rec.write_state(state)
+    return push
+
+
+def discard_slice(
+    args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> int:
     """Throw the slice's workspace away. The user's checkout keeps no git trace of it."""
-    rec, state, ws = _finished_workspace(repo, args.discard, repo_given)
+    rec, state, ws = _finished_workspace(repo, args.discard, repo_given, data_dir)
     with SliceLock(rec):
         if Path(ws.path).exists() or workspace.find_worktree(repo, ws.path) is not None:
             try:
@@ -2484,14 +3122,24 @@ def record_touched_at(rec: Any) -> float:
         return 0.0
 
 
-def _repo_hint(repo: Path, repo_given: bool) -> str:
-    """An empty answer from the default repo says why it is empty, not just that."""
+def _repo_hint(repo: Path, repo_given: bool, data_dir: Optional[Path] = None) -> str:
+    """An empty answer from the default repo says why it is empty, not just that.
+
+    The repos this tool has been pointed at before are offered as candidates,
+    spelled as the flag to copy. They are never applied: naming the repository
+    stays the human's, because guessing it would act on the wrong checkout.
+    """
     if repo_given or (Path(repo) / AIDEV_DIRNAME).is_dir():
         return ""
-    return (
+    hint = (
         "\n    no {0}/ here - this is probably not the target repository."
         "\n    pass --repo <path>".format(AIDEV_DIRNAME)
     )
+    candidates = recent_repos(data_dir) if data_dir is not None else []
+    if candidates:
+        hint += "\n    recently used (aidev never picks one for you - name it):"
+        hint += "".join("\n      --repo {0}".format(path) for path in candidates)
+    return hint
 
 
 def find_record(
@@ -2528,18 +3176,24 @@ def find_record(
     raise PipelineError("no {0} matching '{1}' in {2}".format(kind, pattern, root))
 
 
-def find_slice(repo: Path, slice_id: str, repo_given: bool = True) -> SliceRecord:
+def find_slice(
+    repo: Path, slice_id: str, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> SliceRecord:
     """The slice half of ``find_record``, with the repo's own hint attached."""
     root = slices_root(repo)
     return find_record(
-        _existing_slices(root), slice_id, "slice", root, _repo_hint(repo, repo_given)
+        _existing_slices(root), slice_id, "slice", root, _repo_hint(repo, repo_given, data_dir)
     )
 
 
-def list_slices(repo: Path, repo_given: bool = True) -> int:
+def list_slices(repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None) -> int:
     records = _existing_slices(slices_root(repo))
     if not records:
-        print("(no slices in {0}){1}".format(slices_root(repo), _repo_hint(repo, repo_given)))
+        print(
+            "(no slices in {0}){1}".format(
+                slices_root(repo), _repo_hint(repo, repo_given, data_dir)
+            )
+        )
         return EXIT_DONE
     widths = (34, 26, 34)
     print(_list_row(("SLICE", "STATUS", "STAGES"), widths, "UPDATED"))
