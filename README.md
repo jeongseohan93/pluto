@@ -106,6 +106,8 @@ worktree 생성   <repo>-slices/<slice-id> + 브랜치 slice/<slice-id>  (base =
 --amend <id>   같은 브랜치 위에서 implement → test 한 바퀴 더 (사람이 친다)
 --merge <id>   base 브랜치에 merge      (사람이 친다)
 --discard <id> worktree + 브랜치 제거    (사람이 친다)
+--rollback <id> --to <stage>  브랜치와 상태를 그 단계 커밋으로 되감기 (사람이 친다)
+--revert-merge <id>           base에 merge revert 커밋 (사람이 친다)
 ```
 
 ```bash
@@ -116,6 +118,8 @@ aidev pipeline --repo ~/jokertest --amend 20260816-doctor "인원수 표시를 �
 aidev pipeline --repo ~/jokertest --merge 20260816-doctor    # 승인 = base에 반영
 aidev pipeline --repo ~/jokertest --merge 20260816-doctor --push  # + 원격 백업
 aidev pipeline --repo ~/jokertest --discard 20260816-doctor  # 반려 = 폐기
+aidev pipeline --repo ~/jokertest --rollback 20260816-doctor --to plan  # 되감기
+aidev pipeline --repo ~/jokertest --revert-merge 20260816-doctor        # 철회
 ```
 
 `--repo` 기본값은 현재 디렉터리다. cwd에 `.aidev/`가 없어서 결과가 비면 그 이유를
@@ -311,6 +315,82 @@ aidev pipeline --repo ~/jokertest --amend 20260816-doctor "인원수 표시를 �
   merge해야 한다"고 안내한다. 에픽 소속 slice도 실행하되 "뒤 slice들은 이 amend를
   갖고 있지 않다"고 경고한다(뒤 slice는 amend 이전 tip에서 갈라져 나왔다).
 
+### 되돌리기 (--rollback / --revert-merge, v0.4.2)
+
+> 철학 0조: "일단 만든다, 언제든 롤백된다, 그래서 거침없다."
+
+되돌리기가 사람의 git 지식(reset? revert? 어느 해시?)에 의존하고 있었다. 커밋에는
+이미 slice와 stage가 박혀 있으므로 **되돌리기도 의미 단위로 한다.** 상황이 둘이라
+명령도 둘이다: slice 브랜치는 로컬 전용이라 **되감고**, base 브랜치는 push됐을 수
+있으므로 **revert만 한다.**
+
+```bash
+aidev pipeline --repo ~/jokertest --rollback 20260816-doctor --to plan
+aidev pipeline --repo ~/jokertest --revert-merge 20260816-doctor --reason "설계가 틀렸다"
+```
+
+**`--rollback <id> --to <stage>` — 진행 중/실패 slice 되감기.**
+
+- `--to`가 가리키는 커밋은 **남고, 그 뒤가 되감긴다.** `--to plan`이면 plan 커밋까지
+  남고 implement/test 커밋이 브랜치에서 빠진다. `requirement`도 target이다.
+- slice 브랜치는 **로컬 전용이 원칙**이라 여기서는 `reset --hard`가 허용된다. 다만
+  worktree에 **tracked 변경이 남아 있으면 거부한다**(exit 2) — reset이 그걸 삼킨다.
+  untracked 파일은 reset이 건드리지 않으므로 그대로 통과시키고, 살아남는다.
+- state.json도 같이 되감긴다. **지우지 않는다**: `attempts`/`failures`는 이미 쓴
+  비용이라 그대로 두고, 각 단계에 `rewound`(되감기 전 status/run_id/commit/verdict)를
+  남긴 뒤 `pending`으로 바꾼다. 되감긴 단계의 `session_id`는 버린다 — 없어진 작업에
+  대해 결론을 낸 세션이 그 결론으로 새 작업을 판단하면 안 된다.
+- 이어서 `--resume-slice <id>`를 치면 그 지점부터 다시 진행한다.
+- 어떤 커밋이 빠지는지는 라벨 순서가 아니라 `git merge-base --is-ancestor`로 판정한다.
+  amend는 `amend1/implement`를 `test` **뒤에** 찍으므로 순서 가정은 틀린다.
+- `merged` slice는 거부하고 `--revert-merge`를 안내한다. `reverted` / `discarded`도
+  각각의 사유로 거부한다.
+
+**`--revert-merge <id>` — merge된 slice 철회.**
+
+- base에 **revert 커밋을 하나 더 쌓는다.** reset은 하지 않는다 — 이미 push됐을 수
+  있고, 남이 가진 브랜치를 다시 쓰는 건 되돌리기가 아니라 두 번째 문제다.
+- 본진 전제조건은 **`--merge`와 똑같다**(base 체크아웃 + tracked clean). 본진에
+  쓰는 순간이 그 둘뿐이라 같은 함수가 같은 문장으로 거부한다.
+- merge 커밋이 지금 base에 없으면(이력 재작성 등) 거부한다.
+- 충돌은 **자동 해결하지 않는다**: 충돌 파일을 먼저 읽어두고 `revert --abort`로
+  본진을 원상복구한 뒤 exit 4. slice status는 `merged` 그대로고 `revert.status`만
+  `conflict`로 남는다.
+- 성공하면 status는 `reverted`다. worktree와 브랜치는 **그대로 둔다**(우리가 만들지
+  않은 걸 지우지 않는 `--discard`의 원칙과 같다). 이후 경로는 `--amend` 후 다시
+  `--merge`, 또는 `--discard`. **push는 하지 않는다** — 필요하면 사람이 친다.
+- `reverted` slice는 `--resume-slice`가 거부한다. 모든 단계가 `done`인 채로 루프를
+  통과해 status가 조용히 `done`으로 돌아가면 번복 기록이 세탁되기 때문이다.
+
+**공통.**
+
+- **실행 전에 현재 지점과 복구 명령을 먼저 찍는다**(`--discard`와 같은 방식).
+
+  ```text
+  [pipeline] rollback slice 20260816-doctor -> 'plan' (9f8e7d6)
+  [pipeline]   branch  slice/20260816-doctor
+  [pipeline]   was at  a1b2c3d   (2 commit(s) dropped: implement, test)
+  [pipeline]   undo    git -C C:\...\wt\20260816-doctor reset --hard a1b2c3d4e5
+  ```
+
+- 번복은 `.aidev/slices/<id>/rollbacks.json`에 **append-only로 쌓인다**(시각, 대상,
+  빠진 커밋 sha, 되감긴 단계, `--reason`, 복구 명령). **미래 Ledger의 번복률은 이
+  파일 하나만 읽으면 된다.** state.json에는 가장 최근 한 건의 요약(`rollback`)만 둔다.
+- 되돌리는 범위에 마이그레이션 파일이 있으면 **경고만 한다.**
+
+  ```text
+  [pipeline] warning: this rollback range contains 2 migration file(s) - the database is NOT
+  [pipeline]          rolled back by this command
+  [pipeline]            backend/migrations/003_add_seat.sql
+  ```
+
+  판정은 경로 휴리스틱이다: 경로에 `migrations`/`migration`/`migrate` 디렉터리가
+  있거나, `alembic/versions/`이거나, `.sql` 파일명이 `V1__` / `003_` 형태일 때.
+  **막지 않고, DB를 되돌리지도 않는다** — 사람이 판단할 재료를 주는 것뿐이다.
+- `--dry-run`이면 위 출력만 하고 **아무것도 바꾸지 않는다.**
+- 하지 않는 것: **epic 단위 되감기**(설계만 하고 이번 범위 밖), **DB 마이그레이션
+  자동 롤백**(경고만), **push된 slice 브랜치 처리**(slice 브랜치는 로컬 전용이 원칙).
+
 ### 승인 게이트
 
 승인은 특정 단계의 기능이 아니라 **단계 사이마다 있을 수 있는 게이트**다. 루프는
@@ -495,6 +575,7 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 ├── approvals/
 │   └── plan.md      사람이 쓰는 승인 파일
 ├── setup.log        setup을 선언했을 때만
+├── rollbacks.json   번복 이력 (되돌린 적이 있을 때만, append-only)
 └── runs.json        단계 → run_id (상세는 data/runs/로 연결)
 ```
 
@@ -523,13 +604,16 @@ overwritten by merge"* 로 죽는다 — 본진에 그 파일이 이미 untracke
 `state.json`은 live.json에서 검증된 규칙을 그대로 쓴다: 단일 writer,
 `.tmp` → `os.replace` atomic 쓰기, reader는 깨진 파일에 관용적. slice status는
 `running:<단계>` / `waiting_approval:<단계>` / `quota_wait` / `done` / `rejected` /
-`failed` / `merged` / `discarded`, stage status는 `pending` / `running` / `done` /
-`failed`다. **stages의 키 집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는
+`failed` / `merged` / `discarded` / `rolled_back` / `reverted`, stage status는
+`pending` / `running` / `done` / `failed`다. **stages의 키 집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는
 모르는 키를 그대로 표시해야 한다. v0.3에서 `schema`가 2가 되고
 `workspace` / `commits` / `setup` 키가 늘었다. reader는 **1도 계속 받는다** —
 `workspace`가 없는 slice는 격리 없이 이어진다. v0.4.1이 더한
 `amends` / `amend_open` / `plan_scale` / `merge.push`는 전부 optional이라
 `schema`는 **2 그대로다** — 모르는 reader는 틀린 게 아니라 그냥 더 오래된 것뿐이다.
+v0.4.2가 더한 `rollback` / `revert` / `stages.*.rewound`도 같은 이유로 전부 optional이고,
+`schema`는 여전히 **2**다. status 값은 열린 집합이라 reader는 `rolled_back` /
+`reverted`를 모르더라도 **문자열 그대로 표시하면 된다.**
 
 Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 WinError 5로 죽는다
 (CPython의 `open()`이 delete 공유를 주지 않는다). 지연이 아니라 순간 충돌이므로
@@ -583,6 +667,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   | `mutated`가 false인 동안 매 단계 직전 재검사 | **readonly 단계(plan) 직전에만 worktree가 clean한지** 검사. plan의 사전/사후 비교에 깨끗한 기준선이 필요하고, 이전 실행의 위반이 다음 실행에서 세탁되면 안 되기 때문 |
   | — | 변경 단계 직전엔 검사 없음. worktree는 AI의 샌드박스이고 더러운 게 정상이다 |
   | — | `--merge` 할 때만 본진에 tracked 변경이 없을 것 + base가 체크아웃돼 있을 것. merge가 본진을 실제로 쓰는 유일한 순간이다 |
+  | — | `--rollback`은 worktree에 tracked 변경이 없을 것(reset이 삼킨다. untracked는 무관). `--revert-merge`는 본진에 쓰므로 `--merge`와 **같은 조건**이다 |
 
   `--no-worktree`로 돌리면 격리가 없으므로 v0.2의 dirty 규칙이 그대로 살아난다.
   v0.3 이전에 시작된 slice(`state.json`에 `workspace` 키가 없는 것)도 마찬가지로
@@ -650,6 +735,10 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
 | `--push` | `--merge`와 함께: base 브랜치만 원격에 push (slice 브랜치는 절대 안 함) |
 | `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
+| `--rollback` | slice 브랜치와 상태를 그 slice의 stage 커밋으로 되감기 (`--to` 필수, v0.4.2) |
+| `--to` | `--rollback`이 되감을 지점: `requirement` / `plan` / `implement` / `test` |
+| `--revert-merge` | merge된 slice를 base에서 철회 — revert 커밋만, reset 없음 (충돌 시 exit 4) |
+| `--reason` | 되돌린 이유. `rollbacks.json`에 남는다 (`--rollback` / `--revert-merge` 전용) |
 | `--base` | slice가 갈라져 나올 브랜치 (기본: repo의 현재 HEAD, **main 아님**) |
 | `--worktree-root` | worktree 부모 디렉터리 (기본 `<repo>-slices`) |
 | `--no-worktree` | 격리 없이 repo 안에서 직접 실행 (v0.2 동작) |
@@ -664,10 +753,10 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--approval-timeout` | 승인 대기 포기 시간 (기본 0 = 무한 대기) |
 | `--quota-wait` | reset 시각을 못 읽을 때의 재시도 간격 (기본 900초) |
 | `--quota-max-retries` | 쿼터 재시도 상한 (기본 20) |
-| `--dry-run` | slice id / base / 브랜치 / worktree / setup / 검증 명령 / 턴 예산 / 게이트 / 경로만 출력하고 종료 (`--amend`와 함께면 돌 사이클) |
+| `--dry-run` | slice id / base / 브랜치 / worktree / setup / 검증 명령 / 턴 예산 / 게이트 / 경로만 출력하고 종료 (`--amend`와 함께면 돌 사이클, `--rollback` / `--revert-merge`와 함께면 되돌릴 범위와 복구 명령) |
 
-종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부, `4` merge 충돌,
-`127` claude 없음.
+종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부,
+`4` merge 충돌 **및 revert 충돌**, `127` claude 없음.
 
 **Windows 주의.** worktree 경로 + 깊은 `node_modules`는 `MAX_PATH`(260자)에 쉽게
 닿는다. `--worktree-root D:\wt`처럼 짧은 경로를 주거나

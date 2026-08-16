@@ -101,6 +101,9 @@ AIDEV_DIRNAME = ".aidev"
 # accepting 1 - a v0.2 slice has none of them and resumes in place.
 STATE_SCHEMA = 2
 STATE_FILENAME = "state.json"
+# Every rollback this slice has ever taken, append-only. The future Ledger reads
+# this file and nothing else: state.json keeps only the latest one, as a summary.
+ROLLBACKS_FILENAME = "rollbacks.json"
 
 # The branch a slice owns, and the directory its own record is committed into.
 # HISTORY_DIR is deliberately not ``.aidev/slices``: that path already exists as
@@ -132,6 +135,10 @@ STATUS_REJECTED = "rejected"
 STATUS_QUOTA_WAIT = "quota_wait"
 STATUS_MERGED = "merged"
 STATUS_DISCARDED = "discarded"
+# Rewound to a stage commit: a midpoint, not an ending - --resume-slice goes on
+# from there. 'reverted' is an ending: the merge was taken back off the base.
+STATUS_ROLLED_BACK = "rolled_back"
+STATUS_REVERTED = "reverted"
 
 # Approval verdicts.
 PENDING = "pending"
@@ -485,6 +492,45 @@ def plan_scale_note(scale: Optional[Dict[str, Any]]) -> str:
     )
 
 
+# ------------------------------------------------------------------ migrations
+#
+# git can put the files back; it cannot put the database back. A rollback whose
+# range contains migrations warns about exactly that and then does the rollback
+# anyway - this is a text heuristic over paths, so it must never block. The rules
+# are written down here and in the README so a human can judge a false positive.
+
+MIGRATION_SEGMENTS = ("migrations", "migration", "migrate")
+# V1__init.sql (flyway), 003_add_seat.sql / 0004-add-seat.sql (everything else).
+_MIGRATION_NAME_RE = re.compile(r"^(v\d+__|\d{3,}[_-])", re.IGNORECASE)
+
+
+def looks_like_migration(path: str) -> bool:
+    normalised = str(path).replace("\\", "/").lower()
+    segments = normalised.split("/")
+    if any(segment in MIGRATION_SEGMENTS for segment in segments[:-1]):
+        return True
+    if "alembic" in segments[:-1] and "versions" in segments[:-1]:
+        return True
+    name = segments[-1]
+    return name.endswith(".sql") and bool(_MIGRATION_NAME_RE.match(name))
+
+
+def migration_paths(paths: Sequence[str]) -> List[str]:
+    return [path for path in paths if looks_like_migration(path)]
+
+
+def migration_note(paths: Sequence[str]) -> str:
+    """The warning a rollback range containing migrations gets. Empty when there are none."""
+    found = migration_paths(paths)
+    if not found:
+        return ""
+    return (
+        "warning: this rollback range contains {0} migration file(s) - the database is NOT\n"
+        "         rolled back by this command\n".format(len(found))
+        + "\n".join("           {0}".format(path) for path in found[:20])
+    )
+
+
 # ------------------------------------------------------------------ approvals
 
 APPROVAL_TEMPLATE = """\
@@ -574,6 +620,10 @@ class SliceRecord:
         return self.dir / "runs.json"
 
     @property
+    def rollbacks_path(self) -> Path:
+        return self.dir / ROLLBACKS_FILENAME
+
+    @property
     def approvals_dir(self) -> Path:
         return self.dir / "approvals"
 
@@ -632,6 +682,22 @@ class SliceRecord:
         data = read_json_tolerant(self.runs_path) or {}
         runs = data.get("runs")
         return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+    def append_rollback(self, entry: Dict[str, Any]) -> None:
+        """The 번복 ledger, written exactly like runs.json so readers of one read both."""
+        data = read_json_tolerant(self.rollbacks_path) or {}
+        rollbacks = data.get("rollbacks")
+        if not isinstance(rollbacks, list):
+            rollbacks = []
+        rollbacks.append(entry)
+        write_json_atomic(
+            self.rollbacks_path, {"slice_id": self.slice_id, "rollbacks": rollbacks}
+        )
+
+    def rollbacks(self) -> List[Dict[str, Any]]:
+        data = read_json_tolerant(self.rollbacks_path) or {}
+        entries = data.get("rollbacks")
+        return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
 
 def now_iso() -> str:
@@ -2254,11 +2320,36 @@ def _workspace_lines(state: Dict[str, Any]) -> List[str]:
                 setup["command"], setup.get("status", "?"), setup.get("exit_code")
             )
         )
+    rollback = state.get("rollback")
+    if isinstance(rollback, dict) and rollback.get("n"):
+        lines.append(
+            "Rollback  #{0} {1} -> {2}  ({3} -> {4})".format(
+                rollback.get("n"),
+                rollback.get("kind", "?"),
+                rollback.get("target", "?"),
+                str(rollback.get("from") or "?")[:7],
+                str(rollback.get("to") or "?")[:7],
+            )
+        )
     slice_id = state.get("slice_id", "?")
     repo = state.get("repo", "<repo>")
-    if state.get("status") == STATUS_DONE:
+    status = state.get("status")
+    if status == STATUS_DONE:
         lines.append("")
         lines.append("Next      aidev pipeline --repo {0} --merge {1}".format(repo, slice_id))
+        lines.append("          aidev pipeline --repo {0} --discard {1}".format(repo, slice_id))
+    elif status == STATUS_ROLLED_BACK:
+        lines.append("")
+        lines.append(
+            "Next      aidev pipeline --repo {0} --resume-slice {1}".format(repo, slice_id)
+        )
+    elif status == STATUS_REVERTED:
+        lines.append("")
+        lines.append(
+            'Next      aidev pipeline --repo {0} --amend {1} "<what to fix>"'.format(
+                repo, slice_id
+            )
+        )
         lines.append("          aidev pipeline --repo {0} --discard {1}".format(repo, slice_id))
     return lines
 
@@ -2330,6 +2421,31 @@ def add_parser(sub: Any) -> Any:
         default=None,
         metavar="SLICE",
         help="run a fix cycle on a finished slice, on the branch it already owns",
+    )
+    cmd.add_argument(
+        "--rollback",
+        default=None,
+        metavar="SLICE",
+        help="rewind a slice's branch and state to a stage commit (needs --to)",
+    )
+    cmd.add_argument(
+        "--to",
+        dest="to_stage",
+        default=None,
+        metavar="STAGE",
+        help="with --rollback: the stage commit to rewind to (or 'requirement')",
+    )
+    cmd.add_argument(
+        "--revert-merge",
+        default=None,
+        metavar="SLICE",
+        help="put a revert of this slice's merge commit on its base branch",
+    )
+    cmd.add_argument(
+        "--reason",
+        default=None,
+        metavar="TEXT",
+        help="why you are rolling back - stored in the slice's rollback record",
     )
     cmd.add_argument(
         "--base",
@@ -2447,6 +2563,8 @@ def _dispatch(args: Any) -> int:
         ("merge", "--merge"),
         ("discard", "--discard"),
         ("amend", "--amend"),
+        ("rollback", "--rollback"),
+        ("revert_merge", "--revert-merge"),
         ("resume_slice", "--resume-slice"),
         ("resume_epic", "--resume-epic"),
         ("requirement", "--requirement"),
@@ -2463,6 +2581,16 @@ def _dispatch(args: Any) -> int:
         )
     if getattr(args, "push", False) and not getattr(args, "merge", None):
         raise PipelineError("--push only makes sense with --merge")
+    rollback = getattr(args, "rollback", None)
+    if rollback and not getattr(args, "to_stage", None):
+        raise PipelineError(
+            "--rollback needs --to <stage>: the stage commit to rewind to.\n"
+            "    aidev pipeline --repo {0} --rollback {1} --to plan".format(repo, rollback)
+        )
+    if getattr(args, "to_stage", None) and not rollback:
+        raise PipelineError("--to only makes sense with --rollback")
+    if getattr(args, "reason", None) and not (rollback or getattr(args, "revert_merge", None)):
+        raise PipelineError("--reason only makes sense with --rollback or --revert-merge")
     # Local, and only here: the epic module is a layer built on this one, so it
     # imports pipeline at the top. Importing it back at module level would be a cycle.
     from . import epic as epic_module
@@ -2470,6 +2598,10 @@ def _dispatch(args: Any) -> int:
     if args.list_slices:
         epic_module.list_epics(repo)
         return list_slices(repo, repo_given, data_dir)
+    if rollback:
+        return rollback_slice(args, repo, repo_given, data_dir)
+    if getattr(args, "revert_merge", None):
+        return revert_merge_slice(args, repo, repo_given, data_dir)
     if getattr(args, "merge", None):
         return merge_slice(args, repo, repo_given, data_dir)
     if getattr(args, "discard", None):
@@ -2484,7 +2616,10 @@ def _dispatch(args: Any) -> int:
         return start_slice(args, repo, data_dir)
     if getattr(args, "epic", None):
         return epic_module.start_epic(args, repo, data_dir)
-    raise PipelineError("one of --requirement, --epic, --amend, --resume-slice or --list is required")
+    raise PipelineError(
+        "one of --requirement, --epic, --amend, --rollback, --revert-merge, --resume-slice "
+        "or --list is required"
+    )
 
 
 def _config(
@@ -2785,7 +2920,11 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
         print(render_summary(state, rec.runs()))
         return EXIT_DONE
 
-    if status in (STATUS_MERGED, STATUS_DISCARDED):
+    # 'reverted' belongs here for a reason of its own: every stage of a reverted
+    # slice is still done, so a resume would walk straight through the loop and
+    # set the status back to 'done' - laundering the fact that it was taken off
+    # the base. Amending it is the way forward, and that re-opens the stages.
+    if status in (STATUS_MERGED, STATUS_DISCARDED, STATUS_REVERTED):
         raise PipelineError(
             "slice {0} is {1}; there is nothing left to resume".format(rec.slice_id, status)
         )
@@ -2903,6 +3042,10 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
         say("note: this slice was already merged, so the branch now has commits the base "
             "does not - merge it again when the amend is done:")
         say("      aidev pipeline --repo {0} --merge {1}".format(repo, rec.slice_id))
+    elif status == STATUS_REVERTED:
+        say("note: this slice was reverted off its base, so nothing of it is there right "
+            "now - merge it again when the amend is done:")
+        say("      aidev pipeline --repo {0} --merge {1}".format(repo, rec.slice_id))
     epic = state.get("epic")
     if isinstance(epic, dict) and epic.get("epic_id"):
         say("note: this slice is part of epic {0}; later slices were branched from its "
@@ -2933,6 +3076,27 @@ def _finished_workspace(
     return rec, state, ws
 
 
+def _require_checkout_on_base(repo: Path, ws: workspace.Workspace) -> None:
+    """What must be true of the user's checkout before we write a commit into it.
+
+    Both commands that touch the base branch ask this, in the same words: a merge
+    and the revert of one. Everything else the pipeline does happens in a worktree.
+    """
+    on = workspace.current_branch(repo)
+    if on != ws.base:
+        raise PipelineError(
+            "{0} is on '{1}', not on the base '{2}'.\n"
+            "    aidev does not switch your branches: git -C {0} checkout {2}".format(
+                repo, on or "a detached HEAD", ws.base
+            )
+        )
+    if not workspace.is_clean(repo, tracked_only=True):
+        raise PipelineError(
+            "{0} has uncommitted changes to tracked files; commit or stash them first.\n"
+            "    This is the one moment aidev writes to your checkout.".format(repo)
+        )
+
+
 def merge_slice(
     args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
 ) -> int:
@@ -2958,19 +3122,7 @@ def merge_slice(
             "the worktree still has uncommitted work: {0}\n"
             "    aidev will not throw it away by merging without it.".format(ws.path)
         )
-    on = workspace.current_branch(repo)
-    if on != ws.base:
-        raise PipelineError(
-            "{0} is on '{1}', not on the base '{2}'.\n"
-            "    aidev does not switch your branches: git -C {0} checkout {2}".format(
-                repo, on or "a detached HEAD", ws.base
-            )
-        )
-    if not workspace.is_clean(repo, tracked_only=True):
-        raise PipelineError(
-            "{0} has uncommitted changes to tracked files; commit or stash them first.\n"
-            "    This is the one moment aidev writes to your checkout.".format(repo)
-        )
+    _require_checkout_on_base(repo, ws)
 
     with SliceLock(rec):
         result = workspace.merge_branch(
@@ -3045,6 +3197,344 @@ def _push_base(
     state["merge"]["push"] = push
     rec.write_state(state)
     return push
+
+
+# ------------------------------------------------------------------ rollback
+#
+# 철학 0조: "일단 만든다, 언제든 롤백된다, 그래서 거침없다." Undoing stopped being a
+# question about git - the commits carry the slice and the stage, so the undo is
+# spelled in those terms too. Two shapes, because the two situations differ: a
+# slice branch is local, so it is *rewound*; a base branch may already be pushed,
+# so it is only ever *reverted*. Both print where they are before they move, and
+# both leave a line in the slice's own rollback ledger.
+
+
+def _rollback_targets(state: Dict[str, Any]) -> List[str]:
+    """The labels this slice can be rewound to, in the order they were committed."""
+    commits = state.get("commits")
+    commits = commits if isinstance(commits, dict) else {}
+    return [name for name in [REQUIREMENT_STAGE] + stage_order(state) if commits.get(name)]
+
+
+def _stages_after(state: Dict[str, Any], target: str) -> List[str]:
+    """Which stages a rewind to ``target`` undoes. The requirement is before them all."""
+    order = stage_order(state)
+    if target == REQUIREMENT_STAGE or target not in order:
+        return list(order)
+    return order[order.index(target) + 1 :]
+
+
+def _rewind_state(
+    state: Dict[str, Any], target: str, dropped: Dict[str, Any], number: int
+) -> List[str]:
+    """Wind the stages after ``target`` back to pending. Nothing is deleted.
+
+    ``attempts`` and ``failures`` stay: they are what this slice already cost and
+    already learned. What each stage looked like before the rewind is kept in its
+    own ``rewound`` record - the requirement asks for the fact to be *recorded*,
+    not erased. The dropped commits leave ``commits`` because they are no longer
+    on the branch; the ledger keeps their shas.
+    """
+    rewound = _stages_after(state, target)
+    for name in rewound:
+        entry = stage_entry(state, name)
+        entry["rewound"] = {
+            "n": number,
+            "at": now_iso(),
+            "was": {
+                key: entry.get(key)
+                for key in ("status", "run_id", "commit", "verdict")
+                if entry.get(key) is not None
+            },
+        }
+        entry["status"] = "pending"
+        # The session concluded something about work that is no longer on the
+        # branch, so resuming it would judge a repository that no longer exists.
+        for key in ("run_id", "commit", "verdict", "session_id"):
+            entry.pop(key, None)
+    commits = state.get("commits")
+    if isinstance(commits, dict):
+        for label in dropped:
+            commits.pop(label, None)
+    if "test" in rewound:
+        state.pop("test_verdict", None)
+    return rewound
+
+
+def rollback_slice(
+    args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> int:
+    """Rewind a slice's branch and state to one of its own stage commits."""
+    rec, state, ws = _finished_workspace(repo, args.rollback, repo_given, data_dir)
+    status = str(state.get("status", ""))
+    if status == STATUS_MERGED:
+        raise PipelineError(
+            "slice {0} is merged - its commits are on '{1}' now, and moving the branch "
+            "would not take them off it:\n"
+            "    aidev pipeline --repo {2} --revert-merge {0}".format(
+                rec.slice_id, ws.base or "the base", repo
+            )
+        )
+    if status == STATUS_REVERTED:
+        raise PipelineError(
+            "slice {0} was reverted off '{1}'; rewinding the branch now would only lose the "
+            "work the revert took out.\n"
+            "    Amend it and merge again, or discard it.".format(
+                rec.slice_id, ws.base or "the base"
+            )
+        )
+    if status == STATUS_DISCARDED:
+        raise PipelineError(
+            "slice {0} is discarded - its worktree and branch are gone, so there is "
+            "nothing to rewind".format(rec.slice_id)
+        )
+
+    targets = _rollback_targets(state)
+    target = getattr(args, "to_stage", None)
+    if not target or target not in targets:
+        raise PipelineError(
+            "--rollback needs --to <stage>, naming a stage this slice has a commit for.\n"
+            "    slice {0} can be rewound to: {1}\n"
+            "    an amend label ('{2}') is not a target - name the stage it re-ran".format(
+                rec.slice_id,
+                ", ".join(targets) or "(nothing - it has no stage commits)",
+                AMEND_LABEL.format(1, "implement"),
+            )
+        )
+
+    broken = workspace.verify(repo, ws)
+    if broken is not None:
+        raise PipelineError(
+            "{0}\n"
+            "    aidev does not re-create it: the stage commits already on '{1}' were made "
+            "there.\n"
+            "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
+                broken, ws.branch, repo, rec.slice_id
+            )
+        )
+    # Only tracked changes: a rewind throws those away. Untracked files are the
+    # worktree's build output and reset does not touch them.
+    if not workspace.is_clean(ws.path, tracked_only=True):
+        raise PipelineError(
+            "the worktree has uncommitted changes to tracked files: {0}\n"
+            "    a rewind would throw them away; commit or revert them first.".format(ws.path)
+        )
+
+    target_sha = str((state.get("commits") or {})[target])
+    before = workspace.resolve_commit(repo, ws.branch)
+    if before is None:
+        raise PipelineError("branch '{0}' does not resolve to a commit".format(ws.branch))
+    if not workspace.is_ancestor(repo, target_sha, before):
+        raise PipelineError(
+            "the '{0}' commit {1} is not on '{2}' any more - the branch was moved by hand.\n"
+            "    aidev does not guess what that meant: sort the branch out yourself.".format(
+                target, target_sha[:7], ws.branch
+            )
+        )
+    if before == target_sha:
+        say(
+            "slice {0} is already at '{1}' ({2}) - nothing to rewind".format(
+                rec.slice_id, target, target_sha[:7]
+            )
+        )
+        return EXIT_DONE
+
+    commits = dict(state.get("commits") or {})
+    # Reachability, not label order: an amend commits under 'amend1/implement'
+    # after 'test', so no ordering of the map could tell these apart.
+    dropped = {
+        label: str(sha)
+        for label, sha in commits.items()
+        if sha and not workspace.is_ancestor(repo, str(sha), target_sha)
+    }
+    paths = workspace.diff_paths(repo, target_sha, before)
+    number = len(rec.rollbacks()) + 1
+    reason = (getattr(args, "reason", None) or "").strip() or None
+
+    say("rollback slice {0} -> '{1}' ({2})".format(rec.slice_id, target, target_sha[:7]))
+    say("  branch  {0}".format(ws.branch))
+    say(
+        "  was at  {0}   ({1} commit(s) dropped{2})".format(
+            before[:7], len(dropped), (": " + ", ".join(sorted(dropped))) if dropped else ""
+        )
+    )
+    say("  undo    git -C {0} reset --hard {1}".format(ws.path, before[:10]))
+    say_lines(migration_note(paths))
+    if getattr(args, "dry_run", False):
+        say("--dry-run: nothing was changed")
+        return EXIT_DONE
+
+    with SliceLock(rec):
+        try:
+            workspace.reset_hard(ws.path, target_sha)
+        except workspace.GitError as exc:
+            raise PipelineError("could not rewind {0}: {1}".format(ws.branch, exc))
+        # The ledger before the state: git has already moved, and the undo command
+        # printed above stays correct whatever happens to the two writes after it.
+        rewound = _stages_after(state, target)
+        rec.append_rollback(
+            {
+                "n": number,
+                "kind": "stage",
+                "at": now_iso(),
+                "target": target,
+                "branch": ws.branch,
+                "from": before,
+                "to": target_sha,
+                "dropped_commits": dropped,
+                "rewound_stages": rewound,
+                "migrations": migration_paths(paths),
+                "reason": reason,
+                "undo": "git -C {0} reset --hard {1}".format(ws.path, before),
+            }
+        )
+        _rewind_state(state, target, dropped, number)
+        state["rollback"] = {
+            "n": number,
+            "kind": "stage",
+            "target": target,
+            "at": now_iso(),
+            "from": before,
+            "to": target_sha,
+        }
+        state["reason"] = "rolled back to '{0}' ({1})".format(target, target_sha[:7])
+        set_status(rec, state, STATUS_ROLLED_BACK)
+
+    say("rewound {0} to {1}".format(ws.branch, target_sha[:7]))
+    say("  pending again: {0}".format(", ".join(rewound) or "(nothing after '{0}')".format(target)))
+    say("  recorded in {0}".format(rec.rollbacks_path))
+    say("  continue from there:")
+    say("    aidev pipeline --repo {0} --resume-slice {1}".format(repo, rec.slice_id))
+    return EXIT_DONE
+
+
+def revert_merge_slice(
+    args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> int:
+    """Take a merged slice back off its base branch, with a revert commit.
+
+    Never a reset: the base may already be pushed, and rewriting a branch other
+    people have is not an undo, it is a second problem.
+    """
+    rec, state, ws = _finished_workspace(repo, args.revert_merge, repo_given, data_dir)
+    merge = state.get("merge")
+    merge = merge if isinstance(merge, dict) else {}
+    merge_commit = merge.get("commit")
+    if merge.get("status") != "merged" or not merge_commit:
+        raise PipelineError(
+            "slice {0} was never merged{1}, so there is no merge commit to revert.".format(
+                rec.slice_id,
+                " (its last merge ended in a conflict)"
+                if merge.get("status") == "conflict"
+                else "",
+            )
+        )
+    previous = state.get("revert")
+    if isinstance(previous, dict) and previous.get("status") == "reverted":
+        raise PipelineError(
+            "slice {0} was already reverted, by {1}.\n"
+            "    To put the work back, revert the revert yourself:\n"
+            "    git -C {2} revert --no-edit {1}".format(
+                rec.slice_id, str(previous.get("commit") or "?")[:10], repo
+            )
+        )
+    if ws.base is None:
+        raise PipelineError(
+            "slice {0} has no base branch recorded, so there is nothing to revert it "
+            "from".format(rec.slice_id)
+        )
+
+    # Same four preconditions as --merge: this writes to the user's checkout too.
+    _require_checkout_on_base(repo, ws)
+    if not workspace.is_ancestor(repo, str(merge_commit), ws.base):
+        raise PipelineError(
+            "the merge commit {0} is not on '{1}' - the history was rewritten, or this is a "
+            "different base.\n"
+            "    aidev will not revert something that is not there.".format(
+                str(merge_commit)[:7], ws.base
+            )
+        )
+
+    before = workspace.head_commit(repo) or "?"
+    paths = workspace.diff_paths(repo, "{0}^".format(merge_commit), str(merge_commit))
+    number = len(rec.rollbacks()) + 1
+    reason = (getattr(args, "reason", None) or "").strip() or None
+
+    say("revert merge of slice {0} on {1}".format(rec.slice_id, ws.base))
+    say(
+        "  merge commit   {0}  ({1})".format(
+            str(merge_commit)[:7], COMMIT_MESSAGE.format(rec.slice_id, "merge")
+        )
+    )
+    say("  base is at     {0}".format(before[:7]))
+    say("  undo (not pushed yet)  git -C {0} reset --hard {1}".format(repo, before[:10]))
+    say("  undo (already pushed)  git -C {0} revert --no-edit <the revert commit>".format(repo))
+    say_lines(migration_note(paths))
+    if getattr(args, "dry_run", False):
+        say("--dry-run: nothing was changed")
+        return EXIT_DONE
+
+    with SliceLock(rec):
+        result = workspace.revert_commit(repo, str(merge_commit))
+        if not result.ok:
+            state["revert"] = {
+                "at": now_iso(),
+                "status": "conflict",
+                "conflicts": result.conflicts,
+                "merge_commit": merge_commit,
+                "base": ws.base,
+                "branch": ws.branch,
+            }
+            rec.write_state(state)
+            say("REVERT CONFLICT - {0} is untouched, the revert was aborted".format(repo))
+            for path in result.conflicts[:20] or ["(git named no paths)"]:
+                say("  {0}".format(path))
+            if result.detail:
+                say("  {0}".format(result.detail.splitlines()[0]))
+            say("aidev does not resolve a conflict for you. Do it yourself:")
+            say("  git -C {0} revert -m 1 {1}".format(repo, merge_commit))
+            return EXIT_CONFLICT
+
+        state["revert"] = {
+            "at": now_iso(),
+            "status": "reverted",
+            "commit": result.commit,
+            "merge_commit": merge_commit,
+            "base": ws.base,
+            "branch": ws.branch,
+        }
+        rec.append_rollback(
+            {
+                "n": number,
+                "kind": "revert-merge",
+                "at": now_iso(),
+                "branch": ws.branch,
+                "base": ws.base,
+                "merge_commit": merge_commit,
+                "from": before,
+                "to": result.commit,
+                "migrations": migration_paths(paths),
+                "reason": reason,
+                "undo": "git -C {0} revert --no-edit {1}".format(repo, result.commit),
+            }
+        )
+        set_status(rec, state, STATUS_REVERTED)
+
+    say("reverted {0} out of {1} ({2})".format(ws.branch, ws.base, (result.commit or "?")[:7]))
+    say("  undo (already pushed)  git -C {0} revert --no-edit {1}".format(repo, result.commit))
+    say("  recorded in {0}".format(rec.rollbacks_path))
+    say("the worktree and the branch are untouched - aidev removes nothing it did not "
+        "just create. From here:")
+    say('  aidev pipeline --repo {0} --amend {1} "<what to fix>"   then --merge again'.format(
+        repo, rec.slice_id
+    ))
+    say("  aidev pipeline --repo {0} --discard {1}".format(repo, rec.slice_id))
+    if merge.get("push"):
+        say("this command does not push. The revert is local until you send it:")
+        say("  git -C {0} push {1} {2}".format(
+            repo, (merge.get("push") or {}).get("remote") or "origin", ws.base
+        ))
+    return EXIT_DONE
 
 
 def discard_slice(

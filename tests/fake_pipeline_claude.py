@@ -25,6 +25,8 @@ the pipeline has to survive.
     AIDEV_FAKE_BIG_PLAN     plan stage lists 18 files, 6 of them tests - a plan
                           over the size the turn-budget warning fires at
     AIDEV_FAKE_FILES        create N files in cwd during implement (commit guard)
+    AIDEV_FAKE_MIGRATION    write backend/migrations/003_add_seat.sql during implement,
+                          so a real stage commit carries a migration file
     AIDEV_FAKE_SLICES       how many items the decompose stage lists (default: 2)
     AIDEV_FAKE_SLICE_APPROVAL
                           the 'approval:' each listed slice declares (default: none)
@@ -251,6 +253,15 @@ def main():
         for index in range(int(os.environ["AIDEV_FAKE_FILES"])):
             with open("generated-{0}.txt".format(index), "w", encoding="utf-8") as handle:
                 handle.write("derived output nobody ignored\n")
+
+    if os.environ.get("AIDEV_FAKE_MIGRATION") and stage == "implement":
+        # A real file in a real stage commit, so a rollback range genuinely
+        # contains a migration rather than one a test planted by hand.
+        directory = os.path.join("backend", "migrations")
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(os.path.join(directory, "003_add_seat.sql"), "w", encoding="utf-8") as handle:
+            handle.write("alter table game add column seat int;\n")
 
     # One tool call per run, so telemetry has something to account for. The
     # implement stage reports an Edit, which is what the change summary reads;

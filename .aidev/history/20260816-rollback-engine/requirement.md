@@ -1,6 +1,6 @@
 ---
 approval: plan
-max_turns: implement=160
+max_turns: implement=140
 ---
 # Rollback Engine — 의미 단위 되돌리기
 

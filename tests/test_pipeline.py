@@ -1737,6 +1737,304 @@ def test_a_vanished_worktree_is_reported_not_recreated(repo, tmp_path, claude_bi
     assert "gone" in err and "--discard" in err
 
 
+# ------------------------------------------------- rollback / revert-merge
+#
+# 철학 0조: "일단 만든다, 언제든 롤백된다, 그래서 거침없다." A slice branch is local,
+# so it is rewound; a base branch may be pushed, so it is only ever reverted.
+
+
+def rollbacks(repo, slice_id=None):
+    directory = pipeline.slices_root(repo) / slice_id if slice_id else slice_dir(repo)
+    path = directory / "rollbacks.json"
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))["rollbacks"]
+
+
+def rollback(repo, tmp_path, claude_bin, slice_id, to="plan", *extra):
+    return main(
+        argv(repo, tmp_path, claude_bin, "--rollback", slice_id, "--to", to, *extra)
+    )
+
+
+def test_rollback_rewinds_the_branch_and_the_state(repo, tmp_path, claude_bin, log):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    plan_sha = state_of(repo)["commits"]["plan"]
+
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 0
+
+    branch = "slice/{0}".format(slice_id)
+    assert git(repo, "rev-parse", branch).stdout.strip() == plan_sha
+    work = worktree(repo, tmp_path, slice_id)
+    assert git(work, "rev-parse", "HEAD").stdout.strip() == plan_sha
+
+    state = state_of(repo)
+    assert state["status"] == "rolled_back"
+    assert state["schema"] == 2  # every key it adds is optional
+    assert state["stages"]["plan"]["status"] == "done"
+    assert [state["stages"][name]["status"] for name in ("implement", "test")] == [
+        "pending", "pending"
+    ]
+    assert set(state["commits"]) == {"requirement", "plan"}
+    assert "test_verdict" not in state
+    # the history is wound back, not deleted: what it cost stays, and so does the
+    # fact that it was wound back
+    assert state["stages"]["implement"]["attempts"] == 1
+    assert state["stages"]["implement"]["rewound"]["was"]["status"] == "done"
+    assert state["stages"]["test"]["rewound"]["was"]["verdict"] == "pass"
+    for name in ("implement", "test"):
+        assert "session_id" not in state["stages"][name]
+
+
+def test_a_rolled_back_slice_resumes_and_finishes(repo, tmp_path, claude_bin, log):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 0
+    before = len(invocations(log))
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+
+    calls = invocations(log)[before:]
+    assert len(calls) == 2  # implement and test only: plan is still done
+    assert "IMPLEMENT stage" in calls[0]["prompt"] and "TEST stage" in calls[1]["prompt"]
+
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert {"implement", "test"} <= set(state["commits"])
+    log_subjects = subjects(repo, "{0}..slice/{1}".format(BASE_BRANCH, slice_id))
+    assert log_subjects.count("slice({0}): implement".format(slice_id)) == 1
+    assert log_subjects.count("slice({0}): test".format(slice_id)) == 1
+
+
+def test_rollback_prints_the_recovery_command_and_records_it(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    state = state_of(repo)
+    before = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+    dropped_before = {name: state["commits"][name] for name in ("implement", "test")}
+    capsys.readouterr()
+
+    assert rollback(
+        repo, tmp_path, claude_bin, slice_id, "plan", "--reason", "테스트가 헛돌아서"
+    ) == 0
+
+    out = capsys.readouterr().out
+    assert "was at  {0}".format(before[:7]) in out
+    assert "reset --hard {0}".format(before[:10]) in out
+
+    entries = rollbacks(repo)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert (entry["n"], entry["kind"], entry["target"]) == (1, "stage", "plan")
+    assert entry["from"] == before
+    assert entry["to"] == state["commits"]["plan"]
+    assert entry["dropped_commits"] == dropped_before
+    assert entry["rewound_stages"] == ["implement", "test"]
+    assert entry["reason"] == "테스트가 헛돌아서"
+    assert entry["undo"].endswith("reset --hard {0}".format(before))
+    # state keeps the latest one as a summary; the ledger file is the whole story
+    assert state_of(repo)["rollback"]["n"] == 1
+
+
+def test_rollback_warns_about_migrations_in_range(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    monkeypatch.setenv("AIDEV_FAKE_MIGRATION", "1")
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    capsys.readouterr()
+
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 0
+
+    out = capsys.readouterr().out
+    assert "1 migration file(s)" in out
+    assert "the database is NOT" in out
+    assert "backend/migrations/003_add_seat.sql" in out
+    assert rollbacks(repo)[0]["migrations"] == ["backend/migrations/003_add_seat.sql"]
+
+
+def test_rollback_refuses_uncommitted_work_in_the_worktree(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    tip = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+
+    (work / "README.md").write_text("half-finished by hand\n", encoding="utf-8")
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 2
+    assert "throw them away" in capsys.readouterr().err
+    assert git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip() == tip
+    assert not rollbacks(repo)
+
+    # untracked files are none of a rewind's business - reset never touches them
+    git(work, "checkout", "--", "README.md")
+    (work / "junk.txt").write_text("build output\n", encoding="utf-8")
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 0
+    assert (work / "junk.txt").exists()
+
+
+def test_rollback_usage_errors(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--rollback", slice_id)) == 2
+    assert "--to" in capsys.readouterr().err
+
+    assert main(argv(repo, tmp_path, claude_bin, "--to", "plan")) == 2
+    assert "--to only makes sense" in capsys.readouterr().err
+
+    assert rollback(repo, tmp_path, claude_bin, slice_id, "nope") == 2
+    err = capsys.readouterr().err
+    assert "can be rewound to" in err and "requirement, plan, implement, test" in err
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    capsys.readouterr()
+    assert rollback(repo, tmp_path, claude_bin, slice_id) == 2
+    assert "--revert-merge" in capsys.readouterr().err
+
+
+def test_rollback_dry_run_touches_nothing(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    tip = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+    capsys.readouterr()
+
+    assert rollback(repo, tmp_path, claude_bin, slice_id, "plan", "--dry-run") == 0
+
+    out = capsys.readouterr().out
+    assert "rollback slice {0} -> 'plan'".format(slice_id) in out
+    assert "nothing was changed" in out
+    assert git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip() == tip
+    assert not (slice_dir(repo) / "rollbacks.json").exists()
+    assert state_of(repo)["status"] == "done"
+
+
+def test_rollback_after_an_amend_drops_the_amend_commits(repo, tmp_path, claude_bin, log):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 0
+
+    assert rollback(repo, tmp_path, claude_bin, slice_id, "implement") == 0
+
+    state = state_of(repo)
+    # reachability, not label order: the amend commits sit after 'test'
+    assert set(state["commits"]) == {"requirement", "plan", "implement"}
+    dropped = rollbacks(repo)[0]["dropped_commits"]
+    assert {"test", "amend1/implement", "amend1/test"} == set(dropped)
+    assert state["stages"]["implement"]["status"] == "done"
+    assert state["stages"]["test"]["status"] == "pending"
+
+
+def test_revert_merge_puts_a_revert_commit_on_the_base(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    merge_commit = state_of(repo)["merge"]["commit"]
+    mirrored = repo / ".aidev" / "history" / slice_id / "requirement.md"
+    assert mirrored.exists()
+    capsys.readouterr()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 0
+
+    assert git(repo, "log", "--format=%s", "-1").stdout.strip() == (
+        'Revert "slice({0}): merge"'.format(slice_id)
+    )
+    assert not mirrored.exists()
+    # what we did not create, we do not remove
+    assert worktree(repo, tmp_path, slice_id).is_dir()
+    assert "slice/{0}".format(slice_id) in branches(repo)
+
+    state = state_of(repo)
+    assert state["status"] == "reverted"
+    assert state["revert"]["status"] == "reverted"
+    assert state["revert"]["merge_commit"] == merge_commit
+    assert state["revert"]["commit"] == git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    entries = rollbacks(repo)
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "revert-merge"
+    assert entries[0]["merge_commit"] == merge_commit
+
+    out = capsys.readouterr().out
+    assert "reset --hard" in out and "revert --no-edit" in out
+
+
+def test_revert_merge_conflict_stops_and_reports(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    (work / "README.md").write_text("the slice's version\n", encoding="utf-8")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "slice edit")
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+
+    # the base moved on after the merge, over the very lines the revert undoes
+    (repo / "README.md").write_text("the human's later version\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "human edit")
+    before = git(repo, "rev-parse", "HEAD").stdout.strip()
+    capsys.readouterr()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 4
+
+    out = capsys.readouterr().out
+    assert "REVERT CONFLICT" in out and "README.md" in out
+    # nothing resolved, nothing half-applied
+    assert git(repo, "rev-parse", "HEAD").stdout.strip() == before
+    assert (repo / "README.md").read_text(encoding="utf-8") == "the human's later version\n"
+    assert not [
+        line for line in git(repo, "status", "--porcelain").stdout.splitlines()
+        if line.startswith("UU")
+    ]
+    state = state_of(repo)
+    assert state["revert"]["status"] == "conflict"
+    assert state["status"] == "merged"  # the merge still stands
+    assert not rollbacks(repo)
+
+
+def test_revert_merge_preconditions(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 2
+    assert "never merged" in capsys.readouterr().err
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    capsys.readouterr()
+
+    git(repo, "checkout", "-q", "-b", "somewhere-else")
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 2
+    assert "checkout {0}".format(BASE_BRANCH) in capsys.readouterr().err
+    git(repo, "checkout", "-q", BASE_BRANCH)
+
+    (repo / "README.md").write_text("edited but not committed\n", encoding="utf-8")
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 2
+    assert "commit or stash" in capsys.readouterr().err
+    git(repo, "checkout", "--", "README.md")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 0
+    capsys.readouterr()
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 2
+    assert "already reverted" in capsys.readouterr().err
+
+
+def test_a_reverted_slice_is_readable_and_not_silently_resumed(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    """An open schema: a reader that never heard of 'reverted' still reads it."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    assert main(argv(repo, tmp_path, claude_bin, "--revert-merge", slice_id)) == 0
+    capsys.readouterr()
+
+    assert main(argv(repo, tmp_path, claude_bin, "--list")) == 0
+    assert "reverted" in capsys.readouterr().out
+    assert state_of(repo)["schema"] == 2
+
+    # every stage is still done, so a resume would walk through and quietly
+    # report the slice as done again - which would launder the revert
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
+    assert "nothing left to resume" in capsys.readouterr().err
+
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 0
+    assert "merge it again" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- --amend
 #
 # The 사후 감독 channel: a finished slice is corrected by throwing one more

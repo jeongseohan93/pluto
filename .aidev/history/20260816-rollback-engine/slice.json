@@ -1,0 +1,92 @@
+{
+  "slice_id": "20260816-rollback-engine",
+  "status": "running:test",
+  "branch": "slice/20260816-rollback-engine",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9269167931728f0446587f030db7597cd595919e",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 12,
+    "test_files": 2,
+    "budget": 140,
+    "warn": true
+  },
+  "amends": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260816-223516-rollback-engine-plan",
+      "attempts": 1,
+      "commit": "41925e233ed7fb6b492d208e35cd78f1c9ecbfa5"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260817-004032-rollback-engine-implement",
+      "attempts": 1,
+      "commit": "7cfe7affdd4a584bb0b4c721b9b0e92f2c737a08"
+    },
+    "test": {
+      "status": "done",
+      "run_id": "20260817-011358-rollback-engine-test",
+      "verdict": "pass",
+      "attempts": 1
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260816-223516-rollback-engine-plan",
+      "status": "completed",
+      "turns": 28,
+      "tokens": {
+        "input": 38,
+        "cache_creation": 147871,
+        "cache_read": 2167392,
+        "output": 30286,
+        "billed_input": 2315301,
+        "peak_context": 162340
+      },
+      "cost_usd": 3.319746
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260817-004032-rollback-engine-implement",
+      "status": "completed",
+      "turns": 54,
+      "tokens": {
+        "input": 8830,
+        "cache_creation": 174246,
+        "cache_read": 7795587,
+        "output": 42323,
+        "billed_input": 7978663,
+        "peak_context": 195132
+      },
+      "cost_usd": 6.7424785
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260817-011358-rollback-engine-test",
+      "status": "completed",
+      "turns": 6,
+      "tokens": {
+        "input": 52,
+        "cache_creation": 25783,
+        "cache_read": 204626,
+        "output": 917,
+        "billed_input": 230461,
+        "peak_context": 46669
+      },
+      "cost_usd": 0.383328
+    }
+  ],
+  "updated_at": "2026-08-17T01:20:18+09:00"
+}
