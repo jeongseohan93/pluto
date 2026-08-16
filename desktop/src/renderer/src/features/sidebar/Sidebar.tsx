@@ -11,9 +11,14 @@ import { Icon } from '@renderer/components/Icon'
 import { EmptyState, Meter, PanelHeader, RunStateBadge } from '@renderer/components/primitives'
 import { tokens, usd } from '@renderer/lib/format'
 import type { ActivityId } from '@renderer/features/activitybar/ActivityBar'
+import {
+  PipelineSidebar,
+  type PipelineSidebarProps
+} from '@renderer/features/pipeline/PipelineSidebar'
 
 export function Sidebar(props: {
   activity: ActivityId
+  pipeline: PipelineSidebarProps
   workspaces: WorkspaceSummary[]
   activeWorkspaceId: string
   onSelectWorkspace: (id: string) => void
@@ -26,6 +31,7 @@ export function Sidebar(props: {
   onSelectSymbol: (id: string) => void
 }): JSX.Element {
   const titles: Record<ActivityId, string> = {
+    pipeline: 'Pipeline',
     workspaces: 'Workspaces',
     graph: 'Graph scope',
     changes: 'Changes',
@@ -40,7 +46,9 @@ export function Sidebar(props: {
         right={<Icon name="search" size={13} className="text-fg-mute hover:text-fg-dim" />}
       />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {props.activity === 'workspaces' ? (
+        {props.activity === 'pipeline' ? (
+          <PipelineSidebar {...props.pipeline} />
+        ) : props.activity === 'workspaces' ? (
           <WorkspacesView {...props} />
         ) : props.activity === 'graph' ? (
           <ScopeView {...props} />

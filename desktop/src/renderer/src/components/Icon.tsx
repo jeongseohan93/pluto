@@ -5,6 +5,7 @@ import type { JSX } from 'react'
  * shell needs eight glyphs, and navigation must not fall back to emoji.
  */
 const PATHS = {
+  pipeline: 'M3 3.5h3v3H3zM3 9.5h3v3H3zM10 6.5h3v3h-3zM6 5h2.5a1.5 1.5 0 0 1 1.5 1.5M6 11h2.5a1.5 1.5 0 0 0 1.5-1.5',
   workspaces: 'M2 4h5v4H2zM9 4h5v8H9zM2 10h5v2H2z',
   graph:
     'M2.5 2.5h4v3h-4zM9.5 6.5h4v3h-4zM2.5 10.5h4v3h-4zM6.5 4h1.5a1.5 1.5 0 0 1 1.5 1.5v2.5M6.5 12h1.5a1.5 1.5 0 0 0 1.5-1.5V8',
