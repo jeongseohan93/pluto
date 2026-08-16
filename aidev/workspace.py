@@ -148,6 +148,27 @@ def resolve_commit(repo: Path, ref: str) -> Optional[str]:
     return proc.stdout.strip() or None
 
 
+def is_ancestor(repo: Path, maybe_ancestor: str, ref: str) -> bool:
+    """Is the first commit reachable from the second? A commit is its own ancestor.
+
+    The one question a rewind has to ask about a ref, and it is asked of git
+    rather than of a label order: an amend puts ``amend1/implement`` on the
+    branch after ``test``, so "which commits does this rewind drop" cannot be
+    answered by reading the ``commits`` map top to bottom.
+    """
+    return run(
+        repo, ["merge-base", "--is-ancestor", maybe_ancestor, ref], check=False
+    ).returncode == 0
+
+
+def diff_paths(repo: Path, a: str, b: str) -> List[str]:
+    """Paths that differ between two commits. Empty when git cannot answer."""
+    proc = run(repo, ["diff", "--name-only", a, b], check=False)
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def branch_exists(repo: Path, name: str) -> bool:
     return run(
         repo, ["show-ref", "--verify", "--quiet", "refs/heads/{0}".format(name)], check=False
@@ -312,6 +333,17 @@ def commit_all(
     return head_commit(worktree)
 
 
+def reset_hard(worktree: Path, commit: str) -> None:
+    """Move a branch and its working tree back to ``commit``.
+
+    Untracked files are deliberately left alone - ``git clean`` is not run here.
+    A worktree's node_modules/ and build output are derivatives nobody asked to
+    lose, and reset does not touch them anyway. Tracked changes *are* thrown
+    away, so the caller checks the tree is clean before calling this.
+    """
+    git(worktree, "reset", "--hard", commit)
+
+
 def branch_remote(repo: Path, branch: str) -> Optional[str]:
     """The remote this branch tracks, or ``None`` when it tracks nothing."""
     return _config_value(repo, "branch.{0}.remote".format(branch)) or None
@@ -358,6 +390,34 @@ def merge_branch(repo: Path, branch: str, message: str) -> MergeResult:
         if line.strip()
     ]
     run(repo, ["merge", "--abort"], check=False)
+    detail = (proc.stderr.strip() or proc.stdout.strip())
+    return MergeResult(ok=False, conflicts=conflicts, detail=detail)
+
+
+def revert_commit(repo: Path, commit: str, mainline: int = 1) -> MergeResult:
+    """Put a revert of ``commit`` on whatever is checked out. Same result shape as a merge.
+
+    ``-m 1`` because the commit being reverted is a merge: mainline 1 is the base
+    branch, so what is undone is everything the slice branch brought in.
+
+    No ``--no-verify``: unlike a stage snapshot this is a commit on the user's own
+    branch, made because a human asked for it, and it goes through their hooks for
+    the same reason the merge does.
+
+    A conflict is aborted, never resolved, and the conflicted paths are read
+    *before* the abort - exactly what ``merge_branch`` does and for the same reason.
+    """
+    proc = run(repo, ["revert", "-m", str(mainline), "--no-edit", commit], check=False)
+    if proc.returncode == 0:
+        return MergeResult(ok=True, commit=head_commit(repo), detail=proc.stdout.strip())
+    conflicts = [
+        line.strip()
+        for line in run(
+            repo, ["diff", "--name-only", "--diff-filter=U"], check=False
+        ).stdout.splitlines()
+        if line.strip()
+    ]
+    run(repo, ["revert", "--abort"], check=False)
     detail = (proc.stderr.strip() or proc.stdout.strip())
     return MergeResult(ok=False, conflicts=conflicts, detail=detail)
 
