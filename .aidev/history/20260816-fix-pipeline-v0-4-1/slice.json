@@ -1,6 +1,6 @@
 {
   "slice_id": "20260816-fix-pipeline-v0-4-1",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260816-fix-pipeline-v0-4-1",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9a9aca1ee2a8e9208e57da2b56b2067fc008735e",
@@ -12,7 +12,9 @@
   "setup": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260816-202815-fix-pipeline-v0-4-1-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -21,6 +23,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-16T20:28:14+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260816-202815-fix-pipeline-v0-4-1-plan",
+      "status": "completed",
+      "turns": 26,
+      "tokens": {
+        "input": 2147,
+        "cache_creation": 142182,
+        "cache_read": 1196768,
+        "output": 33778,
+        "billed_input": 1341097,
+        "peak_context": 156651
+      },
+      "cost_usd": 2.8122577499999997
+    }
+  ],
+  "updated_at": "2026-08-16T20:35:48+09:00"
 }
