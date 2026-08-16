@@ -103,6 +103,7 @@ worktree 생성   <repo>-slices/<slice-id> + 브랜치 slice/<slice-id>  (base =
     ↓            커밋: slice(<id>): test
 단계별 토큰 / 비용 / 변경 파일 요약
     ↓
+--amend <id>   같은 브랜치 위에서 implement → test 한 바퀴 더 (사람이 친다)
 --merge <id>   base 브랜치에 merge      (사람이 친다)
 --discard <id> worktree + 브랜치 제거    (사람이 친다)
 ```
@@ -111,11 +112,17 @@ worktree 생성   <repo>-slices/<slice-id> + 브랜치 slice/<slice-id>  (base =
 aidev pipeline --repo ~/jokertest --requirement tasks/doctor.md
 aidev pipeline --repo ~/jokertest --resume-slice last    # 중단된 slice 이어가기
 aidev pipeline --repo ~/jokertest --list                 # slice 목록 / 상태
+aidev pipeline --repo ~/jokertest --amend 20260816-doctor "인원수 표시를 고쳐라"
 aidev pipeline --repo ~/jokertest --merge 20260816-doctor    # 승인 = base에 반영
+aidev pipeline --repo ~/jokertest --merge 20260816-doctor --push  # + 원격 백업
 aidev pipeline --repo ~/jokertest --discard 20260816-doctor  # 반려 = 폐기
 ```
 
-`--repo` 기본값은 현재 디렉터리다. run 단위 세션 재개인 `aidev run --resume`과
+`--repo` 기본값은 현재 디렉터리다. cwd에 `.aidev/`가 없어서 결과가 비면 그 이유를
+찍고, **전에 `--repo`로 지정했던 repo들을 후보로 제시한다**(실측: 빈 목록만 나와서
+원인을 못 찾았다). 후보 목록은 `<data-dir>/repos.json`에 남는다. 자동 적용은
+하지 않는다 — repo를 고르는 건 끝까지 사람 몫이고, 잘못 고르면 남의 체크아웃에서
+일이 벌어진다. run 단위 세션 재개인 `aidev run --resume`과
 이름이 겹치지 않게 `--resume-slice`로 분리했다. 인자는 정확한 id → 유일한 prefix →
 유일한 부분일치 순으로 찾고, **여러 개에 걸리면 고르지 않고 에러를 낸다** (남의
 repo에서 엉뚱한 slice를 재개하는 게 더 나쁘다). `last`는 이름 사전순이 아니라
@@ -177,6 +184,22 @@ aidev pipeline --repo ~/jokertest --discard 20260816-doctor
 알려주고 멈춘다. 충돌이 나면 **자동 해결하지 않는다**: 충돌 파일 목록을 먼저
 읽어두고 `merge --abort`로 본진을 원래대로 되돌린 뒤 exit 4로 끝낸다.
 
+`--merge <id> --push`는 merge가 끝난 뒤 **base 브랜치만** 원격에 push한다(실측:
+merge 후 push를 매번 손으로 쳤고, 잊으면 로컬 유일본이 된다). opt-in이고 기본값은
+push 안 함이다.
+
+- refspec을 `refs/heads/<base>:refs/heads/<base>`로 **명시**해서 부른다. `push.default`가
+  뭐로 설정돼 있든 **slice 브랜치는 argv에 아예 등장하지 않는다.**
+- `--force`, `--all`, `--tags`, `--set-upstream` 어느 것도 쓰지 않는다. 백업이지
+  설정 변경이 아니다.
+- 원격은 base가 추적하는 remote, 없으면 `origin`이다.
+- push가 실패해도 **merge는 그대로 유효하다**(커밋은 진짜고 status도 `merged`).
+  다만 exit는 `1`이다 — 이 옵션의 존재 이유가 "잊으면 로컬 유일본"인데 실패한
+  백업이 성공으로 읽히면 안 된다. 재시도할 `git push` 명령을 그대로 찍어준다.
+  결과는 `state.json`의 `merge.push`에 남는다. (원격이 크면 첫 push가 git
+  타임아웃 300초를 넘길 수 있다. 그때도 merge는 유효하고 push만 실패로 보고된다.)
+- `--merge` 없이 `--push`만 주면 사용법 에러다(exit 2).
+
 `--discard`는 worktree를 지우고 브랜치를 삭제한다. 삭제 직전 sha를 출력하므로
 reflog가 살아있는 동안은 되살릴 수 있다. worktree 제거가 실패하면(Windows에서
 에디터·watcher·node가 파일을 잡고 있으면 흔하다) **브랜치는 남긴 채 중단한다** —
@@ -205,11 +228,88 @@ setup: npm ci --prefix backend
   `setup.status = done`에 남으므로 resume해도 다시 돌지 않는다. 실패하면 slice가
   실패한다 — 반쯤 깨진 환경 위에 implement를 태우면 모델 탓이 아닌 실패가 나온다.
   전체 출력은 `.aidev/slices/<id>/setup.log`에 남는다.
-- 같은 명령이 implement/test의 `--allowedTools`에도 정확형(`Bash(npm ci --prefix
-  backend)`)과 접두형(`Bash(npm ci:*)`) 두 가지로 얹힌다.
+- `test_commands:` 미선언이면 같은 명령이 implement/test의 `--allowedTools`에도
+  정확형(`Bash(npm ci --prefix backend)`)과 접두형(`Bash(npm ci:*)`)으로 얹힌다.
 - **셸 없이 실행한다.** `&&`, `||`, `|`, `;`, `>`, `<`, 백틱, `$(`가 들어오면
   거부한다(exit 2). 셸을 열면 front matter 한 줄이 임의 스크립트가 된다.
   `setup:`을 값 없이 쓰는 것도 `approval:`과 같은 이유로 에러다.
+
+### 검증 명령 (test_commands, v0.4.1)
+
+실측 2026-08-15: `setup: npm ci --prefix backend`가 `Bash(npm ci:*)`만 열어서
+frontend 테스트 명령이 전부 거부됐다. 모델은 "이 프로젝트는 검증할 수 없다"고
+결론내고 계획에서 이탈했다. **검증 명령은 setup에서 파생하지 않고 따로 선언한다.**
+
+```markdown
+---
+approval: plan
+setup: npm ci --prefix backend
+test_commands: npm run test:guards, npm run lint
+test_commands: npx vitest run          # 줄을 반복하면 누적된다
+---
+```
+
+- 구분자는 **쉼표**다. 명령 안의 공백은 그대로 살아있다(`npm run test:guards`는
+  한 명령). 쉼표가 들어간 명령은 표현할 수 없다 — 그런 명령은 `--allow-tool`로 준다.
+- 선언하면 **선언한 것만** 허용된다. 내장 목록(`Bash(pytest:*)` 등)도, setup에서
+  파생된 규칙도 얹지 않는다. 그게 이 결함의 원인이었기 때문이다.
+- `--allow-tool`은 선언 여부와 무관하게 언제나 뒤에 더해진다 — 사람이 명시한 override다.
+- 같은 목록이 프롬프트에도 "이 프로젝트의 검증 명령은 이것"이라고 들어간다.
+  결함의 나머지 절반이 "검증이 불가능하다고 믿은 것"이었기 때문이다.
+- 미선언이면 v0.3 동작 그대로다. 셸 메타문자 거부와 빈 값 거부는 `setup:`과 같다.
+
+### 단계별 턴 예산 (max_turns, v0.4.1)
+
+실측 2026-08-15/16: implement가 **81턴에서 3번 죽었다**(자기수리1차 / v0.3 / v0.4).
+사인은 전부 "일 다 못 끝내고 강제 종료"이고, 매번 resume 비용이 추가됐다. 모든
+단계에 같은 예산을 주는 게 틀린 모양이었다 — plan과 test는 80 안에 편하게 끝난다.
+
+```markdown
+---
+max_turns: 140                  # 모든 단계
+max_turns: implement=140        # 한 단계만
+max_turns: 100, implement=140   # 기본값 + 덮어쓰기
+---
+```
+
+우선순위는 **CLI 단계 > front matter 단계 > CLI 기본 > front matter 기본 > 80**이다.
+CLI 쪽은 `--max-turns 100 --max-turns-stage implement=140`. 오타(`planz=`),
+정수가 아닌 값, `0` 이하, 한 단계에 서로 다른 값 두 번은 전부 거부한다(exit 2) —
+`approval:`과 같은 이유로, 뭔가 하려던 줄이 조용히 아무것도 안 하는 게 더 나쁘다.
+
+plan 산출물이 파일 12개 이상 또는 테스트 파일 5개 이상을 지목하는데 implement
+예산이 아직 160 미만이면, 승인 전에 경고 한 줄을 찍는다(로그 + `approvals/plan.md`
+안의 `#` 주석). 죽은 세 slice가 공유한 규모가 그 임계값이다. **경고일 뿐 막지
+않고, 예산을 자기 마음대로 올리지도 않는다.** 규모는 `state.json`의 `plan_scale`에
+남는다.
+
+### 사후 수정 (--amend, v0.4.1)
+
+완주한 slice에 사후 지시를 던지는 방법이 "새 requirement 작성"뿐이었다. 사후 감독
+모델에서는 이게 **최빈 동작**이 되므로 채널을 따로 냈다.
+
+```bash
+aidev pipeline --repo ~/jokertest --amend 20260816-doctor "인원수 표시를 고쳐라"
+```
+
+- amend는 **새 단계도 새 slice도 아니고, 같은 기록 위의 한 사이클**이다.
+  `implement → test`를 다시 연다. `plan`은 다시 돌지 않는다 — **지시문이 이 사이클의
+  plan이다.** 고칠 때마다 readonly 단계 하나와 게이트 하나를 더 무는 건 최빈 동작에
+  붙일 비용이 아니다.
+- 그래서 **plan 게이트도 다시 묻지 않는다.** `rejected`로 끝난 slice를 amend할 수
+  있는 것도 이 때문이다(`approvals/plan.md`의 낡은 답을 다시 읽지 않는다).
+- 프롬프트에는 **지시문 + 원 requirement + 직전 RESULT** 세 가지가 함께 들어간다.
+  requirement와 plan은 "이미 만든 것을 이해하라는 이력"으로 명시된다.
+- worktree와 브랜치는 그 slice가 이미 가진 것을 쓴다. 세션은 **새로 시작한다** —
+  "다 끝냈다"고 결론낸 세션이 새 지시를 낡은 기억으로 판단하면 안 된다.
+- 커밋은 `slice(<id>): amend1/implement` 형식이다. `slice(<id>): ` 접두는 그대로라
+  기존 reader가 전부 그대로 동작하고, 원래의 `implement` 커밋도 `commits`에 남는다.
+- `state.json`에는 `amends`(append-only 목록)와 `amend_open`이 붙는다. schema는
+  **2 그대로다** — 추가된 키가 전부 optional이기 때문이다. 실패하면 `amend_open`이
+  열린 채 남고, `--resume-slice`는 **slice 전체가 아니라 그 사이클을** 이어간다.
+- `discarded` slice는 거부한다(브랜치가 없다). `merged` slice는 실행하되 "다시
+  merge해야 한다"고 안내한다. 에픽 소속 slice도 실행하되 "뒤 slice들은 이 amend를
+  갖고 있지 않다"고 경고한다(뒤 slice는 amend 이전 tip에서 갈라져 나왔다).
 
 ### 승인 게이트
 
@@ -273,10 +373,14 @@ aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점�
 **분해의 품질 기준은 턴 예산이다.** 프롬프트가 "각 slice의 각 단계가
 `--max-turns`(기본 80) 안에 끝나야 한다"고 요구하고, 실측 근거(2026-08-15에 너무
 크게 자른 slice 2건이 81턴에서 작업 절반을 남기고 사망)를 그대로 준다.
-판단이 서지 않으면 더 작게 자르라고 명시한다.
+판단이 서지 않으면 더 작게 자르라고 명시한다. 정말 더 못 자르는 slice는
+`max_turns: implement=140`으로 **자기 예산을 스스로 올릴 수 있다**(v0.4.1).
+프롬프트가 인용하는 숫자는 decompose가 실제로 받는 예산이다.
 
 `slices.md`의 각 항목은 **그 자체로 실행 가능한 requirement**다. 형식은 기존
-front matter 규약과 그대로 호환이고, 마커만 추가된다.
+front matter 규약과 그대로 호환이고, 마커만 추가된다. 항목의 front matter는
+`approval:` / `setup:` / `test_commands:` / `max_turns:` 네 키를 받고, **목록 전체를
+먼저 검증한다** — 4번 항목의 오타가 1~3번이 브랜치를 만들기 전에 걸린다.
 
 ```markdown
 === SLICE 1: state.json에 memory 키 추가 ===
@@ -423,7 +527,9 @@ overwritten by merge"* 로 죽는다 — 본진에 그 파일이 이미 untracke
 `failed`다. **stages의 키 집합은 고정이 아니다** — 나중에 단계가 늘어도 reader는
 모르는 키를 그대로 표시해야 한다. v0.3에서 `schema`가 2가 되고
 `workspace` / `commits` / `setup` 키가 늘었다. reader는 **1도 계속 받는다** —
-`workspace`가 없는 slice는 격리 없이 이어진다.
+`workspace`가 없는 slice는 격리 없이 이어진다. v0.4.1이 더한
+`amends` / `amend_open` / `plan_scale` / `merge.push`는 전부 optional이라
+`schema`는 **2 그대로다** — 모르는 reader는 틀린 게 아니라 그냥 더 오래된 것뿐이다.
 
 Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 WinError 5로 죽는다
 (CPython의 `open()`이 delete 공유를 주지 않는다). 지연이 아니라 순간 충돌이므로
@@ -526,8 +632,10 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   있었다면 달라지는 지점이다. (복사는 하지 않는다.)
   다른 명령이 필요하면 `--allow-tool 'Bash(npx vitest:*)'`처럼 추가한다.
   같은 목록이 프롬프트에도 그대로 들어가므로, 모델이 아는 명령과 실제로 허용된
-  명령이 어긋날 수 없다.
-- 단계별 `--max-turns` 기본 80.
+  명령이 어긋날 수 없다. 프로젝트의 검증 명령을 front matter `test_commands:`로
+  선언하면 **그것만** 허용된다(위 "검증 명령" 절).
+- 단계별 `--max-turns` 기본 80. front matter `max_turns:`나 `--max-turns-stage`로
+  단계별로 올릴 수 있다(위 "단계별 턴 예산" 절).
 
 주요 옵션:
 
@@ -538,14 +646,17 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--resume-slice` | 중단된 slice 이어가기 (id / prefix / `last`) |
 | `--resume-epic` | 중단된 에픽 큐를 실패 지점부터 이어가기 (id / prefix / `last`) |
 | `--list` | slice 목록과 상태 (에픽이 있으면 에픽 진행 상황도 위에 함께) |
+| `--amend` | 끝난 slice에 지시문 하나로 implement → test 한 바퀴 더 (v0.4.1) |
 | `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
+| `--push` | `--merge`와 함께: base 브랜치만 원격에 push (slice 브랜치는 절대 안 함) |
 | `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
 | `--base` | slice가 갈라져 나올 브랜치 (기본: repo의 현재 HEAD, **main 아님**) |
 | `--worktree-root` | worktree 부모 디렉터리 (기본 `<repo>-slices`) |
 | `--no-worktree` | 격리 없이 repo 안에서 직접 실행 (v0.2 동작) |
 | `--setup-timeout` | front matter setup 명령의 제한 시간 (기본 1800초) |
 | `--commit-file-limit` | 단계 커밋이 건드릴 수 있는 최대 파일 수 (기본 2000) |
-| `--max-turns` | 단계별 상한 (기본 80) |
+| `--max-turns` | 모든 단계의 기본 상한 (기본 80) |
+| `--max-turns-stage` | 한 단계만 지정, `implement=140` (반복 가능, front matter보다 우선) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
 | `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
 | `--session-reset-after` | 같은 단계가 비쿼터 실패 N회면 새 session (기본 1) |
@@ -553,7 +664,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--approval-timeout` | 승인 대기 포기 시간 (기본 0 = 무한 대기) |
 | `--quota-wait` | reset 시각을 못 읽을 때의 재시도 간격 (기본 900초) |
 | `--quota-max-retries` | 쿼터 재시도 상한 (기본 20) |
-| `--dry-run` | slice id / base / 브랜치 / worktree / setup / 게이트 / 경로만 출력하고 종료 |
+| `--dry-run` | slice id / base / 브랜치 / worktree / setup / 검증 명령 / 턴 예산 / 게이트 / 경로만 출력하고 종료 (`--amend`와 함께면 돌 사이클) |
 
 종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부, `4` merge 충돌,
 `127` claude 없음.

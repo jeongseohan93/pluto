@@ -186,3 +186,50 @@ def test_resolve_run_dir(tmp_path):
     assert resolve_run_dir(runs, "nope") is None
     assert len(list_run_dirs(runs)) == 2
     assert list_run_dirs(tmp_path / "missing") == []
+
+
+def test_recent_repos_round_trip(tmp_path):
+    data_dir = tmp_path / "data"
+    first, second = tmp_path / "jokertest", tmp_path / "aidev"
+    for path in (first, second):
+        path.mkdir()
+
+    assert storage.recent_repos(data_dir) == []  # nothing recorded yet
+
+    storage.remember_repo(data_dir, first)
+    storage.remember_repo(data_dir, second)
+    assert storage.recent_repos(data_dir) == [str(second), str(first)]
+
+    # most recently used first, and a repeat moves rather than duplicates
+    storage.remember_repo(data_dir, first)
+    assert storage.recent_repos(data_dir) == [str(first), str(second)]
+
+    # a repo that has since been deleted is not offered as a candidate
+    second.rmdir()
+    assert storage.recent_repos(data_dir) == [str(first)]
+
+
+def test_recent_repos_is_capped_and_can_be_asked_for_fewer(tmp_path):
+    data_dir = tmp_path / "data"
+    for index in range(storage.RECENT_REPOS_LIMIT + 4):
+        path = tmp_path / "repo-{0:02d}".format(index)
+        path.mkdir()
+        storage.remember_repo(data_dir, path)
+
+    stored = json.loads(storage.recent_repos_path(data_dir).read_text(encoding="utf-8"))
+    assert len(stored["repos"]) == storage.RECENT_REPOS_LIMIT
+    assert storage.recent_repos(data_dir) == [
+        str(tmp_path / "repo-{0:02d}".format(index)) for index in (13, 12, 11, 10, 9)
+    ]
+    assert len(storage.recent_repos(data_dir, limit=2)) == 2
+
+
+def test_an_unreadable_recent_repos_file_offers_nothing_and_stops_nothing(tmp_path):
+    """The candidate list is a convenience: it must never be what fails a command."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    storage.recent_repos_path(data_dir).write_text("{ half written", encoding="utf-8")
+
+    assert storage.recent_repos(data_dir) == []
+    storage.remember_repo(data_dir, tmp_path)  # rewrites it rather than raising
+    assert storage.recent_repos(data_dir) == [str(tmp_path)]

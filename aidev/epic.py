@@ -193,7 +193,8 @@ TURN BUDGET - this is the quality bar for the split
 - Every step of every slice runs with a budget of {max_turns} turns.
 - Measured on 2026-08-15: two slices that were cut too large died at 81 turns
   with the work half done. That is the failure this budget exists to prevent.
-- If you are unsure whether a slice fits, cut it smaller.
+- If you are unsure whether a slice fits, cut it smaller. A slice that genuinely
+  cannot be cut smaller may raise its own budget with 'max_turns: implement=140'.
 
 ORDER IS DEPENDENCY
 - Slice N+1 starts in a worktree that already contains slice N's result, so a
@@ -225,9 +226,11 @@ approval: plan
 === SLICE 2: <title> ===
 ...
 
-- The front matter accepts exactly two keys: 'approval:' (stage names, or the
-  word none) and 'setup:' (one plain command, no shell operators). If you are
-  not sure, leave the line out and the default gate applies.
+- The front matter accepts exactly four keys: 'approval:' (stage names, or the
+  word none), 'setup:' (one plain command, no shell operators), 'test_commands:'
+  (how this project is verified, comma separated) and 'max_turns:' (a number, or
+  '<stage>=<number>'). If you are not sure, leave the line out and the defaults
+  apply.
 - Any text before the first === marker is kept as a note and never executed.
 - Write the body in the language the epic is written in.
 """
@@ -239,7 +242,8 @@ def decompose_spec(cfg: pipeline.PipelineConfig, epic_body: str) -> pipeline.Sta
         policy=DECOMPOSE_POLICY,
         phase=DECOMPOSE,
         allowed=(),
-        prompt=_DECOMPOSE_PROMPT.format(epic=epic_body.strip(), max_turns=cfg.max_turns),
+        # The number the prompt quotes has to be the number the run actually gets.
+        prompt=_DECOMPOSE_PROMPT.format(epic=epic_body.strip(), max_turns=cfg.turns_for(DECOMPOSE)),
     )
 
 
@@ -303,6 +307,8 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
         try:
             pipeline.resolve_gates(fields)
             pipeline.resolve_setup(fields)
+            pipeline.resolve_test_commands(fields)
+            pipeline.resolve_max_turns(fields)
         except pipeline.PipelineError as exc:
             raise pipeline.PipelineError("{0}: {1}".format(where, exc))
 
@@ -717,7 +723,7 @@ def start_epic(args: Any, repo: Path, data_dir: Path) -> int:
 
 
 def resume_epic(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
-    erec = find_epic(repo, args.resume_epic, repo_given)
+    erec = find_epic(repo, args.resume_epic, repo_given, data_dir)
     state = erec.read_state()
     if state is None:
         raise pipeline.PipelineError("no readable state.json in {0}".format(erec.dir))
@@ -793,10 +799,16 @@ def _existing_epics(root: Path) -> List[EpicRecord]:
     ]
 
 
-def find_epic(repo: Path, pattern: str, repo_given: bool = True) -> EpicRecord:
+def find_epic(
+    repo: Path, pattern: str, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> EpicRecord:
     root = epics_root(repo)
     return pipeline.find_record(
-        _existing_epics(root), pattern, "epic", root, pipeline._repo_hint(repo, repo_given)
+        _existing_epics(root),
+        pattern,
+        "epic",
+        root,
+        pipeline._repo_hint(repo, repo_given, data_dir),
     )
 
 

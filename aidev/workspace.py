@@ -312,6 +312,27 @@ def commit_all(
     return head_commit(worktree)
 
 
+def branch_remote(repo: Path, branch: str) -> Optional[str]:
+    """The remote this branch tracks, or ``None`` when it tracks nothing."""
+    return _config_value(repo, "branch.{0}.remote".format(branch)) or None
+
+
+def remote_exists(repo: Path, name: str) -> bool:
+    proc = run(repo, ["remote"], check=False)
+    return name in [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def push_branch(repo: Path, remote: str, branch: str) -> str:
+    """Push exactly one branch, by explicit refspec.
+
+    The refspec is spelled out rather than left to ``push.default`` so nothing
+    can ride along: whatever the repository is configured to do, only this one
+    branch is named in the argv. No force, no ``--all``, no ``--tags``, and no
+    upstream is set - pushing is a backup here, not a change of configuration.
+    """
+    return git(repo, "push", remote, "refs/heads/{0}:refs/heads/{0}".format(branch))
+
+
 @dataclass
 class MergeResult:
     ok: bool

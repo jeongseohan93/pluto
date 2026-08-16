@@ -705,6 +705,62 @@ def test_resume_without_repo_points_at_the_repo_flag(tmp_path, capsys, monkeypat
     assert "pass --repo <path>" in err
 
 
+def elsewhere_dir(tmp_path, monkeypatch):
+    path = tmp_path / "not-the-target"
+    path.mkdir()
+    monkeypatch.chdir(path)
+    return path
+
+
+def test_list_without_repo_offers_the_repos_it_has_seen(
+    repo, tmp_path, claude_bin, log, capsys, monkeypatch
+):
+    """The measured case: no .aidev/ in cwd printed an empty list and no reason."""
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    # a repo is only remembered once it has an .aidev/, so the run that creates
+    # one is not itself a candidate - the next command against it is
+    assert main(argv(repo, tmp_path, claude_bin, "--list")) == 0
+    capsys.readouterr()
+
+    elsewhere_dir(tmp_path, monkeypatch)
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--list"]) == 0
+
+    out = capsys.readouterr().out
+    assert "no slices in" in out
+    assert "recently used" in out
+    assert "--repo {0}".format(repo) in out
+    # offered, never applied: the listing itself is still empty
+    assert state_of(repo)["slice_id"] not in out
+
+
+def test_resume_without_repo_offers_candidates_but_resumes_nothing(
+    repo, tmp_path, claude_bin, log, capsys, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert main(argv(repo, tmp_path, claude_bin, "--list")) == 0
+    capsys.readouterr()
+
+    elsewhere_dir(tmp_path, monkeypatch)
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--resume-slice", "last"]) == 2
+
+    err = capsys.readouterr().err
+    assert "--repo {0}".format(repo) in err
+    assert "aidev never picks one for you" in err
+
+
+def test_a_directory_without_aidev_is_not_offered_later(tmp_path, capsys, monkeypatch):
+    junk = elsewhere_dir(tmp_path, monkeypatch)
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--list"]) == 0
+    capsys.readouterr()
+
+    assert main(["--data-dir", str(tmp_path / "data"), "pipeline", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "recently used" not in out
+    assert str(junk) not in out.replace("no slices in {0}".format(pipeline.slices_root(junk)), "")
+
+
 def test_dry_run_touches_nothing(repo, tmp_path, claude_bin, capsys):
     requirement(repo, front="approval: plan, implement")
     assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md", "--dry-run")) == 0
@@ -1247,6 +1303,230 @@ def test_setup_rejects_a_shell_chain(repo, tmp_path, claude_bin, log, capsys):
     assert invocations(log) == []
 
 
+# ------------------------------------------------------- declared test commands
+#
+# Measured 2026-08-15: 'setup: npm ci --prefix backend' granted Bash(npm ci:*)
+# and nothing else, so the frontend test command was refused, the agent concluded
+# the project could not be verified, and it left the plan. Verification is
+# declared now, not derived from the setup line.
+
+
+def granted(call):
+    argv_ = call["argv"]
+    return argv_[argv_.index("--allowedTools") + 1].split(",")
+
+
+def test_a_setup_command_no_longer_crowds_out_the_declared_test_command(tmp_path):
+    """The measured case exactly: the setup rule is gone, the real one is there."""
+    cfg = pipeline.PipelineConfig(
+        repo=tmp_path,
+        data_dir=tmp_path / "data",
+        setup_command="npm ci --prefix backend",
+        test_commands=["npm run test:guards"],
+    )
+    rules = pipeline.allowed_tools_for("test", cfg)
+    assert rules == ("Bash(npm run test:guards)", "Bash(npm run:*)")
+    assert "Bash(npm ci:*)" not in rules
+    assert pipeline.allowed_tools_for("plan", cfg) == ()  # readonly stays readonly
+
+    # --allow-tool is a human's explicit override and survives either way
+    cfg.allow_tools = ["Bash(npx playwright test:*)"]
+    assert pipeline.allowed_tools_for("test", cfg)[-1] == "Bash(npx playwright test:*)"
+
+
+def test_declared_test_commands_replace_the_built_in_rules(repo, tmp_path, claude_bin, log):
+    requirement(
+        repo,
+        front="approval: none\ntest_commands: npm run test:guards, npm run lint",
+    )
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    plan, implement, test = invocations(log)
+    assert "--allowedTools" not in plan["argv"]
+    for call in (implement, test):
+        assert granted(call) == [
+            "Bash(npm run test:guards)",
+            "Bash(npm run:*)",
+            "Bash(npm run lint)",
+        ]
+        # the built-ins are not appended behind them: declared means only these
+        assert "Bash(pytest:*)" not in granted(call)
+    # and the stage is told, in words, which commands are the project's
+    assert "npm run test:guards" in implement["prompt"]
+    assert "do not conclude the" in implement["prompt"]
+
+
+def test_the_declared_command_is_what_the_test_stage_may_actually_run(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """The whole measured defect end to end: setup declared, verification still possible."""
+    command = setup_script(tmp_path, "pass\n")
+    requirement(
+        repo,
+        front="approval: none\nsetup: {0}\ntest_commands: npm run test:guards".format(command),
+    )
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "requires_approval")
+    monkeypatch.setenv("AIDEV_FAKE_TEST_RULE", "Bash(npm run test:guards)")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert state_of(repo)["test_verdict"] == "pass"
+
+    rules = granted(invocations(log)[-1])
+    assert "Bash(npm run test:guards)" in rules
+    assert "Bash({0})".format(command) not in rules  # setup no longer grants itself
+
+
+def test_no_test_commands_declared_keeps_the_old_rules(repo, tmp_path, claude_bin, log):
+    """The undeclared path is v0.3's, untouched - setup still contributes its own rule."""
+    command = setup_script(tmp_path, "pass\n")
+    requirement(repo, front="approval: none\nsetup: {0}".format(command))
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    rules = granted(invocations(log)[1])
+    assert set(pipeline.TEST_COMMAND_TOOLS) <= set(rules)
+    assert "Bash({0})".format(command) in rules
+
+
+def test_a_test_command_that_needs_a_shell_is_refused_before_anything_runs(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    requirement(repo, front="approval: none\ntest_commands: npm test && rm -rf /")
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert "not allowed" in capsys.readouterr().err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
+
+
+# ------------------------------------------------------------- turn budgets
+#
+# Measured 2026-08-15/16: three implement stages died at turn 81 with the work
+# half done, each costing a resume. One budget for every stage was the wrong
+# shape, so the budget is declarable per stage.
+
+
+def budgets(log_path, calls=None):
+    return [
+        call["argv"][call["argv"].index("--max-turns") + 1]
+        for call in (calls if calls is not None else invocations(log_path))
+    ]
+
+
+def test_max_turns_front_matter_sets_one_stage_budget(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none\nmax_turns: implement=140")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    # only implement is raised; the two stages that already fit keep the default
+    assert budgets(log) == ["80", "140", "80"]
+
+
+def test_a_bare_max_turns_line_applies_to_every_stage(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none\nmax_turns: 120, test=40")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert budgets(log) == ["120", "120", "40"]
+
+
+def test_the_stage_flag_beats_the_front_matter_and_the_base_flag(
+    repo, tmp_path, claude_bin, log
+):
+    requirement(repo, front="approval: none\nmax_turns: 120, implement=140")
+    assert run_slice(
+        repo, tmp_path, claude_bin, "--max-turns", "50", "--max-turns-stage", "implement=200"
+    ) == 0
+    # CLI stage > front-matter stage > CLI base > front-matter base > the default
+    assert budgets(log) == ["50", "200", "50"]
+
+
+def test_a_repo_that_declares_nothing_still_gets_eighty(repo, tmp_path, claude_bin, log):
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert budgets(log) == ["80", "80", "80"]
+
+
+@pytest.mark.parametrize(
+    "front, message",
+    [
+        ("max_turns: planz=10", "unknown stage 'planz'"),
+        ("max_turns: abc", "positive whole number"),
+        ("max_turns: 0", "positive whole number"),
+        ("max_turns:", "needs a number"),
+        ("max_turns: implement=140, implement=60", "twice"),
+    ],
+)
+def test_a_max_turns_line_that_cannot_be_honoured_stops_the_slice(
+    repo, tmp_path, claude_bin, log, capsys, front, message
+):
+    requirement(repo, front="approval: none\n{0}".format(front))
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert message in capsys.readouterr().err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
+
+
+def test_the_dry_run_prints_the_budget_it_would_use(repo, tmp_path, claude_bin, capsys):
+    requirement(repo, front="approval: none\nmax_turns: implement=140")
+    assert run_slice(repo, tmp_path, claude_bin, "--dry-run") == 0
+    assert "turns     plan=80  implement=140  test=80" in capsys.readouterr().out
+
+
+# ------------------------------------------------------- plan size warning
+
+
+def test_a_plan_too_big_for_the_budget_warns_before_the_gate(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    requirement(repo, front="approval: plan")
+    monkeypatch.setenv("AIDEV_FAKE_BIG_PLAN", "1")
+    seen = {}
+
+    def approve(_seconds):
+        path = slice_dir(repo) / "approvals" / "plan.md"
+        seen["template"] = path.read_text(encoding="utf-8")
+        path.write_text("approved\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_sleep", approve)
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    scale = state_of(repo)["plan_scale"]
+    assert (scale["files"], scale["test_files"], scale["budget"]) == (18, 6, 80)
+    assert scale["warn"] is True
+
+    out = capsys.readouterr().out
+    assert "18 file(s), 6 of them tests" in out
+    assert "--max-turns-stage implement=160" in out
+    # the human deciding the gate reads it in the file too, as inert comments
+    assert "# warning: this plan names 18 file(s)" in seen["template"]
+    assert "# " in seen["template"]
+
+
+def test_a_small_plan_says_nothing(repo, tmp_path, claude_bin, log, capsys):
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    scale = state_of(repo)["plan_scale"]
+    assert scale["warn"] is False
+    assert "may not be enough" not in capsys.readouterr().out
+
+
+def test_a_budget_already_raised_has_nothing_left_to_advise(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    requirement(repo, front="approval: none\nmax_turns: implement=160")
+    monkeypatch.setenv("AIDEV_FAKE_BIG_PLAN", "1")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    scale = state_of(repo)["plan_scale"]
+    assert (scale["files"], scale["budget"], scale["warn"]) == (18, 160, False)
+    assert "may not be enough" not in capsys.readouterr().out
+
+
+def test_the_warning_reaches_an_unattended_slice_too(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """approval: none is the case where nobody is reading a gate file - so it is logged."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_BIG_PLAN", "1")
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert "may not be enough" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------- merge / discard
 
 
@@ -1272,6 +1552,81 @@ def test_merge_lands_on_a_non_main_base(repo, tmp_path, claude_bin, log, capsys)
     # the worktree is not ours to delete just because the merge worked
     assert worktree(repo, tmp_path, slice_id).is_dir()
     assert "--discard" in capsys.readouterr().out
+
+
+@pytest.fixture
+def bare_remote(repo, tmp_path):
+    """A remote on disk: nothing in these tests resolves a hostname."""
+    path = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True)
+    git(repo, "remote", "add", "origin", str(path))
+    return path
+
+
+def test_merge_push_pushes_the_base_branch_and_only_that(
+    repo, tmp_path, claude_bin, log, bare_remote, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id, "--push")) == 0
+
+    refs = git(repo, "ls-remote", str(bare_remote)).stdout
+    assert "refs/heads/{0}".format(BASE_BRANCH) in refs
+    assert git(repo, "rev-parse", BASE_BRANCH).stdout.strip() in refs
+    # the guarantee the flag exists to make: the slice branch is not in the argv
+    assert "slice/" not in refs
+
+    push = state_of(repo)["merge"]["push"]
+    assert (push["status"], push["remote"], push["branch"]) == ("pushed", "origin", BASE_BRANCH)
+    assert "the slice branch was not pushed" in capsys.readouterr().out
+    # a backup is not a change of configuration
+    assert git(repo, "config", "--get", "branch.{0}.remote".format(BASE_BRANCH),
+               check=False).stdout.strip() == ""
+
+
+def test_merge_without_push_pushes_nothing(repo, tmp_path, claude_bin, log, bare_remote):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+
+    assert git(repo, "ls-remote", str(bare_remote)).stdout.strip() == ""
+    assert "push" not in state_of(repo)["merge"]
+
+
+def test_merge_push_failure_reports_but_keeps_the_merge(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    tip = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+    git(repo, "remote", "add", "origin", str(tmp_path / "nowhere.git"))
+
+    # exit 1: the point of --push is 'if you forget, the only copy is local', so a
+    # backup that did not happen must not read as success
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id, "--push")) == 1
+
+    state = state_of(repo)
+    assert state["status"] == "merged"
+    assert state["merge"]["status"] == "merged"
+    assert state["merge"]["push"]["status"] == "failed"
+    assert BASE_BRANCH in git(repo, "branch", "--contains", tip).stdout
+
+    out = capsys.readouterr().out
+    assert "PUSH FAILED" in out
+    assert "the merge stands" in out
+    assert "git -C" in out and "push origin {0}".format(BASE_BRANCH) in out
+
+
+def test_merge_push_without_a_remote_says_which_one_is_missing(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id, "--push")) == 1
+    assert "no git remote named 'origin'" in capsys.readouterr().out
+    assert state_of(repo)["status"] == "merged"
+
+
+def test_push_without_merge_is_a_usage_error(repo, tmp_path, claude_bin, capsys):
+    assert main(argv(repo, tmp_path, claude_bin, "--push")) == 2
+    assert "--push only makes sense with --merge" in capsys.readouterr().err
 
 
 def test_merge_conflict_aborts_and_reports(repo, tmp_path, claude_bin, log, capsys):
@@ -1380,6 +1735,195 @@ def test_a_vanished_worktree_is_reported_not_recreated(repo, tmp_path, claude_bi
     assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
     err = capsys.readouterr().err
     assert "gone" in err and "--discard" in err
+
+
+# ---------------------------------------------------------------- --amend
+#
+# The 사후 감독 channel: a finished slice is corrected by throwing one more
+# instruction at it, on the branch it already owns. An amend is neither a new
+# stage nor a new slice - it is one more implement -> test cycle over the same
+# record, and plan is history because the instruction is that cycle's plan.
+
+
+FIX = "인원수 표시를 고쳐라"
+
+
+def amend(repo, tmp_path, claude_bin, slice_id, instruction=FIX, *extra):
+    return main(
+        argv(repo, tmp_path, claude_bin, "--amend", slice_id, *(list(extra) + [instruction]))
+    )
+
+
+def test_amend_reruns_implement_and_test_on_the_same_branch(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    before = len(invocations(log))
+
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 0
+
+    calls = invocations(log)[before:]
+    assert len(calls) == 2  # plan did not run again
+    assert "IMPLEMENT stage" in calls[0]["prompt"] and "TEST stage" in calls[1]["prompt"]
+    for call in calls:
+        # the three pieces of context the channel promises
+        assert FIX in call["prompt"]
+        assert "밤 페이즈 의사 보호 로직" in call["prompt"]  # the original requirement
+        assert "12 passed, 0 failed" in call["prompt"]  # the previous RESULT
+        assert Path(call["cwd"]).resolve() == work.resolve()
+        # a session that concluded 'I finished' must not judge a new instruction
+        assert "--resume" not in call["argv"]
+
+    state = state_of(repo, slice_id)
+    assert state["status"] == "done"
+    assert state["schema"] == pipeline.STATE_SCHEMA  # every new key is optional
+    assert state["amend_open"] is False
+    assert len(state["amends"]) == 1
+    entry = state["amends"][0]
+    assert (entry["n"], entry["instruction"], entry["stages"]) == (1, FIX, ["implement", "test"])
+    assert entry["previous_result"]["stage"] == "test"
+    assert entry["closed_at"]
+
+    # the original stage commits survive beside the amend's own
+    assert {"implement", "test", "amend1/implement", "amend1/test"} <= set(state["commits"])
+    log_subjects = subjects(repo, "{0}..slice/{1}".format(BASE_BRANCH, slice_id))
+    assert "slice({0}): amend1/implement".format(slice_id) in log_subjects
+    assert "slice({0}): amend1/test".format(slice_id) in log_subjects
+
+    # and the instruction is on disk, in the record and in the history mirror
+    assert (slice_dir(repo) / "amends" / "001.md").read_text(encoding="utf-8").strip() == FIX
+    mirrored = work / ".aidev" / "history" / slice_id / "amends" / "001.md"
+    assert mirrored.read_text(encoding="utf-8").strip() == FIX
+
+    out = capsys.readouterr().out
+    assert "amend #1 of slice" in out
+    assert "Amends    1" in out and FIX in out
+
+
+def test_amend_does_not_reask_the_plan_gate(repo, tmp_path, claude_bin, log, monkeypatch):
+    requirement(repo)  # no front matter: the plan gate is on
+    git_repo(repo)
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            "approved\n", encoding="utf-8"
+        ),
+    )
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    slice_id = state_of(repo)["slice_id"]
+
+    # a stale answer that would stop the slice if the gate were consulted again
+    (slice_dir(repo) / "approvals" / "plan.md").write_text(
+        "rejected: 이미 끝난 계획\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        pipeline, "_sleep", lambda _s: pytest.fail("the plan gate was asked again")
+    )
+
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 0
+    assert state_of(repo, slice_id)["status"] == "done"
+
+
+def test_a_second_amend_numbers_itself(repo, tmp_path, claude_bin, log):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert amend(repo, tmp_path, claude_bin, slice_id, "첫 수정") == 0
+    assert amend(repo, tmp_path, claude_bin, slice_id, "둘째 수정") == 0
+
+    state = state_of(repo, slice_id)
+    assert [entry["n"] for entry in state["amends"]] == [1, 2]
+    assert state["amends"][1]["instruction"] == "둘째 수정"
+    # the second cycle answers what the first one reported, not the original run
+    assert state["amends"][1]["previous_result"]["stage"] == "test"
+    assert {"amend1/implement", "amend2/implement", "amend2/test"} <= set(state["commits"])
+    assert (slice_dir(repo) / "amends" / "002.md").exists()
+
+
+def test_a_failed_amend_is_resumed_as_an_amend(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "fail")
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 1
+
+    state = state_of(repo, slice_id)
+    assert state["status"] == "failed"
+    # deliberately still open, so a resume continues the cycle and not the slice
+    assert state["amend_open"] is True
+    assert state["stages"]["plan"]["status"] == "done"  # never re-opened
+
+    monkeypatch.delenv("AIDEV_FAKE_MODE")
+    before = len(invocations(log))
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+
+    calls = invocations(log)[before:]
+    assert len(calls) == 2  # implement and test, not the whole slice
+    assert FIX in calls[0]["prompt"]
+    assert "resuming amend #1 of slice" in capsys.readouterr().out
+    assert state_of(repo, slice_id)["amend_open"] is False
+
+
+def test_amend_on_a_merged_slice_says_it_has_to_be_merged_again(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--merge", slice_id)) == 0
+    capsys.readouterr()
+
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 0
+    out = capsys.readouterr().out
+    assert "already merged" in out
+    assert "--merge {0}".format(slice_id) in out
+    assert state_of(repo, slice_id)["status"] == "done"
+
+
+def test_amend_refuses_a_discarded_slice(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
+    capsys.readouterr()
+
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 2
+    assert "nothing to amend" in capsys.readouterr().err
+
+
+def test_amend_needs_an_instruction(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    assert main(argv(repo, tmp_path, claude_bin, "--amend", slice_id)) == 2
+    assert "--amend needs an instruction" in capsys.readouterr().err
+    assert "amends" not in state_of(repo, slice_id)
+
+
+def test_a_bare_argument_without_amend_is_a_usage_error(repo, tmp_path, claude_bin, capsys):
+    """nargs='?' must not silently swallow a stray token from another command."""
+    assert main(argv(repo, tmp_path, claude_bin, "--list", "stray")) == 2
+    assert "'stray'" in capsys.readouterr().err
+
+
+def test_amend_cannot_combine_with_another_command(repo, tmp_path, claude_bin, capsys):
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--amend", "a", "--requirement", "tasks/doctor.md", FIX)
+    ) == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_amend_dry_run_touches_nothing(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    before = len(invocations(log))
+    head = git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip()
+
+    assert amend(repo, tmp_path, claude_bin, slice_id, FIX, "--dry-run") == 0
+
+    out = capsys.readouterr().out
+    assert "amend     #1" in out
+    assert "implement -> test" in out
+    assert "slice({0}): amend1/<stage>".format(slice_id) in out
+    assert FIX in out
+
+    assert len(invocations(log)) == before
+    assert git(repo, "rev-parse", "slice/{0}".format(slice_id)).stdout.strip() == head
+    assert "amends" not in state_of(repo, slice_id)
+    assert not (slice_dir(repo) / "amends").exists()
 
 
 # --------------------------------------------------------------- edge cases

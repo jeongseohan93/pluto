@@ -17,9 +17,13 @@ the pipeline has to survive.
                                  - behave like the real CLI without a rule for
                                    the test command: refuse it and report FAIL,
                                    unless argv carries Bash(npm run test:*)
+    AIDEV_FAKE_TEST_RULE  which --allowedTools rule 'requires_approval' looks for
+                          (default: Bash(npm run test:*))
     AIDEV_FAKE_QUOTA_FAILS  how many invocations fail with a limit (default: 1)
     AIDEV_FAKE_RESET_IN     seconds from now to advertise as the reset moment
     AIDEV_FAKE_TEXT         final text to emit instead of the per-stage default
+    AIDEV_FAKE_BIG_PLAN     plan stage lists 18 files, 6 of them tests - a plan
+                          over the size the turn-budget warning fires at
     AIDEV_FAKE_FILES        create N files in cwd during implement (commit guard)
     AIDEV_FAKE_SLICES       how many items the decompose stage lists (default: 2)
     AIDEV_FAKE_SLICE_APPROVAL
@@ -74,11 +78,14 @@ def has_test_rule():
     """Did a rule for the project's test command reach this process?
 
     The real CLI only sees --allowedTools; nothing else in argv can stand in for
-    it, so looking at exactly that is what makes the check honest.
+    it, so looking at exactly that is what makes the check honest. A requirement
+    that declares 'test_commands:' is granted the exact command instead of the
+    built-in prefix rule, so AIDEV_FAKE_TEST_RULE names which one to look for.
     """
+    wanted = os.environ.get("AIDEV_FAKE_TEST_RULE", TEST_RULE)
     for index, arg in enumerate(sys.argv):
         if arg == "--allowedTools" and index + 1 < len(sys.argv):
-            if TEST_RULE in sys.argv[index + 1].split(","):
+            if wanted in sys.argv[index + 1].split(","):
                 return True
     return False
 
@@ -125,9 +132,20 @@ def decompose_report():
     )
 
 
+def big_plan():
+    """A plan naming enough work to trip the pre-approval size warning."""
+    files = ["aidev/module{0}.py".format(index) for index in range(1, 13)]
+    tests = ["tests/test_module{0}.py".format(index) for index in range(1, 7)]
+    return "# PLAN\n\n## Files\n\n" + "".join(
+        "- {0}: rewrite it\n".format(path) for path in files + tests
+    )
+
+
 def final_text(stage, mode):
     if stage == "decompose":
         return decompose_report()
+    if stage == "plan" and os.environ.get("AIDEV_FAKE_BIG_PLAN"):
+        return big_plan()
     if stage != "test":
         return STAGE_TEXT[stage]
     return approval_report() if mode == "requires_approval" else test_report()

@@ -462,6 +462,39 @@ def test_a_bad_front_matter_line_names_the_item(tmp_path):
     assert "slice 2" in message and "나쁨" in message and "browser" in message
 
 
+@pytest.mark.parametrize(
+    "front, needle",
+    [
+        ("max_turns: planz=140", "unknown stage 'planz'"),
+        ("max_turns: abc", "positive whole number"),
+        ("test_commands: npm test && rm -rf /", "not allowed"),
+        ("test_commands:", "needs a command"),
+    ],
+)
+def test_a_listed_slice_with_a_bad_new_key_is_refused_before_anything_runs(
+    tmp_path, front, needle
+):
+    """Every declared key is read up front, so item 4's typo stops items 1-3 too."""
+    _, items = epic_module.parse_slices(
+        "=== SLICE 1: 좋음 ===\n---\napproval: none\n---\n# 좋음\n\n본문.\n\n"
+        "=== SLICE 2: 나쁨 ===\n---\napproval: none\n{0}\n---\n# 나쁨\n\n본문.\n".format(front)
+    )
+    with pytest.raises(pipeline.PipelineError) as excinfo:
+        epic_module.validate_items(items, tmp_path / "slices.md")
+    message = str(excinfo.value)
+    assert "slice 2" in message and "나쁨" in message and needle in message
+
+
+def test_the_decompose_prompt_quotes_the_budget_decompose_actually_gets(tmp_path):
+    """The number the model is told to cut against has to be the number it is given."""
+    cfg = pipeline.PipelineConfig(repo=tmp_path, data_dir=tmp_path / "data", max_turns=130)
+    spec = epic_module.decompose_spec(cfg, "# 에픽\n\n본문.\n")
+    assert "budget of 130 turns" in spec.prompt
+    assert spec.prompt.count("80 turns") == 0
+    # and a slice that genuinely cannot be cut smaller is told how to raise its own
+    assert "max_turns: implement=140" in spec.prompt
+
+
 def test_slice_names_keep_the_index_inside_the_id_limit():
     erec = epic_module.EpicRecord(Path("."), "20260815-a-very-long-epic-name-that-keeps-going")
     item = epic_module.SliceItem(

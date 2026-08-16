@@ -1,6 +1,6 @@
 {
   "slice_id": "20260816-fix-pipeline-v0-4-1",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260816-fix-pipeline-v0-4-1",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9a9aca1ee2a8e9208e57da2b56b2067fc008735e",
@@ -13,11 +13,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260816-202815-fix-pipeline-v0-4-1-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "31bfad0f7f99c879d2b4c133ff4af006068dbfb1"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260816-221818-fix-pipeline-v0-4-1-implement-3",
+      "attempts": 3
     },
     "test": {
       "status": "pending"
@@ -39,7 +43,55 @@
         "peak_context": 156651
       },
       "cost_usd": 2.8122577499999997
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260816-212829-fix-pipeline-v0-4-1-implement",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 150,
+        "cache_creation": 211075,
+        "cache_read": 15364637,
+        "output": 53701,
+        "billed_input": 15575862,
+        "peak_context": 231961
+      },
+      "cost_usd": 11.136343499999997
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260816-220113-fix-pipeline-v0-4-1-implement-2",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 151,
+        "cache_creation": 154852,
+        "cache_read": 9843104,
+        "output": 53355,
+        "billed_input": 9998107,
+        "peak_context": 175738
+      },
+      "cost_usd": 7.804701999999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 3,
+      "run_id": "20260816-221818-fix-pipeline-v0-4-1-implement-3",
+      "status": "completed",
+      "turns": 23,
+      "tokens": {
+        "input": 43,
+        "cache_creation": 68961,
+        "cache_read": 1588372,
+        "output": 7119,
+        "billed_input": 1657376,
+        "peak_context": 89847
+      },
+      "cost_usd": 1.6619860000000002
     }
   ],
-  "updated_at": "2026-08-16T20:35:48+09:00"
+  "updated_at": "2026-08-16T22:27:49+09:00"
 }
