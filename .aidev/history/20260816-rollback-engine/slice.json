@@ -1,6 +1,6 @@
 {
   "slice_id": "20260816-rollback-engine",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260816-rollback-engine",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9269167931728f0446587f030db7597cd595919e",
@@ -10,11 +10,18 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 12,
+    "test_files": 2,
+    "budget": 140,
+    "warn": true
+  },
   "amends": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260816-223516-rollback-engine-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -23,6 +30,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-16T22:35:15+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260816-223516-rollback-engine-plan",
+      "status": "completed",
+      "turns": 28,
+      "tokens": {
+        "input": 38,
+        "cache_creation": 147871,
+        "cache_read": 2167392,
+        "output": 30286,
+        "billed_input": 2315301,
+        "peak_context": 162340
+      },
+      "cost_usd": 3.319746
+    }
+  ],
+  "updated_at": "2026-08-16T22:42:42+09:00"
 }
