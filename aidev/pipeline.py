@@ -4354,7 +4354,8 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
     @param repo      the user's repository
     @param data_dir  where runs are stored
     @param rec       the slice to continue, already located
-    @flow  refuse finished states -> re-guard the requirement -> verify workspace -> _finish
+    @flow  refuse finished states -> re-guard the requirement -> verify workspace
+           (a broken one is refused by ``_broken_workspace_error``) -> _finish
     """
     state = rec.read_state()
     if state is None:
@@ -4421,7 +4422,8 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
     @param repo       the user's repository
     @param data_dir   where runs are stored
     @param repo_given whether --repo was named, for the "no slices here" hint
-    @flow  instruction -> find slice -> re-guard the requirement -> open the cycle -> _finish
+    @flow  instruction -> find slice -> re-guard the requirement -> verify workspace
+           (a broken one is refused by ``_broken_workspace_error``) -> open the cycle -> _finish
     """
     instruction = (getattr(args, "instruction", None) or "").strip()
     if not instruction:
@@ -4862,7 +4864,15 @@ def _rewind_state(
 def rollback_slice(
     args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
 ) -> int:
-    """Rewind a slice's branch and state to one of its own stage commits."""
+    """Rewind a slice's branch and state to one of its own stage commits.
+
+    @param args       parsed arguments - ``--rollback <slice> [<stage>]``
+    @param repo       the user's repository
+    @param repo_given whether --repo was named, for the "no slices here" hint
+    @param data_dir   where slices are stored (None = the default)
+    @flow  refuse merged/reverted/discarded -> name the target stage -> verify workspace
+           (a broken one is refused by ``_broken_workspace_error``) -> reset branch and state
+    """
     rec, state, ws = _finished_workspace(repo, args.rollback, repo_given, data_dir)
     status = str(state.get("status", ""))
     if status == STATUS_MERGED:

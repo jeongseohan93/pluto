@@ -39,7 +39,7 @@ _sleep = time.sleep
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Every subcommand's parser, assembled in one place. Takes no arguments."""
+    """Every parser in one place, watch's --repo included. Takes no arguments."""
     parser = argparse.ArgumentParser(
         prog="aidev",
         description="Telemetry runner for Claude Code sessions (v0.1).",

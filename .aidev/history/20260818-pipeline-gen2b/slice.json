@@ -16,7 +16,22 @@
     "budget": 120,
     "warn": true
   },
-  "amends": null,
+  "amends": [
+    {
+      "n": 1,
+      "instruction": "명세 검사 위반 5건만 수정하라. python -m aidev.specs --repo . --base 926e61d 가 보고한 것: ① aidev/cli.py:41 build_parser — 본문이 바뀌었으니 spec 문구 갱신(한 줄이면 됨) ② aidev/pipeline.py:4350 continue_slice — 동일 ③ aidev/pipeline.py:4417 amend_slice — 동일 ④ aidev/pipeline.py:4862 rollback_slice — @param args, repo, repo_given, data_dir 추가 ⑤ aidev/storage.py:459 _normalised — @param path 추가. 다른 코드는 건드리지 말 것. 수정 후 specs 명령으로 위반 0 확인.",
+      "stages": [
+        "implement",
+        "test"
+      ],
+      "opened_at": "2026-08-18T17:56:34+09:00",
+      "previous_result": {
+        "stage": "test",
+        "run_id": "20260818-165501-pipeline-gen2b-test",
+        "summary": "## Command\n\nThe project pins its own invocation in `pyproject.toml:26-28` (`testpaths = [\"tests\"]`, `addopts = \"-q\"`), so the project's command is plain:\n\n```\npytest\n```\n\n(I also re-ran it as `pytest --tb=no -rf -q`, `pytest --tb=line -q --no-header`, and per-file/per-test variants purely to read the tracebacks the first run truncated. No code or test was modified.)\n\n## Result\n\n**436 collected — 402 passed, 32 failed, 2 skipped. Exit code 1.**\n\nThe failures are not scattered regressions: they are the new tests for this slice failing against source that does not implement them. Four of the five items in §3/§1b are missing on the production side while their tests are present. Only §3e (`requires-python = \">=3.10\"`, `pyproject.toml:13`) is actually in the tree.\n\n## Failures\n\n### §1b/§3c — approval condition inheritance (5 failures)\n\n| Test | Error |\n| --- | --- |\n| `test_pipeline.py::test_decision_parsing[approved: scope=A only\\n-approved-scope=A only]` | `AssertionError: assert ('approved', '') == ('approved', 'scope=A only')` — `test_pipeline.py:3125`. `read_decision` still discards the text after `approved:`. |\n| `test_pipeline.py::test_decision_parsing[approve: 선구현 금지-approved-선구현 금지]` | `AssertionError: assert ('approved', '') == ('approved', '선구현 금지')` — `test_pipeline.py:3125` |\n| `test_pipeline.py::test_approval_conditions_reads_only_approved_stages_and_changes_nothing` | `AttributeError: module 'aidev.pipeline' has no attribute 'approval_conditions'` — `test_pipeline.py:2764` |\n| `test_pipeline.py::test_build_prompt_carries_the_condition_into_a_repair` | `TypeError: build_prompt() got an unexpected keyword argument 'approvals'` — `test_pipeline.py:2738` |\n| `test_pipeline.py::test_an_approval_condition_reaches_implement_and_the_retry` | `KeyError: 'approval_reason'` — the E2E slice runs to completion but `state[\"stages\"][\"plan\"]` never gains the key. This is the Done Criteria case (\"approval comment present in attempt 2+ prompts\"). |\n\n### §3a — unknown front m"
+      }
+    }
+  ],
   "repairs": null,
   "replans": null,
   "rejections": null,
@@ -30,11 +45,14 @@
     },
     "implement": {
       "status": "done",
-      "run_id": "20260818-164254-pipeline-gen2b-implement-2",
-      "attempts": 2
+      "run_id": "20260818-175634-pipeline-gen2b-implement-3",
+      "attempts": 3,
+      "commit": "4f432ba6bfa77038dedde6d07b5c5b5c587f7a53"
     },
     "test": {
-      "status": "pending"
+      "status": "pending",
+      "run_id": "20260818-165501-pipeline-gen2b-test",
+      "attempts": 1
     }
   },
   "runs": [
@@ -85,7 +103,39 @@
         "peak_context": 93636
       },
       "cost_usd": 3.0140060000000006
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260818-165501-pipeline-gen2b-test",
+      "status": "completed",
+      "turns": 10,
+      "tokens": {
+        "input": 18,
+        "cache_creation": 44680,
+        "cache_read": 330995,
+        "output": 7599,
+        "billed_input": 375693,
+        "peak_context": 52795
+      },
+      "cost_usd": 0.8023625
+    },
+    {
+      "stage": "implement",
+      "attempt": 3,
+      "run_id": "20260818-175634-pipeline-gen2b-implement-3",
+      "status": "completed",
+      "turns": 43,
+      "tokens": {
+        "input": 76,
+        "cache_creation": 53598,
+        "cache_read": 1903741,
+        "output": 16256,
+        "billed_input": 1957415,
+        "peak_context": 64808
+      },
+      "cost_usd": 1.8946305000000003
     }
   ],
-  "updated_at": "2026-08-18T16:55:01+09:00"
+  "updated_at": "2026-08-18T18:18:31+09:00"
 }

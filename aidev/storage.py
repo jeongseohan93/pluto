@@ -457,7 +457,10 @@ def run_repo(run_dir: Path) -> Optional[str]:
 
 
 def _normalised(path: Any) -> Optional[str]:
-    """One comparable form of a path, the way ``workspace._same_path`` compares them."""
+    """One comparable form of a path, the way ``workspace._same_path`` compares them.
+
+    @param path  anything path-shaped, or empty for "nothing to compare"
+    """
     if not path:
         return None
     try:
