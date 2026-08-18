@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from . import __version__, pipeline, reporter, runner
+from . import __version__, pipeline, reporter, runner, verify
 from .storage import (
     Database,
     RunStore,
@@ -35,6 +36,7 @@ _sleep = time.sleep
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Every subcommand's parser, assembled in one place. Takes no arguments."""
     parser = argparse.ArgumentParser(
         prog="aidev",
         description="Telemetry runner for Claude Code sessions (v0.1).",
@@ -89,6 +91,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.set_defaults(func=cmd_run)
 
     pipeline.add_parser(sub)
+
+    verify_cmd = sub.add_parser(
+        "verify",
+        help="run this slice's verification commands and print only a summary",
+    )
+    verify_cmd.add_argument(
+        "--command",
+        action="append",
+        default=[],
+        dest="commands",
+        metavar="CMD",
+        help="a verification command (repeatable; default: what the slice declared)",
+    )
+    verify_cmd.add_argument("--cwd", type=Path, default=None, help="where to run them")
+    verify_cmd.add_argument(
+        "--log-dir", type=Path, default=None, help="where the full output is written"
+    )
+    verify_cmd.set_defaults(func=cmd_verify)
 
     report_cmd = sub.add_parser("report", help="print the report of a stored run")
     report_cmd.add_argument("run_id", nargs="?", default="last")
@@ -217,6 +237,43 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(reporter.render_final(data))
     print("saved: {0}".format(store.dir))
     return result.exit_code if result.exit_code is not None else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Run the declared verification commands and print the diet, not the output.
+
+    This is what the implement stage is granted instead of the raw test command.
+    The full output goes to a log file; what comes back into the session is the
+    failures with their locations and the successes as a number.
+
+    @param args  parsed arguments: --command, --cwd, --log-dir
+    @flow  argv or AIDEV_VERIFY_* env -> run_commands -> summarize_for_agent -> exit code
+    주요 내부 변수: commands(실행할 명령들), result(VerifyResult)
+    """
+    commands = list(args.commands or [])
+    if not commands:
+        declared = os.environ.get("AIDEV_VERIFY_COMMANDS", "")
+        try:
+            parsed = json.loads(declared) if declared.strip() else []
+        except ValueError:
+            parsed = []
+        commands = [str(item) for item in parsed if str(item).strip()]
+    if not commands:
+        print(
+            "error: no verification command.\n"
+            "    'aidev verify' is what a pipeline stage runs: the slice's declared\n"
+            "    test_commands reach it through AIDEV_VERIFY_COMMANDS.\n"
+            "    Outside a stage, name them: aidev verify --command 'pytest -q'",
+            file=sys.stderr,
+        )
+        return 2
+    cwd = args.cwd or Path(os.environ.get("AIDEV_VERIFY_CWD") or Path.cwd())
+    log_dir = args.log_dir or (
+        Path(os.environ["AIDEV_VERIFY_LOG_DIR"]) if os.environ.get("AIDEV_VERIFY_LOG_DIR") else None
+    )
+    result = verify.run_commands(commands, Path(cwd), log_dir=log_dir)
+    print(verify.summarize_for_agent(result))
+    return verify.worst_exit_code(result)
 
 
 def cmd_report(args: argparse.Namespace) -> int:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from aidev import pipeline
+from aidev import pipeline, progress
 from aidev.cli import main
 from aidev.telemetry import PHASES
 
@@ -1278,7 +1278,12 @@ def test_no_setup_declared_runs_nothing(repo, tmp_path, claude_bin, log):
     assert "setup" not in state_of(repo)
     implement = invocations(log)[1]["argv"]
     rules = implement[implement.index("--allowedTools") + 1].split(",")
-    assert set(rules) == set(pipeline.TEST_COMMAND_TOOLS)
+    # The built-ins, plus v0.5's spec checker - implement may run it on itself so
+    # the convention is feedback during the work and not only a verdict after it.
+    assert set(rules) == set(pipeline.TEST_COMMAND_TOOLS) | set(pipeline.SPEC_CHECK_TOOLS)
+    # the test stage is never granted it: it does not edit, so it cannot fix one
+    test = invocations(log)[2]["argv"]
+    assert "Bash(python -m aidev.specs)" not in test[test.index("--allowedTools") + 1]
 
 
 def test_setup_failure_stops_before_implement(repo, tmp_path, claude_bin, log):
@@ -1335,11 +1340,14 @@ def test_a_setup_command_no_longer_crowds_out_the_declared_test_command(tmp_path
 
 
 def test_declared_test_commands_replace_the_built_in_rules(repo, tmp_path, claude_bin, log):
+    """The v0.4 path, still: --no-verify-engine keeps the agent test stage."""
     requirement(
         repo,
         front="approval: none\ntest_commands: npm run test:guards, npm run lint",
     )
-    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert run_slice(
+        repo, tmp_path, claude_bin, "--no-verify-engine", "--no-output-diet", "--no-spec-check"
+    ) == 0
 
     plan, implement, test = invocations(log)
     assert "--allowedTools" not in plan["argv"]
@@ -1356,10 +1364,38 @@ def test_declared_test_commands_replace_the_built_in_rules(repo, tmp_path, claud
     assert "do not conclude the" in implement["prompt"]
 
 
+def test_the_diet_gives_implement_the_wrapper_instead_of_the_suite(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """v0.5: implement may run 'aidev verify', which prints failures and a count.
+
+    Measured 2026-08-16/17: the raw output of a 233-test suite entered the
+    session's context after every single edit. The rule is what stops it - the
+    stage cannot run the suite directly, so there is no raw output to enter.
+    """
+    monkeypatch.setattr(pipeline, "verify_wrapper_command", lambda: "aidev verify")
+    requirement(repo, front="approval: none\ntest_commands: npm run test:guards")
+    # the engine would really run npm here, so only the wiring is under test
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+
+    implement, test = invocations(log)[1], invocations(log)[2]
+    assert "Bash(aidev verify)" in granted(implement)
+    assert "Bash(npm run test:guards)" not in granted(implement)
+    assert "aidev verify" in implement["prompt"]
+    # the agent test stage is untouched: it still runs the declared command
+    assert "Bash(npm run test:guards)" in granted(test)
+    assert "Bash(aidev verify)" not in granted(test)
+
+
 def test_the_declared_command_is_what_the_test_stage_may_actually_run(
     repo, tmp_path, claude_bin, log, monkeypatch
 ):
-    """The whole measured defect end to end: setup declared, verification still possible."""
+    """The whole measured defect end to end: setup declared, verification still possible.
+
+    Pinned to --no-verify-engine on purpose. This is the regression test for the
+    v0.4.1 defect, which lived on the path where an *agent* runs the suite; the
+    engine path cannot reproduce it because there is no agent to refuse a rule to.
+    """
     command = setup_script(tmp_path, "pass\n")
     requirement(
         repo,
@@ -1368,7 +1404,7 @@ def test_the_declared_command_is_what_the_test_stage_may_actually_run(
     monkeypatch.setenv("AIDEV_FAKE_MODE", "requires_approval")
     monkeypatch.setenv("AIDEV_FAKE_TEST_RULE", "Bash(npm run test:guards)")
 
-    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
     assert state_of(repo)["test_verdict"] == "pass"
 
     rules = granted(invocations(log)[-1])
@@ -2224,6 +2260,421 @@ def test_amend_dry_run_touches_nothing(repo, tmp_path, claude_bin, log, capsys):
     assert not (slice_dir(repo) / "amends").exists()
 
 
+# ------------------------------------------------------- the empty requirement
+#
+# Measured 2026-08-17: an empty requirement bought a worktree, a branch, a plan
+# stage and a gate before anyone noticed there was nothing in it. Two of the four
+# entry points checked for it and two did not, so the check is one function now
+# and every entry point is asserted here - a guard nobody calls is not a guard.
+
+
+EMPTY_REQUIREMENTS = [
+    ("", "requirement file is empty"),
+    ("   \n\n\t\n", "requirement file is empty"),
+    ("---\napproval: none\n---\n", "front matter but no body"),
+    ("---\napproval: none\n---\n\n   \n", "front matter but no body"),
+    ("---\napproval: none\n---\n# 제목\n", "effectively empty"),
+]
+
+
+@pytest.mark.parametrize("text, message", EMPTY_REQUIREMENTS)
+def test_an_empty_requirement_is_refused_at_launch(
+    repo, tmp_path, claude_bin, log, capsys, text, message
+):
+    (repo / "tasks" / "doctor.md").write_text(text, encoding="utf-8")
+    git_repo(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert message in capsys.readouterr().err
+    # refused at the moment of launch: no session, and no record of a slice
+    assert invocations(log) == []
+    root = pipeline.slices_root(repo)
+    assert not root.exists() or list(root.iterdir()) == []
+    assert not [name for name in branches(repo) if name.startswith("slice/")]
+
+
+def test_an_empty_requirement_is_refused_on_resume(
+    repo, tmp_path, claude_bin, log, capsys, monkeypatch
+):
+    """A requirement emptied between two runs must not be resumed into a session."""
+    requirement(repo)  # the plan gate is on, so the slice stops with work left
+    git_repo(repo)
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: None)
+    assert run_slice(
+        repo, tmp_path, claude_bin, "--approval-timeout", "0.05", "--poll-interval", "0.01"
+    ) == 1
+    before = len(invocations(log))
+
+    (slice_dir(repo) / "requirement.md").write_text("", encoding="utf-8")
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 2
+    assert "requirement file is empty" in capsys.readouterr().err
+    assert len(invocations(log)) == before
+
+
+def test_an_empty_requirement_is_refused_on_amend(repo, tmp_path, claude_bin, log, capsys):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    before = len(invocations(log))
+
+    (slice_dir(repo) / "requirement.md").write_text(
+        "---\napproval: none\n---\n", encoding="utf-8"
+    )
+    assert amend(repo, tmp_path, claude_bin, slice_id) == 2
+    assert "front matter but no body" in capsys.readouterr().err
+    assert len(invocations(log)) == before
+    assert "amends" not in state_of(repo, slice_id)
+
+
+def test_a_short_requirement_in_korean_is_not_mistaken_for_an_empty_one():
+    """The guard refuses *empty*, not *brief* - 다섯 글자가 한 문장인 언어가 있다."""
+    body = pipeline.guard_requirement("---\napproval: none\n---\n밤 의사 보호\n", "x")
+    assert body.strip() == "밤 의사 보호"
+
+
+# ----------------------------------------------------------------- progress.md
+#
+# The requirement asked the engine to signal a session at 90% of its budget so
+# the session writes the file itself. A headless `claude -p` has no channel back
+# into a running session, so the engine writes it from telemetry instead - which
+# also works for the case that matters most: a session that died mid-sentence.
+
+
+def test_progress_md_is_written_when_a_stage_ends_incomplete(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_FAIL_AFTER", "1")  # plan lands, implement dies
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    slice_id = state_of(repo)["slice_id"]
+
+    text = (slice_dir(repo) / "progress.md").read_text(encoding="utf-8")
+    assert text.startswith("# PROGRESS - {0} · implement".format(slice_id))
+    assert "stage ended incomplete" in text
+    assert "## Done" in text
+    # the plan named a path and nothing edited it, so it is what is left
+    assert "## Remaining" in text and "aidev/thing.py" in text
+    assert "--resume-slice {0}".format(slice_id) in text
+
+    record = state_of(repo)["progress"]
+    assert (record["stage"], record["attempt"]) == ("implement", 1)
+    assert record["reason"] == "stage ended incomplete"
+
+
+def test_a_resume_is_handed_the_progress_of_the_attempt_that_died(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_FAIL_AFTER", "1")
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    before = len(invocations(log))
+
+    monkeypatch.delenv("AIDEV_FAKE_FAIL_AFTER")
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+
+    resumed, after = invocations(log)[before], invocations(log)[before + 1]
+    assert "IMPLEMENT stage" in resumed["prompt"]
+    assert "WHERE THE PREVIOUS ATTEMPT GOT TO" in resumed["prompt"]
+    assert "# PROGRESS" in resumed["prompt"] and "## Remaining" in resumed["prompt"]
+    # the note belongs to the stage that wrote it, and only while it is unfinished
+    assert "WHERE THE PREVIOUS ATTEMPT GOT TO" not in after["prompt"]
+    assert "progress" not in state_of(repo)
+    # it is not deleted: it is the human's report of what happened, too
+    assert (slice_dir(repo) / "progress.md").exists()
+
+
+def test_the_snapshot_threshold_is_the_last_tenth_of_the_budget():
+    assert not progress.should_snapshot(80, 100)
+    assert progress.should_snapshot(90, 100)
+    assert progress.should_snapshot(140, 140)
+    assert not progress.should_snapshot(90, 100, already=True)
+    assert not progress.should_snapshot(90, 0)  # no budget, no threshold
+
+
+def test_progress_renders_what_was_done_and_what_is_left():
+    telemetry = {
+        "observed": {
+            "file_accesses": [
+                {"operation": "edit", "path": "aidev/verify.py"},
+                {"operation": "read", "path": "aidev/pipeline.py"},
+                {"operation": "write", "path": "aidev/verify.py"},  # deduplicated
+            ],
+            "calls": [{"category": "test", "target": "pytest -q"}],
+        }
+    }
+    text = progress.render(
+        slice_id="20260817-x",
+        stage="implement",
+        attempt=2,
+        telemetry=telemetry,
+        plan_paths=["aidev/verify.py", "aidev/specs.py"],
+        last_text="I was halfway through the spec checker.",
+        reason=progress.REASON_BUDGET,
+        turn=126,
+        budget=140,
+        repo="/w/jokertest",
+    )
+    assert "turn 126/140   (turn-budget 90%)" in text
+    assert text.count("- edited aidev/verify.py") == 1
+    assert "- ran pytest -q" in text
+    assert "aidev/pipeline.py" not in text  # read, not written: not "done"
+    assert "- aidev/specs.py" in text  # named by the plan, never edited
+    assert "halfway through the spec checker" in text
+    assert "aidev pipeline --repo /w/jokertest --resume-slice 20260817-x" in text
+
+
+# --------------------------------------------------------------------- --replan
+#
+# 차분 재계획. Resuming a rejected slice deliberately re-reads the same approval
+# file and stops again - that is the protection, and it stays. Re-planning is a
+# separate command a human types, and the plan stage is handed its own rejected
+# plan plus the rejection, so it edits rather than starts over.
+
+
+PARTIAL_DETAIL = """\
+# 반려
+
+## 대상
+aidev/pipeline.py:1611  run_stage
+
+## 문제
+run_stage를 통째로 다시 쓴다.
+
+## 요구
+기존 함수는 그대로 두고 분기만 더해라.
+
+## 범위
+부분 반려
+"""
+
+FULL_DETAIL = "## 범위\n전면 반려 - 접근 자체가 틀렸다.\n"
+
+
+def rejected_slice(repo, tmp_path, claude_bin, monkeypatch, reason, detail=None):
+    """A slice stopped at the plan gate by a rejection, optionally a detailed one."""
+    requirement(repo)  # no front matter: the plan gate is on
+    git_repo(repo)
+
+    def reject(_seconds):
+        approvals = slice_dir(repo) / "approvals"
+        if detail is not None:
+            (approvals / "rejected-detail.md").write_text(detail, encoding="utf-8")
+        (approvals / "plan.md").write_text(
+            "rejected: {0}\n".format(reason), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(pipeline, "_sleep", reject)
+    assert run_slice(repo, tmp_path, claude_bin) == 3
+    return state_of(repo)["slice_id"]
+
+
+def approve_the_gate(repo, monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            "approved\n", encoding="utf-8"
+        ),
+    )
+
+
+def test_replan_keeps_the_old_plan_and_injects_the_rejection(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    slice_id = rejected_slice(
+        repo, tmp_path, claude_bin, monkeypatch, "범위가 너무 넓다", PARTIAL_DETAIL
+    )
+    before = len(invocations(log))
+    approve_the_gate(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--replan", slice_id)) == 0
+
+    prompt = invocations(log)[before]["prompt"]
+    assert "PLAN stage" in prompt
+    assert "PREVIOUS PLAN (rejected)" in prompt
+    assert "1. touch aidev/thing.py" in prompt  # the plan that was rejected, verbatim
+    assert "reason: 범위가 너무 넓다" in prompt
+    assert "grade:  partial" in prompt
+    assert "run_stage를 통째로 다시 쓴다" in prompt  # rejected-detail.md, verbatim
+    assert "Change ONLY what the rejection names" in prompt
+
+    # nothing was destroyed to make room for the replacement
+    directory = slice_dir(repo)
+    assert "# PLAN" in (directory / "plans" / "001.md").read_text(encoding="utf-8")
+    assert "rejected: 범위가 너무 넓다" in (
+        directory / "approvals" / "plan-001.md"
+    ).read_text(encoding="utf-8")
+
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert state["schema"] == pipeline.STATE_SCHEMA  # every new key is optional
+    assert len(state["replans"]) == 1
+    record = state["replans"][0]
+    assert record["n"] == 1 and record["previous_plan"] == "plans/001.md"
+    assert record["rejection"]["grade"] == "partial"
+    assert record["rejection"]["reason"] == "범위가 너무 넓다"
+    # the ledger of rejections is its own record, and it survives the replan
+    assert state["rejections"][0]["stage"] == "plan"
+    assert "replan_open" not in state  # consumed by the stage it was written for
+
+    out = capsys.readouterr().out
+    assert "replan #1 of slice" in out and "범위가 너무 넓다" in out
+
+
+def test_a_plain_rejection_without_a_detail_file_still_replans(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """'rejected: <reason>' on one line has always been the whole contract."""
+    slice_id = rejected_slice(repo, tmp_path, claude_bin, monkeypatch, "너무 크다")
+    before = len(invocations(log))
+    approve_the_gate(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--replan", slice_id)) == 0
+
+    prompt = invocations(log)[before]["prompt"]
+    assert "reason: 너무 크다" in prompt
+    assert "grade:  partial" in prompt  # 부분 반려 is the default
+    assert "Change ONLY what the rejection names" in prompt
+    assert not (slice_dir(repo) / "approvals" / "rejected-detail.md").exists()
+    assert state_of(repo)["status"] == "done"
+
+
+def test_a_full_rejection_asks_for_a_rewrite_instead_of_a_diff(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    slice_id = rejected_slice(
+        repo, tmp_path, claude_bin, monkeypatch, "접근이 틀렸다", FULL_DETAIL
+    )
+    before = len(invocations(log))
+    approve_the_gate(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--replan", slice_id)) == 0
+
+    prompt = invocations(log)[before]["prompt"]
+    assert "grade:  full" in prompt
+    assert "re-plan from scratch" in prompt
+    assert "Change ONLY what the rejection names" not in prompt
+    assert state_of(repo)["replans"][0]["rejection"]["grade"] == "full"
+
+
+def test_replan_dry_run_says_what_it_would_undo_and_undoes_nothing(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    slice_id = rejected_slice(repo, tmp_path, claude_bin, monkeypatch, "범위", PARTIAL_DETAIL)
+    before = len(invocations(log))
+
+    assert main(argv(repo, tmp_path, claude_bin, "--replan", slice_id, "--dry-run")) == 0
+
+    out = capsys.readouterr().out
+    assert "replan    #1" in out
+    assert "plan.md -> plans/001.md" in out
+    assert "rejected-detail.md" in out
+
+    assert len(invocations(log)) == before
+    assert state_of(repo)["status"] == "rejected"
+    assert "replans" not in state_of(repo)
+    assert not (slice_dir(repo) / "plans").exists()
+    assert (slice_dir(repo) / "approvals" / "plan.md").exists()
+
+
+# ------------------------------------------------------------------ model mix
+#
+# One line, the same grammar as max_turns: the stages differ in what they are
+# worth, and a diagnosis that only has to say "the seat index is off by one"
+# does not need the model that wrote the plan.
+
+
+def model_of(call):
+    argv_ = call["argv"]
+    return argv_[argv_.index("--model") + 1] if "--model" in argv_ else None
+
+
+def test_a_model_named_for_one_stage_reaches_only_that_stage(
+    repo, tmp_path, claude_bin, log
+):
+    requirement(repo, front="approval: none\nmodel: implement=claude-opus-5")
+    git_repo(repo)
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+
+    plan, implement, test = invocations(log)
+    assert model_of(implement) == "claude-opus-5"
+    assert model_of(plan) is None and model_of(test) is None
+
+
+def test_a_bare_model_line_applies_to_every_stage(repo, tmp_path, claude_bin, log):
+    requirement(
+        repo,
+        front="approval: none\nmodel: claude-sonnet-5, implement=claude-opus-5",
+    )
+    git_repo(repo)
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+
+    plan, implement, test = invocations(log)
+    assert model_of(plan) == "claude-sonnet-5"
+    assert model_of(test) == "claude-sonnet-5"
+    assert model_of(implement) == "claude-opus-5"  # the named stage wins
+
+
+def test_model_stage_on_the_command_line_beats_the_front_matter(
+    repo, tmp_path, claude_bin, log
+):
+    requirement(repo, front="approval: none\nmodel: implement=claude-opus-5")
+    git_repo(repo)
+    assert run_slice(
+        repo, tmp_path, claude_bin,
+        "--no-verify-engine", "--model-stage", "implement=claude-haiku-4-5",
+    ) == 0
+    assert model_of(invocations(log)[1]) == "claude-haiku-4-5"
+
+
+@pytest.mark.parametrize(
+    "front, expected",
+    [
+        (None, (None, {})),
+        ("model: claude-sonnet-5", ("claude-sonnet-5", {})),
+        ("model: diagnose=claude-haiku-4-5", (None, {"diagnose": "claude-haiku-4-5"})),
+        (
+            "model: claude-opus-5, diagnose=claude-sonnet-5",
+            ("claude-opus-5", {"diagnose": "claude-sonnet-5"}),
+        ),
+        ("model: implement=a  test=b", (None, {"implement": "a", "test": "b"})),
+    ],
+)
+def test_model_resolution(front, expected):
+    fields, _ = pipeline.parse_front_matter(
+        "---\n{0}\n---\nbody\n".format(front) if front is not None else "body\n"
+    )
+    assert pipeline.resolve_models(fields) == expected
+
+
+@pytest.mark.parametrize(
+    "front",
+    [
+        "model:",  # blank: say a model or leave the line out
+        "model: planz=claude-opus-5",  # a stage that does not exist
+        "model: implement=",  # a stage with no model
+        "model: implement=a, implement=b",  # said twice, two different ways
+    ],
+)
+def test_models_that_must_be_refused(front):
+    fields, _ = pipeline.parse_front_matter("---\n{0}\n---\nbody\n".format(front))
+    with pytest.raises(pipeline.PipelineError):
+        pipeline.resolve_models(fields)
+
+
+def test_the_diagnose_stage_can_be_given_its_own_model():
+    """A stage that never appears in STAGES still answers to the same line."""
+    fields, _ = pipeline.parse_front_matter(
+        "---\nmodel: diagnose=claude-haiku-4-5\n---\nbody\n"
+    )
+    cfg = pipeline.PipelineConfig(
+        repo=Path("."), data_dir=Path("."), stage_models=pipeline.resolve_models(fields)[1]
+    )
+    assert cfg.model_for("diagnose") == "claude-haiku-4-5"
+    assert cfg.model_for("implement") is None
+
+
 # --------------------------------------------------------------- edge cases
 
 
@@ -2256,6 +2707,46 @@ def test_legacy_slice_without_workspace_resumes_in_place(repo, tmp_path, claude_
 
     assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 1
     assert "uncommitted changes" in state_of(repo, slice_id)["reason"]
+
+
+def test_a_legacy_state_without_a_commit_range_skips_the_spec_check(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    """A record from before this slice has nothing to diff, and says so rather than failing.
+
+    The 함수 명세 check reads a commit range. A v0.2 state.json has neither
+    'commits' nor 'workspace', so there is no range to read - and a checker that
+    cannot read a diff must never be the reason a stage fails.
+    """
+    passing = '"{0}" "{1}"'.format(sys.executable, tmp_path / "ok.py")
+    (tmp_path / "ok.py").write_text("print('148 passed')\n", encoding="utf-8")
+    requirement(
+        repo,
+        front="approval: none\ntest_commands: {0}".format(passing),
+    )
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    slice_id = state_of(repo)["slice_id"]
+
+    directory = slice_dir(repo)
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    for key in ("workspace", "commits", "mutated", "test_verdict"):
+        state.pop(key, None)
+    state["schema"] = 1
+    state["stages"]["test"] = {"status": "pending"}
+    state["status"] = "failed"
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    git_repo(repo)  # v0.2 ran in the repo itself, and needed it clean
+    before = len(invocations(log))
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+    assert "spec check skipped" in capsys.readouterr().out
+
+    state = state_of(repo, slice_id)
+    assert state["status"] == "done"
+    assert state["test_verdict"] == "pass"
+    assert state["stages"]["test"]["verify"]["engine"] is True
+    # the engine verified it, so the resume bought no session at all
+    assert len(invocations(log)) == before
 
 
 def test_non_git_repo_is_refused_with_a_way_out(tmp_path, claude_bin, log, capsys):

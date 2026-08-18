@@ -32,6 +32,11 @@ the pipeline has to survive.
                           the 'approval:' each listed slice declares (default: none)
     AIDEV_FAKE_FAIL_AFTER   fail every invocation from the Nth on, whatever the
                           mode - how a queue is stopped at a chosen slice
+    AIDEV_FAKE_SPECLESS     implement writes a function with no spec comment, so
+                          the 함수 명세 machine check has something real to catch
+    AIDEV_FAKE_SPEC_FIX     with SPECLESS: from the Nth invocation on, write the
+                          same function *with* a spec - a repair that works
+    AIDEV_FAKE_DIAGNOSIS    what the diagnose step answers with
 """
 
 import glob
@@ -62,6 +67,29 @@ STAGE_TEXT = {
     "implement": "Changed aidev/thing.py as planned.",
     "test": "Ran: pytest -q\n12 passed, 0 failed.",
 }
+
+DIAGNOSIS = (
+    "# DIAGNOSIS\n"
+    "## Cause\n"
+    "The helper returns the wrong seat index.\n"
+    "## Fix direction\n"
+    "Clamp the index to the seat count before returning it.\n"
+    "## Where\n"
+    "- aidev/thing.py:12 - off by one\n"
+)
+
+# A function with no spec comment at all, and the same function with one. The
+# machine check is over a real diff, so the stub writes real code.
+SPECLESS_FUNCTION = "def generated_helper(seat, phase):\n    return seat + phase\n"
+SPECKED_FUNCTION = (
+    "def generated_helper(seat, phase):\n"
+    '    """Combine a seat with a phase.\n'
+    "\n"
+    "    @param seat   the seat index\n"
+    "    @param phase  the phase number\n"
+    '    """\n'
+    "    return seat + phase\n"
+)
 
 
 def test_report():
@@ -146,6 +174,8 @@ def big_plan():
 def final_text(stage, mode):
     if stage == "decompose":
         return decompose_report()
+    if stage == "diagnose":
+        return os.environ.get("AIDEV_FAKE_DIAGNOSIS") or DIAGNOSIS
     if stage == "plan" and os.environ.get("AIDEV_FAKE_BIG_PLAN"):
         return big_plan()
     if stage != "test":
@@ -154,10 +184,13 @@ def final_text(stage, mode):
 
 
 def detect_stage(prompt):
-    # decompose first: it is the only stage whose prompt carries a whole epic,
-    # which may well talk about planning or testing.
+    # decompose and diagnose first: they are the stages whose prompts quote a
+    # whole other document, which may well talk about planning or testing.
+    upper = prompt.upper()
+    if "DIAGNOSE STEP" in upper:
+        return "diagnose"
     for stage in ("decompose",) + tuple(STAGE_TEXT):
-        if "{0} stage".format(stage).upper() in prompt.upper():
+        if "{0} stage".format(stage).upper() in upper:
             return stage
     return "plan"
 
@@ -253,6 +286,14 @@ def main():
         for index in range(int(os.environ["AIDEV_FAKE_FILES"])):
             with open("generated-{0}.txt".format(index), "w", encoding="utf-8") as handle:
                 handle.write("derived output nobody ignored\n")
+
+    if os.environ.get("AIDEV_FAKE_SPECLESS") and stage == "implement":
+        # A real function in a real file, so the diff the spec checker reads is
+        # a real diff. The 'fix' round writes the same function with a spec.
+        fix_from = os.environ.get("AIDEV_FAKE_SPEC_FIX")
+        fixed = fix_from and previous >= int(fix_from)
+        with open("aidev_generated.py", "w", encoding="utf-8") as handle:
+            handle.write(SPECKED_FUNCTION if fixed else SPECLESS_FUNCTION)
 
     if os.environ.get("AIDEV_FAKE_MIGRATION") and stage == "implement":
         # A real file in a real stage commit, so a rollback range genuinely

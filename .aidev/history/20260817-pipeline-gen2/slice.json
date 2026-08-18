@@ -1,6 +1,6 @@
 {
   "slice_id": "20260817-pipeline-gen2",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260817-pipeline-gen2",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "f19864298637e419204e65dce4be4333672690fe",
@@ -20,11 +20,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260817-223048-pipeline-gen2-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "f41a3d9a61a893926ab4840570670f436191f32f"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260818-122421-pipeline-gen2-implement-3",
+      "attempts": 3
     },
     "test": {
       "status": "pending"
@@ -46,7 +50,55 @@
         "peak_context": 187340
       },
       "cost_usd": 4.8233025
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260817-230654-pipeline-gen2-implement",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 150,
+        "cache_creation": 203561,
+        "cache_read": 13659213,
+        "output": 66040,
+        "billed_input": 13862924,
+        "peak_context": 224446
+      },
+      "cost_usd": 10.516966500000002
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260818-113542-pipeline-gen2-implement-2",
+      "status": "failed",
+      "turns": 141,
+      "tokens": {
+        "input": 262,
+        "cache_creation": 262254,
+        "cache_read": 28480335,
+        "output": 101676,
+        "billed_input": 28742851,
+        "peak_context": 283140
+      },
+      "cost_usd": 19.405917500000008
+    },
+    {
+      "stage": "implement",
+      "attempt": 3,
+      "run_id": "20260818-122421-pipeline-gen2-implement-3",
+      "status": "completed",
+      "turns": 142,
+      "tokens": {
+        "input": 242,
+        "cache_creation": 178535,
+        "cache_read": 18129589,
+        "output": 60518,
+        "billed_input": 18308366,
+        "peak_context": 199420
+      },
+      "cost_usd": 12.364304499999998
     }
   ],
-  "updated_at": "2026-08-17T22:43:53+09:00"
+  "updated_at": "2026-08-18T13:07:57+09:00"
 }
