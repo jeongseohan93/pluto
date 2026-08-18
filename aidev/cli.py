@@ -5,6 +5,8 @@
     aidev report <run-id>|last
     aidev list
     aidev stats
+    aidev graph build --repo ~/jokertest
+    aidev graph show run_pipeline
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from . import __version__, pipeline, reporter, runner, verify, workspace
+from . import __version__, graph, pipeline, reporter, runner, verify, workspace
 from .storage import (
     Database,
     RunStore,
@@ -39,7 +41,7 @@ _sleep = time.sleep
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Every parser in one place, watch's --repo included. Takes no arguments."""
+    """Every parser in one place, watch's --repo and graph's verbs included. Takes no arguments."""
     parser = argparse.ArgumentParser(
         prog="aidev",
         description="Telemetry runner for Claude Code sessions (v0.1).",
@@ -94,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.set_defaults(func=cmd_run)
 
     pipeline.add_parser(sub)
+    graph.add_parser(sub)
 
     verify_cmd = sub.add_parser(
         "verify",

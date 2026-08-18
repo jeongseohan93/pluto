@@ -171,8 +171,16 @@ def changed_python_files(repo: Path, base: str, head: str) -> Dict[str, Set[int]
 # ---------------------------------------------------------------- the functions
 
 
-def _comment_block_above(lines: Sequence[str], lineno: int) -> str:
-    """The run of ``#`` comments directly above a ``def``, oldest line first."""
+def comment_block_above(lines: Sequence[str], lineno: int) -> str:
+    """The run of ``#`` comments directly above a ``def``, oldest line first.
+
+    Public since v0.6: the graph parser reads the same convention (docstring
+    first, then the comment block above), and two copies of this would drift.
+
+    @param lines   the file's lines, 0-based
+    @param lineno  the 1-based line the ``def`` is on
+    @flow  walk up from the line above: blank or non-comment ends the block
+    """
     collected: List[str] = []
     index = lineno - 2  # 0-based, the line above the def
     while index >= 0:
@@ -207,7 +215,9 @@ def functions(text: str) -> List[FuncSpec]:
     """Every top-level or method function in one file, with its spec text.
 
     Nested functions and dunders are left out: a closure's contract is its
-    parent's, and ``__init__``'s is the class docstring's.
+    parent's, and ``__init__``'s is the class docstring's. The graph parser keeps
+    both, which is why it has its own walk and only shares
+    ``comment_block_above`` with this one.
 
     @param text  the file's source
     @flow  ast.parse -> walk classes/functions -> docstring or the comment block above
@@ -225,7 +235,7 @@ def functions(text: str) -> List[FuncSpec]:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = prefix + child.name
                 if not inside_function and not _is_dunder(child.name):
-                    spec = ast.get_docstring(child) or _comment_block_above(lines, child.lineno)
+                    spec = ast.get_docstring(child) or comment_block_above(lines, child.lineno)
                     found.append(
                         FuncSpec(
                             name=name,

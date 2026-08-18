@@ -1,6 +1,6 @@
 {
   "slice_id": "20260818-graph-engine-1",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260818-graph-engine-1",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9b00363951aa11e3b18813bb04c2d819840293e7",
@@ -23,11 +23,16 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
+      "approval_reason": "훅은 (b)안 lazy 방식 — dirty 표시만, 갱신은 조회 시점",
       "run_id": "20260818-190606-graph-engine-1-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "4897372a0cd9f0ed16195b2d69b74f994fbc72a1"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260818-224228-graph-engine-1-implement-2",
+      "attempts": 2
     },
     "test": {
       "status": "pending"
@@ -49,7 +54,39 @@
         "peak_context": 145662
       },
       "cost_usd": 3.464629999999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260818-193122-graph-engine-1-implement",
+      "status": "failed",
+      "turns": 45,
+      "tokens": {
+        "input": 70,
+        "cache_creation": 133401,
+        "cache_read": 3233828,
+        "output": 67510,
+        "billed_input": 3367299,
+        "peak_context": 141516
+      },
+      "cost_usd": 4.639024000000001
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260818-224228-graph-engine-1-implement-2",
+      "status": "completed",
+      "turns": 139,
+      "tokens": {
+        "input": 228,
+        "cache_creation": 220927,
+        "cache_read": 16012535,
+        "output": 83927,
+        "billed_input": 16233690,
+        "peak_context": 203716
+      },
+      "cost_usd": 12.314852499999997
     }
   ],
-  "updated_at": "2026-08-18T19:16:31+09:00"
+  "updated_at": "2026-08-18T23:09:11+09:00"
 }

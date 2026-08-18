@@ -1011,6 +1011,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--no-write-guard` | 기존 파일에 대한 Write 차단을 끈다 (v0.5) |
 | `--no-output-diet` | implement에 `aidev verify` 대신 원본 테스트 명령을 준다 (v0.5) |
 | `--no-spec-check` | 함수 명세 기계 검사를 끈다 (v0.5) |
+| `--no-graph` | 단계 커밋 뒤 Function Graph를 stale로 표시하지 않는다 (v0.6) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
 | `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
 | `--session-reset-after` | 같은 단계가 비쿼터 실패 N회면 새 session (기본 1) |
@@ -1027,6 +1028,105 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 닿는다. `--worktree-root D:\wt`처럼 짧은 경로를 주거나
 `git config --global core.longpaths true`를 켠다. `--discard`가 실패하면 대개
 에디터·watcher·node가 worktree 안 파일을 잡고 있는 것이다 — 닫고 다시 실행한다.
+
+## Function Graph (v0.6, 1단계)
+
+> 그래프 엔진은 **사람에겐 시선(view), AI에겐 DB(query)** 다.
+> 이 단계는 그중 데이터층이다 — 에이전트의 '탐색'을 '조회'로 바꾼다.
+> **찾지 않는다, 좌표로 요청한다.**
+
+코드와 명세 주석을 파싱해 함수 단위 DB를 만든다. 진실은 언제나 코드고
+DB는 파생물이다. 언제 지워도 잃는 것이 없다.
+
+```bash
+aidev graph build --repo .            # 전체 빌드
+aidev graph update --repo .           # 변경된 파일만 재파싱
+aidev graph status --repo .           # 기준 커밋 / 파일·함수 수 / 커버리지 / 실패 목록
+
+aidev graph show run_pipeline         # 명세 + 시그니처 + 좌표 + 호출/피호출
+aidev graph callers merge_slice       # 부르는 곳들 (파일:줄)
+aidev graph calls commit_stage        # 부르는 것들
+aidev graph summaries --dir aidev     # 범위 안 함수 이름 + 기능 한 줄
+```
+
+모든 동사가 `--repo`(기본 현재 디렉터리)와 `--graph-dir`(기본
+`<repo>/.aidev/graph`)를 받는다. 출력은 토큰 효율 우선 — 항목당 1~2줄,
+좌표는 항상 `경로:줄`. 같은 이름의 함수가 여럿이면 **전부** 나열하고 경로로
+구분한다. 엔진이 대신 고르지 않는다.
+
+```
+run_pipeline(cfg: PipelineConfig, rec: SliceRecord, ...)  aidev/pipeline.py:3310-3447  py
+  The single loop: run the stage if it is not done, then ask about its gate.
+  @param cfg  the slice's configuration
+  @flow  per stage: dirty check -> run -> commit -> gate
+  calls 29: run_stage aidev/pipeline.py:2284 | commit_stage aidev/pipeline.py:2771 | +17 more
+  callers 1: _finish aidev/pipeline.py:5355
+```
+
+종료 코드: `0` 답했다, `1` 그런 이름이 없다, `2` 물어볼 수가 없다
+(그래프 없음 / 다른 스키마 / 파일 잠김).
+
+### 태그 규약 — 닫힌 코어, 열린 주변
+
+**코어 태그 4종**만 도구가 의미를 해석한다: 기능 한 줄 / `@param` / `@flow` /
+`@why` — 위 **함수 명세 규약 — 기계 검사**와 같은 형식이다.
+그 밖의 `@태그`는 **해석하지 않고 그대로 수집·보존**해서 DB에 넣고 `show`에
+원문 그대로 찍고 `status`에 개수를 센다. front matter의 미지 키를 다루는 원칙과
+같다 — **태그는 데이터고, 검사는 블록의 일이다.** 커스텀 태그에 검사 규칙을
+붙이는 것은 이 단계가 하지 않는다.
+
+Python은 docstring이 없으면 `def` 위의 `#` 블록을 명세로 읽고(명세 검사기와
+같은 함수를 쓴다), JS/TS는 선언 위의 `/** ... */` 또는 `//` 연속 블록을 읽는다.
+JSDoc의 `@param`이 그대로 코어 태그가 된다.
+
+### 캐시 규약
+
+`.aidev/graph/graph.db` — SQLite 한 파일. 빌드할 때마다 같은 디렉터리에
+`.gitignore`(내용 `*`)를 써 두므로 **어떤 repo에서도 커밋되지 않는다.**
+`git add -A`로 커밋하는 단계 커밋도, readonly 단계 직전의 청결 검사도 이걸
+보지 못한다.
+
+증분 갱신은 `mtime`+크기가 그대로면 읽지도 않고, 달라졌으면 sha256을 재서
+해시가 같으면 재파싱하지 않는다. 스키마가 다르면 마이그레이션하지 않고
+**버리고 다시 만든다** — 소모품 캐시에 마이그레이션 코드를 쓰는 것은 그것을
+소모품이 아니라고 말하는 것이다.
+
+json이 아니라 SQLite인 이유는 두 접근 패턴 모두에서 json이 지기 때문이다.
+조회는 이름 인덱스 한 번이면 되는데 json은 전체 문서를 메모리에 올려야 하고,
+증분 갱신은 `DELETE ... WHERE path=?` + 수십 행 삽입이면 되는데 json은 매번
+전체를 다시 직렬화해야 한다.
+
+### 파서의 한계 (알고 쓰는 것)
+
+의존성을 **추가하지 않았다.** Python은 stdlib `ast`(좌표가 정확하다),
+JS/TS는 자체 문자 스캐너다. tree-sitter를 쓰지 않은 이유: 이 도구는 무인 루프에서
+임의의 worktree를 돌아다니고, `dependencies = []`라는 것은 설치 실패라는 고장
+모드 자체가 없다는 뜻이다. 네이티브 휠 3종은 OS·파이썬 버전마다 새 실패 지점이 된다.
+
+- **JS/TS는 이름 있는 선언만** 잡는다 — `function f`, `const f = () =>`,
+  `const f = function`, `class` 본문의 메서드/화살표 프로퍼티. 객체 리터럴 메서드와
+  익명 콜백은 잡지 않는다(이름으로 물어볼 수 없는 것들이다). 익명 콜백 안의 호출은
+  그것이 쓰인 함수의 것으로 친다.
+- 문자열·템플릿·주석·정규식 리터럴을 먼저 공백으로 지운 사본 위에서 중괄호를
+  세므로 JSX도 그대로 성립한다. 정규식과 나눗셈의 구분은 휴리스틱이고, 틀리면
+  **그 파일 하나만** 실패 목록으로 가고 빌드는 완주한다.
+- **호출 관계는 이름 기반 best effort.** 같은 파일에 그 이름이 하나면 그것으로,
+  아니면 repo 전체에서 하나일 때만 잇는다. 언어가 다르면 잇지 않는다
+  (Python의 `str()`은 TypeScript의 `str`이 아니다). 나머지는 `(unresolved)` /
+  `(ambiguous: N)`으로 **모른다고 말한다.**
+- 파싱에 실패한 파일은 건너뛰고 `status`의 실패 목록에 사유와 함께 남는다.
+- 테스트 파일도 색인한다(테스트도 호출자다). 다만 명세 커버리지 %에서는 빼고
+  `status`가 두 숫자를 다 보고한다.
+
+### 파이프라인 훅 — lazy
+
+단계 커밋이 성공하면 `.aidev/graph/dirty` 마커 한 줄을 쓰고 끝난다. **파싱은 하지
+않는다.** 아직 어떤 단계도 그래프를 읽지 않으므로 커밋마다 재파싱하는 것은 아무도
+안 보는 캐시에 시간을 쓰는 일이다. 대신 커밋 뒤 **첫 조회**가 값을 치르고, 그때도
+움직인 파일만 다시 읽는다. 마커 쓰기가 실패해도 경고 한 줄이고 slice는 계속 간다 —
+파생 캐시가 파이프라인을 죽일 수는 없다. `--no-graph`면 아무것도 하지 않는다.
+
+브리핑 생성기와 plan 프롬프트 주입은 2단계, 그래프 화면은 3단계다.
 
 ## 다른 터미널에서 관찰 (v0.1.2)
 
@@ -1299,6 +1399,12 @@ slice 브랜치에 커밋되는 읽기 전용 스냅샷은 그 둘과 또 다른
 `.aidev/history/<slice-id>/`다. 에픽은 같은 원리로 `.aidev/epics/<epic-id>/`에
 들어간다 (위 [Epic → Slice Planner](#epic--slice-planner-v04) 참고).
 
+Function Graph는 그 어느 쪽도 아니다. `.aidev/graph/graph.db`는 **코드에서 언제든
+다시 만들 수 있는 파생 캐시**라서 진행 상태처럼 따라다닐 필요가 없다. 그래서 같은
+디렉터리에 `.gitignore`(`*`)를 함께 써 두고 git에서 통째로 감춘다 — 지워도 잃는
+것이 없다는 것이 이 설계의 요점이다 (위
+[Function Graph](#function-graph-v06-1단계) 참고).
+
 SQLite 테이블(전체 실행 비교용): `runs`, `tool_calls`, `file_accesses`, `phases`.
 `runs`에는 실행별 exact token(input / cache creation / cache read / output /
 peak context)과 attributable / gap 토큰도 같이 들어간다. 예전 스키마로 만들어진
@@ -1323,6 +1429,12 @@ pipeline은 `tests/fake_pipeline_claude.py`를 쓴다. 환경변수로 단계별
 격리 쪽 테스트는 진짜 git repo에서 돈다. `repo` fixture의 초기 브랜치 이름이
 `windows-handoff-20260808`이라서 **"base가 main이 아닌 브랜치에서 동작한다"를
 스위트 전체가 상시 증명한다.** git이 없으면 skip된다.
+
+`tests/test_graph.py`는 tmp repo와 **이 repo 자신**을 둘 다 대상으로 돈다.
+자기 자신을 빌드해서 `show run_pipeline`이 내놓는 좌표를 실제 소스에서 찾은
+`def` 줄과 비교하므로(줄 번호를 하드코딩하지 않는다) 구현이 줄을 밀어도
+회귀가 아니고, `desktop/src/**`의 실제 `.ts/.tsx`가 파싱되는지도 같이 본다.
+소스 체크아웃이 아니면 skip된다.
 
 ## Pluto IDE — 데스크톱 셸 (desktop/, v0.0.1)
 
@@ -1371,7 +1483,7 @@ v0.2  Slice Pipeline              ← 완료
 v0.3  Workspace 격리               ← 완료 (worktree / 브랜치 / 단계별 커밋 / merge·discard)
 v0.4  Epic → Slice Planner        ← 완료 (decompose / 목록 게이트 / 순차 큐 / --resume-epic)
 v0.5  파이프라인 2세대              ← 완료 (엔진 검증 / 실패 문서 규격 / Write 차단 / 명세 검사)
-v0.6  Codebase Memory             ← 지금 여기
+v0.6  Codebase Memory             ← 지금 여기 (1단계: 파서 + Function DB 완료)
 v0.7  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
       (v0.2.5에서 상태/plan/승인 3종 선행)
 ```
