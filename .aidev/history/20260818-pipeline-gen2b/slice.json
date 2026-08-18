@@ -1,6 +1,6 @@
 {
   "slice_id": "20260818-pipeline-gen2b",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260818-pipeline-gen2b",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "f8d8bfedcf4eaf647977716a717801a9ca9341d9",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260818-155309-pipeline-gen2b-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "9cf59c4cc3e34612b416bbcd813ced11099199ad"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260818-164254-pipeline-gen2b-implement-2",
+      "attempts": 2
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,39 @@
         "peak_context": 219090
       },
       "cost_usd": 6.800001999999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260818-161310-pipeline-gen2b-implement",
+      "status": "failed",
+      "turns": 121,
+      "tokens": {
+        "input": 240,
+        "cache_creation": 215654,
+        "cache_read": 18853043,
+        "output": 51635,
+        "billed_input": 19068937,
+        "peak_context": 223769
+      },
+      "cost_usd": 12.875136499999998
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260818-164254-pipeline-gen2b-implement-2",
+      "status": "completed",
+      "turns": 60,
+      "tokens": {
+        "input": 94,
+        "cache_creation": 85521,
+        "cache_read": 3325252,
+        "output": 19828,
+        "billed_input": 3410867,
+        "peak_context": 93636
+      },
+      "cost_usd": 3.0140060000000006
     }
   ],
-  "updated_at": "2026-08-18T16:06:27+09:00"
+  "updated_at": "2026-08-18T16:55:01+09:00"
 }

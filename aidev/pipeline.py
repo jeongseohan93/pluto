@@ -526,6 +526,53 @@ def resolve_spec_check(fields: Dict[str, str]) -> bool:
     )
 
 
+# ------------------------------------------------------- unknown front matter
+#
+# Measured 2026-08-17: 'model:' was written into a requirement's front matter
+# before this tool knew the key. It was dropped in silence, and the slice ran a
+# whole stage on a budget nobody had asked for. Silence is the defect, not the
+# ignoring: a key this version does not know may be a typo, a note a human left,
+# or a key the next version adds - none of which is worth killing a slice over.
+
+# Every key a reader here actually pulls out. Adding one to the readers without
+# adding it here is what turns a working line into a warning, so they move together.
+KNOWN_FRONT_MATTER_KEYS: Tuple[str, ...] = (
+    "approval",
+    "setup",
+    "test_commands",
+    "max_turns",
+    "model",
+    "spec_check",
+)
+
+
+def unknown_front_matter_keys(fields: Dict[str, str]) -> List[str]:
+    """Front matter keys nothing reads, in the order they were written.
+
+    @param fields  the parsed front matter - keys already lowercased and de-dashed
+    """
+    return [key for key in fields if key not in KNOWN_FRONT_MATTER_KEYS]
+
+
+def warn_unknown_front_matter(fields: Dict[str, str], where: str = "") -> str:
+    """One warning line for keys that will be ignored, or ``""`` when there are none.
+
+    Returned rather than printed: the caller decides where a warning goes, and a
+    function that returns a string can be tested without capturing output.
+
+    @param fields  the parsed front matter
+    @param where   what to name after the warning - a path, or a path and an item
+    """
+    unknown = unknown_front_matter_keys(fields)
+    if not unknown:
+        return ""
+    return "warning: front matter key(s) ignored: {0} - known: {1}{2}".format(
+        ", ".join(unknown),
+        ", ".join(KNOWN_FRONT_MATTER_KEYS),
+        " ({0})".format(where) if where else "",
+    )
+
+
 # ------------------------------------------------------------ requirement body
 #
 # Measured 2026-08-17: an empty requirement launched a slice, a plan stage and a
@@ -689,6 +736,8 @@ APPROVAL_TEMPLATE = """\
 # Write the decision on its own line below. Lines starting with '#' are ignored.
 #
 #   approved
+#   approved: <condition>   the condition follows every later stage, retry and
+#                           repair prompt of this slice
 #   rejected: <reason>
 #
 # You may edit {artifact} before approving - what follows reads {artifact} as it
@@ -714,11 +763,22 @@ _FULL_REJECTION_WORDS = ("전면", "full rejection", "rewrite from scratch", "st
 @dataclass
 class Decision:
     verdict: str
+    # Why it was rejected, or the condition attached to an approval. Both are the
+    # same thing to a reader: the sentence the deciding human wrote after the word.
     reason: str = ""
 
 
 def read_decision(path: Path) -> Decision:
-    """The first line that is neither blank nor a comment decides."""
+    """The first line that is neither blank nor a comment decides, with what follows it.
+
+    ``approved: scope=A only`` keeps ``scope=A only``. Measured 2026-08-17: the
+    words after ``approved:`` were dropped here, so a condition a human typed at
+    the gate reached nothing downstream and attempt 2 built past it.
+
+    @param path  the approval file
+    @flow  read -> first non-comment line -> approved | rejected | pending
+    주요 내부 변수: word(판정 단어), rest(그 뒤에 사람이 쓴 문장)
+    """
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -730,7 +790,7 @@ def read_decision(path: Path) -> Decision:
         head, _, rest = line.partition(":")
         word = head.strip().lower().rstrip(".!")
         if word in ("approved", "approve"):
-            return Decision(APPROVED)
+            return Decision(APPROVED, rest.strip())
         if word in ("rejected", "reject"):
             return Decision(REJECTED, rest.strip())
         return Decision(PENDING)  # anything else: the human is still writing
@@ -769,6 +829,36 @@ def read_rejection(rec: "SliceRecord", stage: str, decision: Decision) -> Dict[s
         "path": path,
         "at": now_iso(),
     }
+
+
+# A condition attached to an approval is state, not a sentence somebody said once.
+# Measured 2026-08-17/18: a plan approved with 'scope=A only' was implemented past
+# that scope on attempt 2, because the new session had never been told. It is kept
+# where the approval itself is kept - stages.<stage>.approval_reason - so a replan,
+# which wipes that key, cannot leak the old cycle's condition into the next one.
+
+
+def approval_conditions(state: Dict[str, Any]) -> List[Dict[str, str]]:
+    """The ``approved: <condition>`` lines this slice was given, in stage order.
+
+    Read-only on purpose: this runs while a prompt is being built, and a builder
+    that grows state.json would blur the single-writer rule the loop depends on.
+
+    @param state  state.json
+    @flow  stage_order -> approved stages carrying a comment -> list
+    주요 내부 변수: stages(기록된 단계들), found(승인 조건 목록)
+    """
+    stages = state.get("stages")
+    stages = stages if isinstance(stages, dict) else {}
+    found: List[Dict[str, str]] = []
+    for stage in stage_order(state):
+        entry = stages.get(stage)
+        if not isinstance(entry, dict) or entry.get("approval") != APPROVED:
+            continue
+        comment = str(entry.get("approval_reason") or "").strip()
+        if comment:
+            found.append({"stage": stage, "comment": comment})
+    return found
 
 
 # ----------------------------------------------------------------- slice dirs
@@ -1423,7 +1513,7 @@ REQUIREMENT
 APPROVED PLAN
 -------------
 {plan}
-
+{approval}
 INSTRUCTIONS
 - Follow the approved plan. Where the real code contradicts it, follow the code
   and say so in your final message.
@@ -1461,6 +1551,18 @@ _DIAGNOSIS_BLOCK = """
 DIAGNOSIS
 ---------
 {diagnosis}
+"""
+
+# What the human wrote after 'approved:'. It sits directly under the plan because
+# that is what it qualifies, and it is context rather than an instruction - the
+# same kind of injection _REPAIR_NOTE and _AMEND_NOTE already are.
+_APPROVAL_NOTE = """
+APPROVAL CONDITIONS - attached by the human who approved this
+-------------------------------------------------------------
+{conditions}
+
+These are part of what was approved. They hold for every attempt, including this
+one. Where a condition and the plan disagree, the condition wins.
 """
 
 # Injected into a stage that is picking up after one that ran out of turns.
@@ -1507,7 +1609,7 @@ REQUIREMENT
 PLAN THAT WAS IMPLEMENTED
 -------------------------
 {plan}
-
+{approval}
 INSTRUCTIONS
 - Read the failing code and the failing test. Do not run anything and do not edit
   anything: every mutating tool is blocked, and looking for a way around them is
@@ -1535,7 +1637,7 @@ REQUIREMENT
 PLAN THAT WAS IMPLEMENTED
 -------------------------
 {plan}
-
+{approval}
 INSTRUCTIONS
 - Run this project's own test suite the way the project runs it. Find the
   command from the project's config rather than assuming one.
@@ -1660,6 +1762,7 @@ def build_prompt(
     replan: Optional[Dict[str, Any]] = None,
     spec_check: bool = True,
     diet: bool = False,
+    approvals: Sequence[Dict[str, Any]] = (),
 ) -> str:
     """The prompt one stage is given, built from what the engine already knows.
 
@@ -1675,7 +1778,8 @@ def build_prompt(
     @param replan         the rejected plan and its rejection, for a re-plan
     @param spec_check     whether the 함수 명세 convention is being enforced
     @param diet           whether verification reaches the stage through ``aidev verify``
-    @flow  plan (+replan) -> implement/test template -> allowed/test-command/workspace notes
+    @param approvals      conditions a human attached to this slice's approvals
+    @flow  plan (+replan) -> implement/test template -> allowed/test-command/workspace/approval notes
     주요 내부 변수: note(허용 규칙 + 검증 명령 안내), where(워크스페이스 안내)
     """
     if stage == "plan":
@@ -1703,6 +1807,7 @@ def build_prompt(
         allowed=note,
         workspace=where,
         amend=_amend_note(amend),
+        approval=_approval_note(approvals),
         **extra
     )
 
@@ -1720,6 +1825,23 @@ def _repair_note(repair: Optional[Dict[str, Any]]) -> str:
         failure=str(repair.get("failure") or "(the report is missing)").strip(),
         diagnosis=_DIAGNOSIS_BLOCK.format(diagnosis=diagnosis) if diagnosis else "",
     )
+
+
+def _approval_note(conditions: Sequence[Dict[str, Any]]) -> str:
+    """The conditions attached to this slice's approvals, or nothing when there are none.
+
+    Empty is byte-for-byte the prompt as it was before conditions existed, which
+    is what keeps an ordinary ``approved`` from changing anything at all.
+
+    @param conditions  what ``approval_conditions`` returned
+    """
+    if not conditions:
+        return ""
+    lines = [
+        "- {0}: {1}".format(entry.get("stage") or "?", str(entry.get("comment") or "").strip())
+        for entry in conditions
+    ]
+    return _APPROVAL_NOTE.format(conditions="\n".join(lines))
 
 
 def _replan_note(replan: Optional[Dict[str, Any]]) -> str:
@@ -2179,7 +2301,7 @@ def run_stage(
     @param amend        the open amend cycle, if any
     @param repair       a failed verification this run must fix, if any
     @param replan       the rejected plan and its rejection, for a re-plan
-    @flow  session policy -> build prompt -> execute -> quota? wait and retry : return
+    @flow  session policy -> build prompt (+approval conditions) -> execute -> quota? wait and retry : return
     주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수)
     """
     spec = spec or StageSpec.for_slice(stage, cfg, rec)
@@ -2224,6 +2346,9 @@ def run_stage(
             replan=replan,
             spec_check=cfg.spec_check,
             diet=diet_is_on(cfg),
+            # Rebuilt every time round this loop, so a quota retry, a resume, a
+            # repair and an amend all carry the condition without asking for it.
+            approvals=approval_conditions(state),
         )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
@@ -2803,7 +2928,7 @@ def run_diagnosis(
     @param state        state.json, where the run is recorded like any other
     @param requirement  the requirement body
     @param failure_md   the failure report, injected verbatim
-    @flow  StageSpec(readonly, phase=repair) -> run_stage -> save diagnosis.md
+    @flow  StageSpec(readonly, phase=repair, +approval conditions) -> run_stage -> save diagnosis.md
     주요 내부 변수: spec(진단 세션 설정), run(StageRun), text(모델의 최종 답)
     """
     spec = StageSpec(
@@ -2817,6 +2942,9 @@ def run_diagnosis(
             failure=failure_md.strip(),
             requirement=requirement.strip(),
             plan=(rec.read_plan().strip() or "(no plan recorded)"),
+            # A diagnosis of work done under a condition has to know the condition,
+            # or it proposes a fix that reaches outside what was approved.
+            approval=_approval_note(approval_conditions(state)),
         ),
     )
     run = run_stage(cfg, rec, state, DIAGNOSE_STAGE, requirement, spec=spec)
@@ -2992,7 +3120,7 @@ def await_approval(
     @param stage     which gate this is
     @param artifact  what the human may edit before deciding
     @param note      advice rendered into the template as comments
-    @flow  read -> write template -> poll -> approved | rejected (+ rejection record)
+    @flow  read -> write template -> poll -> approved (+condition) | rejected (+ rejection record)
     """
     path = rec.approval_path(stage)
     decision = read_decision(path)
@@ -3008,7 +3136,7 @@ def await_approval(
         set_status(rec, state, "waiting_approval:{0}".format(stage))
         say("waiting for approval of '{0}'".format(stage))
         say("  edit {0}".format(path))
-        say("  write 'approved' or 'rejected: <reason>' on its own line")
+        say("  write 'approved', 'approved: <condition>' or 'rejected: <reason>' on its own line")
         say_lines(note)
         deadline = time.time() + cfg.approval_timeout if cfg.approval_timeout else None
         while decision.verdict == PENDING:
@@ -3021,6 +3149,11 @@ def await_approval(
     entry["approval"] = decision.verdict
     if decision.reason:
         entry["approval_reason"] = decision.reason
+    if decision.verdict == APPROVED and decision.reason:
+        # Said out loud at the moment it is written down, so the human sees that
+        # the condition was taken rather than trusting it was.
+        say("approval condition: {0}".format(decision.reason))
+        say("  it goes into every stage, retry and repair prompt of this slice")
     if decision.verdict == REJECTED:
         # Append-only, and optional like every key added after schema 2: what was
         # rejected, why, and how far it reaches - the input --replan reads.
@@ -3856,9 +3989,14 @@ def _config(
     @param ws             the slice's workspace, when it has one
     @param setup_command  the declared setup command, if any
     @param fields         the requirement's front matter
+    @flow  warn about unknown keys -> turns (CLI > file) -> models (same) -> PipelineConfig
     주요 내부 변수: stage_turns / stage_models(단계별 덮어쓰기)
     """
     fields = fields or {}
+    # Every launch path - start, resume, amend, replan, dry-run - passes through
+    # here exactly once with the front matter in hand, so one line here is one
+    # warning per run rather than one per reader.
+    say_lines(warn_unknown_front_matter(fields))
     front_base, front_stage = resolve_max_turns(fields)
     _, cli_stage = parse_turn_tokens(
         getattr(args, "stage_turns", None) or [],
@@ -4184,6 +4322,31 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
     return continue_slice(args, repo, data_dir, rec)
 
 
+def _broken_workspace_error(
+    repo: Path, rec: SliceRecord, ws: workspace.Workspace, broken: str
+) -> PipelineError:
+    """Refuse a workspace that cannot be used, with the commands that get out of it.
+
+    Both callers - resume and amend - say exactly this, so they say it from one
+    place: two copies of the same paragraph are two copies to keep in step, and
+    ``worktree repair`` had to be added to both.
+
+    @param repo    the user's repository
+    @param rec     the slice whose workspace this is
+    @param ws      the recorded workspace
+    @param broken  what ``workspace.verify`` said is wrong with it
+    """
+    return PipelineError(
+        "{0}\n"
+        "    aidev does not re-create it: the stage commits already on '{1}' were made "
+        "there.\n"
+        "    Try to restore it:  git -C {2} worktree repair {3}\n"
+        "    Or give it up:      aidev pipeline --repo {2} --discard {4}".format(
+            broken, ws.branch, repo, ws.path, rec.slice_id
+        )
+    )
+
+
 def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> int:
     """Pick a stopped slice up where it stopped. The queue resumes slices this way too.
 
@@ -4226,14 +4389,7 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
     else:
         broken = workspace.verify(repo, ws)
         if broken is not None:
-            raise PipelineError(
-                "{0}\n"
-                "    aidev does not re-create it: the stage commits already on '{1}' were made "
-                "there.\n"
-                "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
-                    broken, ws.branch, repo, rec.slice_id
-                )
-            )
+            raise _broken_workspace_error(repo, rec, ws, broken)
 
     amend = current_amend(state)
     if amend is not None:
@@ -4296,14 +4452,7 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
     else:
         broken = workspace.verify(repo, ws)
         if broken is not None:
-            raise PipelineError(
-                "{0}\n"
-                "    aidev does not re-create it: the stage commits already on '{1}' were made "
-                "there.\n"
-                "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
-                    broken, ws.branch, repo, rec.slice_id
-                )
-            )
+            raise _broken_workspace_error(repo, rec, ws, broken)
 
     stages = [name for name in stage_order(state) if name in AMEND_STAGES]
     if not stages:
@@ -4753,14 +4902,7 @@ def rollback_slice(
 
     broken = workspace.verify(repo, ws)
     if broken is not None:
-        raise PipelineError(
-            "{0}\n"
-            "    aidev does not re-create it: the stage commits already on '{1}' were made "
-            "there.\n"
-            "    Restore it yourself, or: aidev pipeline --repo {2} --discard {3}".format(
-                broken, ws.branch, repo, rec.slice_id
-            )
-        )
+        raise _broken_workspace_error(repo, rec, ws, broken)
     # Only tracked changes: a rewind throws those away. Untracked files are the
     # worktree's build output and reset does not touch them.
     if not workspace.is_clean(ws.path, tracked_only=True):
@@ -4986,26 +5128,137 @@ def revert_merge_slice(
     return EXIT_DONE
 
 
+def _discard_failed(
+    repo: Path,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    ws: workspace.Workspace,
+    exc: Exception,
+) -> None:
+    """Report a failed worktree removal by measuring what it actually left behind.
+
+    Three states are possible and only one of them is the dead end. Guessing
+    between them is how the orphan went unnoticed, so each is asked about rather
+    than assumed. Always raises, except when the directory turns out to be gone
+    after all - then the goal is reached and the caller may go on.
+
+    @param repo   the user's repository
+    @param rec    the slice being discarded
+    @param state  state.json, where a dead end is written down
+    @param ws     its recorded workspace
+    @param exc    what git said
+    @flow  still registered -> nothing changed ; gone from git -> repair | orphan ; no directory -> continue
+    주요 내부 변수: registered(다시 잰 등록 여부), exists(디렉터리가 남았는지)
+    """
+    registered = workspace.find_worktree(repo, ws.path) is not None
+    exists = Path(ws.path).exists()
+    if not exists:
+        # git complained, but the directory is what we came for and it is gone.
+        say("git reported an error removing the worktree, but the directory is gone:")
+        say("  {0}".format(exc))
+        return
+    if registered:
+        raise PipelineError(
+            "could not remove the worktree, so the branch was kept: {0}\n"
+            "    {1}\n"
+            "    Nothing changed: it is still registered and still on disk.\n"
+            "    Close whatever holds files in there and run --discard again.".format(
+                ws.path, exc
+            )
+        )
+    if workspace.repair_worktree(repo, ws.path):
+        raise PipelineError(
+            "could not remove the worktree, so it was registered again and the "
+            "branch was kept: {0}\n"
+            "    {1}\n"
+            "    Close whatever holds files in there and run --discard again.".format(
+                ws.path, exc
+            )
+        )
+    state["discard_failed"] = {"at": now_iso(), "path": str(ws.path), "error": str(exc)}
+    rec.write_state(state)
+    raise PipelineError(
+        "the worktree was unregistered but the directory could not be deleted, so "
+        "the branch was kept: {0}\n"
+        "    {1}\n"
+        "    git no longer knows this path, so it cannot remove it either. Either\n"
+        "    run --discard again - it deletes an orphaned directory - or do it by\n"
+        "    hand:\n{2}".format(ws.path, exc, _discard_recovery(repo, rec, ws))
+    )
+
+
+def _discard_recovery(repo: Path, rec: SliceRecord, ws: workspace.Workspace) -> str:
+    """The three commands that get a half-removed workspace out of its dead end.
+
+    The third one matters most: running ``--discard`` again now finishes the job,
+    because an orphaned directory is a case it handles rather than one it refuses.
+
+    @param repo  the user's repository
+    @param rec   the slice being discarded
+    @param ws    its recorded workspace
+    """
+    return (
+        "    git -C {0} worktree prune\n"
+        "    rm -rf {1}\n"
+        "    aidev pipeline --repo {0} --discard {2}".format(repo, ws.path, rec.slice_id)
+    )
+
+
 def discard_slice(
     args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
 ) -> int:
-    """Throw the slice's workspace away. The user's checkout keeps no git trace of it."""
+    """Throw the slice's workspace away. The user's checkout keeps no git trace of it.
+
+    ``git worktree remove`` unregisters and then deletes, and measured 2026-08-18
+    it did the first and failed the second - leaving an orphaned directory that
+    resume refused and that ``--discard`` itself could never remove, because git
+    will not remove a path it no longer has registered. So: look before leaping,
+    re-measure after a failure instead of assuming what it left behind, put the
+    registration back when git can, and treat an orphan as a case rather than an
+    error. The branch is still never deleted first - going back is worth more
+    than a tidy directory.
+
+    @param args        parsed arguments - ``--discard <slice>``
+    @param repo        the user's repository
+    @param repo_given  whether --repo was named, for the "no slices here" hint
+    @param data_dir    where runs are stored
+    @flow  blockers? refuse -> remove -> failed? re-measure (repair | orphan) -> branch -> discarded
+    주요 내부 변수: entry(git의 등록 정보), sha(지운 브랜치의 커밋)
+    """
     rec, state, ws = _finished_workspace(repo, args.discard, repo_given, data_dir)
     with SliceLock(rec):
-        if Path(ws.path).exists() or workspace.find_worktree(repo, ws.path) is not None:
+        entry = workspace.find_worktree(repo, ws.path)
+        if entry is not None:
+            blockers = workspace.removal_blockers(repo, ws.path)
+            if blockers:
+                # Nothing has been touched yet, which is the whole point of asking
+                # first: the slice is exactly as it was and the branch is intact.
+                raise PipelineError(
+                    "the worktree cannot be removed as it stands, so nothing was "
+                    "changed:\n"
+                    + "\n".join("  - " + reason for reason in blockers)
+                    + "\n    then: aidev pipeline --repo {0} --discard {1}".format(
+                        repo, rec.slice_id
+                    )
+                )
             try:
                 workspace.worktree_remove(repo, ws.path)
             except workspace.GitError as exc:
-                # Windows holds files open for editors, watchers and node. Deleting
-                # the branch anyway would leave the worse leftover: a worktree with
-                # nothing to go back to.
+                _discard_failed(repo, rec, state, ws, exc)
+        elif Path(ws.path).exists():
+            # The half-removed state an earlier --discard left behind. git has
+            # nothing to remove any more, so the directory is ours to delete.
+            say("worktree is no longer registered but the directory is still there:")
+            say("  {0}".format(ws.path))
+            problem = workspace.remove_tree(ws.path)
+            if problem is not None:
                 raise PipelineError(
-                    "could not remove the worktree, so the branch was kept: {0}\n"
-                    "    {1}\n"
-                    "    Close whatever holds files in there and run --discard again.".format(
-                        ws.path, exc
+                    "could not delete the orphaned worktree directory, so the branch "
+                    "was kept: {0}\n    {1}\n{2}".format(
+                        ws.path, problem, _discard_recovery(repo, rec, ws)
                     )
                 )
+            say("  removed it")
         else:
             say("worktree was already gone: {0}".format(ws.path))
             say("  if git still lists it, prune it yourself: git -C {0} worktree prune".format(repo))
@@ -5016,6 +5269,8 @@ def discard_slice(
             except workspace.GitError as exc:
                 raise PipelineError("could not delete branch {0}: {1}".format(ws.branch, exc))
         state["discard"] = {"at": now_iso(), "branch": ws.branch, "commit": sha}
+        # An earlier failure is history now: the workspace really is gone.
+        state.pop("discard_failed", None)
         set_status(rec, state, STATUS_DISCARDED)
 
     say("discarded {0}".format(rec.slice_id))

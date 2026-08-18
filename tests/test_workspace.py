@@ -178,6 +178,63 @@ def test_verify_notices_a_gone_or_moved_worktree(repo, tmp_path):
     assert "gone" in (workspace.verify(repo, ws) or "")
 
 
+# ------------------------------------------------------------------ removal
+#
+# Measured 2026-08-18: 'git worktree remove' unregistered a worktree and then
+# failed to delete it, leaving a directory git no longer knew about - which the
+# same command could never remove afterwards.
+
+
+def test_removal_blockers_name_a_lock_and_the_command_that_clears_it(repo, tmp_path):
+    ws = workspace.create(repo, plan_for(repo, tmp_path))
+    assert workspace.removal_blockers(repo, ws.path) == []
+
+    git(repo, "worktree", "lock", str(ws.path))
+    reasons = workspace.removal_blockers(repo, ws.path)
+    assert len(reasons) == 1
+    assert "locked" in reasons[0] and "worktree unlock" in reasons[0]
+
+    git(repo, "worktree", "unlock", str(ws.path))
+    assert workspace.removal_blockers(repo, ws.path) == []
+    # an unregistered path blocks nothing: there is no git operation to attempt
+    assert workspace.removal_blockers(repo, tmp_path / "nowhere") == []
+
+
+def test_removal_blockers_notice_a_registration_with_nothing_behind_it(repo, tmp_path):
+    ws = workspace.create(repo, plan_for(repo, tmp_path))
+    shutil.rmtree(str(ws.path))
+
+    reasons = workspace.removal_blockers(repo, ws.path)
+    assert len(reasons) == 1
+    assert "missing on disk" in reasons[0] and "worktree prune" in reasons[0]
+
+
+def test_repair_measures_whether_the_registration_really_came_back(repo, tmp_path):
+    """The answer is measured with find_worktree, never assumed from git's exit code."""
+    ws = workspace.create(repo, plan_for(repo, tmp_path))
+    admin = (ws.path / ".git").read_text(encoding="utf-8").split("gitdir:", 1)[-1].strip()
+
+    # a worktree whose link is intact is trivially repairable
+    assert workspace.repair_worktree(repo, ws.path) is True
+
+    # and one whose admin directory is gone is not - which is not an error
+    shutil.rmtree(admin, ignore_errors=True)
+    assert workspace.find_worktree(repo, ws.path) is None
+    assert workspace.repair_worktree(repo, ws.path) is False
+
+
+def test_remove_tree_reports_instead_of_raising(repo, tmp_path):
+    ws = workspace.create(repo, plan_for(repo, tmp_path))
+
+    assert workspace.remove_tree(tmp_path / "never-existed") is None  # already the goal
+    assert workspace.remove_tree(ws.path) is None
+    assert not ws.path.exists()
+
+    a_file = tmp_path / "not-a-directory.txt"
+    a_file.write_text("x\n", encoding="utf-8")
+    assert isinstance(workspace.remove_tree(a_file), str)  # reported, not raised
+
+
 # ---------------------------------------------------------------- committing
 
 

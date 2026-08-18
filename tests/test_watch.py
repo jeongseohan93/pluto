@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from aidev import cli, reporter
+from aidev import cli, reporter, storage
 from aidev.cli import main, resolve_watch_target
 from aidev.storage import (
     RunStore,
@@ -138,6 +138,110 @@ def test_without_a_running_run_watch_falls_back_to_the_newest(tmp_path):
     assert resolve_watch_target(tmp_path / "empty", "last") is None
 
 
+# ------------------------------------------------------------------ staleness
+#
+# Measured 2026-08-18: `aidev watch` attached to a run that had died two days
+# earlier. A killed runner leaves live.json saying 'running' forever, so the
+# status alone cannot answer "is anybody still working on this".
+
+
+def write_run_json(run_dir: Path, repo: Path) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(run_dir / "run.json", {"config": {"repo": str(repo)}})
+
+
+def test_last_skips_a_run_nobody_has_updated(tmp_path):
+    runs = tmp_path / "runs"
+    write_live(runs / "20260101-000000-a", status="completed")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    write_live(runs / "20260102-000000-b", status="running", updated_at=two_days_ago)
+
+    assert find_running_run(runs) is None
+    # the finished run is worth more than one that only claims to be running
+    assert resolve_watch_target(runs, "last").name == "20260101-000000-a"
+    # and naming it is still allowed: an explicit id always wins
+    assert resolve_watch_target(runs, "20260102").name == "20260102-000000-b"
+
+
+def test_last_still_prefers_a_live_running_run(tmp_path):
+    runs = tmp_path / "runs"
+    write_live(runs / "20260101-000000-a", status="running", updated_at=time.time() - 5)
+    write_live(runs / "20260102-000000-b", status="completed")
+
+    assert find_running_run(runs).name == "20260101-000000-a"
+    assert resolve_watch_target(runs, "last").name == "20260101-000000-a"
+
+
+def test_a_run_that_cannot_be_dated_is_not_called_dead(tmp_path):
+    """Not knowing how old it is, is not the same as knowing it is dead."""
+    runs = tmp_path / "runs"
+    run_dir = runs / "20260101-000000-a"
+    write_live(run_dir, status="running", updated_at="not a number")
+
+    assert storage.live_age({"updated_at": None}) is None
+    # the file's own mtime stands in, and it was written just now
+    assert storage.is_stale(read_live(run_dir), run_dir) is False
+    assert find_running_run(runs).name == "20260101-000000-a"
+
+
+def test_only_stale_running_runs_are_still_offered(tmp_path):
+    """Better a stale run with a warning than 'no run to watch' when there is one."""
+    runs = tmp_path / "runs"
+    write_live(runs / "20260101-000000-a", status="running", updated_at=1000.0)
+
+    assert find_running_run(runs) is None
+    assert resolve_watch_target(runs, "last").name == "20260101-000000-a"
+
+
+# ----------------------------------------------------------------- repo scope
+
+
+def test_watch_scopes_last_to_a_repo(tmp_path):
+    runs = tmp_path / "runs"
+    mine, theirs = tmp_path / "jokertest", tmp_path / "someone-else"
+    write_live(runs / "20260101-000000-a", status="running")
+    write_run_json(runs / "20260101-000000-a", theirs)
+    write_live(runs / "20260102-000000-b", status="running")
+    write_run_json(runs / "20260102-000000-b", mine)
+
+    assert resolve_watch_target(runs, "last", repo=mine).name == "20260102-000000-b"
+    assert resolve_watch_target(runs, "last", repo=theirs).name == "20260101-000000-a"
+    # unscoped is what it always was: the newest running run, whoever owns it
+    assert resolve_watch_target(runs, "last").name == "20260102-000000-b"
+
+
+def test_a_slice_worktree_run_counts_as_the_repos_own(tmp_path):
+    """Pipeline stages record the worktree they ran in, not the user's checkout."""
+    runs = tmp_path / "runs"
+    repo = tmp_path / "jokertest"
+    worktree = tmp_path / "jokertest-slices" / "20260818-doctor"
+    write_live(runs / "20260101-000000-a", status="running")
+    write_run_json(runs / "20260101-000000-a", worktree)
+
+    assert resolve_watch_target(runs, "last", repo=repo).name == "20260101-000000-a"
+    assert resolve_watch_target(runs, "last", repo=tmp_path / "elsewhere") is None
+
+
+def test_a_run_that_never_said_where_it_ran_is_out_of_scope(tmp_path):
+    """A run that cannot prove it belongs here is the one that got attached to."""
+    runs = tmp_path / "runs"
+    write_live(runs / "20260101-000000-a", status="running")
+
+    assert storage.run_repo(runs / "20260101-000000-a") is None
+    assert resolve_watch_target(runs, "last", repo=tmp_path / "jokertest") is None
+    assert resolve_watch_target(runs, "last").name == "20260101-000000-a"
+
+
+def test_run_repo_falls_back_to_telemetry(tmp_path):
+    run_dir = tmp_path / "runs" / "20260101-000000-a"
+    run_dir.mkdir(parents=True)
+    write_json_atomic(run_dir / "telemetry.json", {"repo": "/w/jokertest"})
+
+    assert storage.run_repo(run_dir) == "/w/jokertest"
+    write_json_atomic(run_dir / "run.json", {"config": {"repo": "/w/other"}})
+    assert storage.run_repo(run_dir) == "/w/other"  # run.json is written first and wins
+
+
 # --------------------------------------------------------------------- frames
 
 def test_watch_frame_marks_live_numbers_provisional(tmp_path):
@@ -259,6 +363,23 @@ def test_watch_waits_when_there_is_nothing_to_show_yet(tmp_path, capsys):
 def test_watch_without_any_run(tmp_path, capsys):
     assert main(["--data-dir", str(tmp_path / "data"), "watch"]) == 2
     assert "no run to watch" in capsys.readouterr().err
+
+
+def test_watch_does_not_follow_a_dead_run_forever(tmp_path, monkeypatch, capsys):
+    """The other half of the 2026-08-18 defect: attaching to it never ended."""
+    data_dir = tmp_path / "data"
+    run_dir = data_dir / "runs" / "run-dead"
+    write_live(run_dir, status="running", updated_at=time.time() - 2 * 24 * 3600)
+
+    def never(_seconds):
+        raise AssertionError("a run with no runner behind it must not be polled")
+
+    monkeypatch.setattr(cli, "_sleep", never)
+    assert main(["--data-dir", str(data_dir), "watch", "run-dead"]) == 0
+
+    out = capsys.readouterr().out
+    assert "STALE" in out and "no runner" in out
+    assert "run finished" not in out  # it did not finish; nobody is there
 
 
 def test_ctrl_c_stops_only_the_watcher(tmp_path, monkeypatch, capsys):

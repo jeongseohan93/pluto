@@ -298,7 +298,14 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
     """Every item has to be a requirement this pipeline can actually run.
 
     Checked once, before the queue starts, so a typo in item 4 is not discovered
-    after items 1..3 have already built branches.
+    after items 1..3 have already built branches. All six declared keys are read
+    here: ``model:`` and ``spec_check:`` were documented as validated and were
+    not, which is the same defect as a key that is ignored in silence.
+
+    @param items  the parsed slice list
+    @param path   the file the list came from, named in every message
+    @flow  per item: body present? -> every front matter key parses -> warn about the rest
+    주요 내부 변수: where(어느 항목인지), fields(항목의 front matter)
     """
     for item in items:
         where = "{0}, slice {1} ('{2}')".format(path, item.index, item.title)
@@ -310,8 +317,13 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
             pipeline.resolve_setup(fields)
             pipeline.resolve_test_commands(fields)
             pipeline.resolve_max_turns(fields)
+            pipeline.resolve_models(fields)
+            pipeline.resolve_spec_check(fields)
         except pipeline.PipelineError as exc:
             raise pipeline.PipelineError("{0}: {1}".format(where, exc))
+        # Not an error: the queue is worth running with one line ignored, but
+        # nobody should find out afterwards that it was.
+        pipeline.say_lines(pipeline.warn_unknown_front_matter(fields, where))
 
 
 def _slug(text: str) -> str:

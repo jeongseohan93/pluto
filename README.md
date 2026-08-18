@@ -38,7 +38,12 @@ aidev report <run-id>
 pip install -e ".[dev]"
 ```
 
-의존성 없음(표준 라이브러리만). `claude` CLI가 PATH에 있어야 한다.
+Python **3.10 이상**. 의존성 없음(표준 라이브러리만). `claude` CLI가 PATH에 있어야 한다.
+
+3.9는 **거부한다**(`requires-python = ">=3.10"`). 실측 2026-08-18 macOS: `aidev/verify.py`가
+`Path.write_text(..., newline="\n")`를 부르는데 그 인자는 3.10에 생겼다. 3.9에서는 검증이
+로그를 쓰는 순간 `TypeError`로 죽는다. 개행 제어를 빼는 쪽으로 물러서지 않았다 — 윈도우에서
+CRLF가 섞이면 로그 대조가 깨지고, 그건 지울 수 없는 요구다.
 
 ## 사용
 
@@ -210,6 +215,29 @@ reflog가 살아있는 동안은 되살릴 수 있다. worktree 제거가 실패
 순서를 뒤집으면 돌아갈 곳 없는 worktree라는 더 나쁜 잔해가 생긴다.
 "본진 무흔적"은 git 이력 기준이다. slice 자체의 기록(`.aidev/slices/<id>/`)은
 **남긴다** — worktree를 버려도 무엇을 왜 했는지는 남아야 하기 때문이다.
+
+**제거는 원자적이지 않다**(v0.5). `git worktree remove`는 등록 해제와 디렉터리 삭제
+**두 가지**이고, 실측 2026-08-18에 앞의 것만 하고 뒤의 것에서 실패했다. 그러면 git이
+모르는 고아 폴더가 남는데, `--resume-slice`는 "더 이상 등록돼 있지 않다"며 거부하고
+`--discard`를 다시 쳐도 등록 없는 경로라 git이 또 거절한다 — **출구가 없었다.** 지금은
+네 단계다.
+
+- **선검사.** 잠긴 worktree, 등록됐는데 디스크에 없는 경로처럼 애초에 통할 수 없는
+  상태면 **아무것도 건드리기 전에** 거부하고 풀 명령(`worktree unlock` / `worktree prune`)을
+  준다. 실패한 게 아니라 시작하지 않은 것이므로 slice는 그대로다.
+- **실패 후 재측정.** git이 무엇을 남겼는지 **가정하지 않고 다시 잰다.** 등록도 폴더도
+  그대로면 아무것도 안 바뀐 것이고, 폴더가 이미 없으면 목표에 도달한 것이라 브랜치
+  삭제로 넘어간다.
+- **등록 복원.** 등록만 사라졌으면 `git worktree repair`로 되살려 본다. 되살아났는지는
+  `find_worktree`로 **측정**한다(최선 노력이다 — admin 디렉터리가 통째로 없거나 구버전
+  git이면 못 되살린다). 되살아나면 원상 복구이므로 다시 치면 된다.
+- **고아 폴더는 케이스지 에러가 아니다.** 되살릴 수 없으면 `state.json`에
+  `discard_failed`로 적고 복구 3종을 찍는다. 그 중 셋째가 `--discard` 재실행인데,
+  **등록 없는 디렉터리는 이제 우리가 지운다.** 지우는 조건은 셋 다 만족할 때뿐이다 —
+  state.json이 기록한 그 slice의 workspace이고, 어떤 worktree로도 등록돼 있지 않고,
+  사람이 `--discard`를 직접 쳤을 때.
+
+어느 분기에서도 **브랜치를 먼저 지우지 않는다.** 성공하면 `discard_failed`는 지워진다.
 
 `--no-worktree`를 주면 v0.2처럼 repo 안에서 직접 돈다. 경고를 찍고, v0.2의 dirty
 검사가 그대로 살아난다. git이 없거나 git repo가 아닌 디렉터리에서의 유일한 길이다.
@@ -409,6 +437,28 @@ aidev pipeline --repo ~/jokertest --replan 20260817-doctor
   plan이 바뀌면 그 아래는 전부 다시 결정될 일이다.
 - `state.json`에 `replans` / `rejections`가 append-only로 쌓인다.
 
+**승인 조건 승계.**
+
+실측 2026-08-17/18: `approved: scope=A만`이라고 써서 plan을 승인했는데, 그 문구가
+**어디에도 남지 않았다.** 파서가 `approved:` 뒤를 버리고 있었다. attempt 1이 죽고
+attempt 2가 새 세션으로 뜨자 — 새 세션은 기억이 없다 — 조건 없는 plan만 보고 범위를
+넘겨 구현했다. 조건은 **누가 한 번 말한 문장이 아니라 state**다.
+
+- `approved: <조건>`의 문구를 `state.json`의 `stages.<단계>.approval_reason`에 기록한다.
+  새 키를 만들지 않은 이유가 있다: `--replan`이 재계획 때 그 키를 **지운다.** 반려된
+  plan에 붙었던 조건이 다음 사이클로 새는 것이 공짜로 막힌다. `--amend`는 지우지 않는데
+  그것도 맞다 — amend는 승인된 plan 위에서 도는 사이클이라 조건이 계속 유효하다.
+- 프롬프트의 **plan 블록 바로 아래**에 붙는다. 계획에 붙은 단서이므로 계획 옆이 제자리다.
+  *"이건 승인된 것의 일부다. 이번 회차를 포함해 모든 시도에 유효하고, 조건과 plan이
+  어긋나면 조건이 이긴다."*
+- 닿는 곳은 implement / test / diagnose, 그리고 **재시도·resume·repair·amend 전부**다.
+  프롬프트가 루프 회차마다 새로 만들어지므로 세션이 갈려도 따라간다.
+- 조건이 없는 그냥 `approved`는 **바이트 하나 달라지지 않는다**(하위 호환). 조건을
+  받아 적은 순간 `approval condition: ...` 한 줄을 찍는다 — 사람이 "기록됐다"를
+  믿는 게 아니라 본다.
+- desktop 셸(`parseDecision`)은 아직 승인 문구를 읽지 않는다. UI는 이번 범위 밖이고,
+  desktop이 쓰는 승인문은 항상 조건 없는 `approved`라 실제로 어긋나지는 않는다.
+
 **빈 requirement 가드.**
 
 실측 2026-08-17: 빈 requirement가 worktree와 브랜치와 plan 단계와 게이트까지 사고
@@ -563,8 +613,12 @@ approval: plan, implement    # 게이트 추가
 
 ```text
 approved              → 다음 단계 진행
+approved: 조건         → 진행하되, 조건이 이후 모든 단계·재시도·repair 프롬프트로 따라간다
 rejected: 사유         → slice 중단, 사유를 state.json에 기록
 ```
+
+`approved: scope=A만`처럼 조건을 붙이면 `state.json`에 기록되고 이후 프롬프트마다
+plan 바로 아래에 실린다(위 "승인 조건 승계"). 조건 없는 `approved`는 예전 그대로다.
 
 반려는 한 줄이면 충분하지만, 같은 디렉터리의 `rejected-detail.md`에 **대상 좌표 /
 문제 / 요구 / 범위**를 쓰면 `--replan`이 그걸 그대로 plan 단계에 물려준다(v0.5,
@@ -612,7 +666,23 @@ aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점�
 front matter 규약과 그대로 호환이고, 마커만 추가된다. 항목의 front matter는
 `approval:` / `setup:` / `test_commands:` / `max_turns:` / `model:` /
 `spec_check:` 여섯 키를 받고, **목록 전체를 먼저 검증한다** — 4번 항목의 오타가
-1~3번이 브랜치를 만들기 전에 걸린다.
+1~3번이 브랜치를 만들기 전에 걸린다. (여섯 키 전부를 실제로 검증한다. `model:`과
+`spec_check:`는 여기 적혀 있으면서 정작 검사에서 빠져 있었다 — 선언한 줄이 조용히
+아무 일도 안 하는 것은 아래 미지 키와 같은 결함이라 함께 닫았다.)
+
+**모르는 키는 무시하되 경고한다**(v0.5). 실측 2026-08-17: `model:`이 아직 미지 키이던
+시절 조용히 버려졌고, 그 바람에 **`max_turns` 적용까지 깨졌다.** 조용한 무시가 결함이지
+무시 자체가 결함은 아니다.
+
+```
+warning: front matter key(s) ignored: modle - known: approval, setup, test_commands, max_turns, model, spec_check
+```
+
+- **에러가 아니다.** 오타일 수도, 사람이 남긴 메모일 수도, 다음 버전이 추가할 키일 수도
+  있다. 그 중 어느 것도 slice를 죽일 값어치는 없다.
+- 발사 경로마다 **정확히 한 번** 찍힌다(`--requirement` / `--resume-slice` / `--amend` /
+  `--replan` / `--dry-run` 전부 front matter를 해석하는 한 곳을 지난다). epic 항목은
+  검증 단계에서 어느 항목인지까지 붙여 찍는다.
 
 ```markdown
 === SLICE 1: state.json에 memory 키 추가 ===
@@ -966,7 +1036,30 @@ aidev watch last         # 위와 동일
 aidev watch 20260813-22  # 특정 run (prefix 가능)
 aidev watch <run-id> --once      # 한 프레임만 찍고 종료
 aidev watch --interval 0.5       # 0.3~0.5로 clamp
+aidev watch --repo ~/jokertest   # 이 저장소(+그 slice worktree)의 run만 후보 (v0.5)
 ```
+
+**`last`가 죽은 run을 고르지 않는다**(v0.5). 실측 2026-08-18: **이틀 전에 죽은 run**에
+붙었다. 원인 둘 — ① 죽은 러너는 `live.json`을 `running`인 채로 남기는데 선택이 그
+`status`만 봤고 ② watch에 저장소 스코프가 아예 없어서 남의 저장소 run도 후보였다.
+
+- 선택 기준이 `status == running` **그리고 최근에 갱신됨**으로 바뀌었다. 무갱신 기준은
+  **30분**(`RUN_STALE_AFTER_S`)이다. 표시용 10초(위 STALE)와 **다른 숫자이고 달라야
+  한다** — 긴 Bash 호출 하나에 갇힌 세션은 이벤트를 전혀 못 내고, 검증 타임아웃이
+  정확히 그만큼(1800초)을 허용한다. 10초로 고르면 살아있는 run을 죽었다고 부른다.
+- 순서는 ① 스코프 안의 살아있는 running ② 없으면 stale-running이 아닌 최신 ③ 그래도
+  없으면 스코프 안의 최신이다. run이 있는데 "없다"고 하지는 않는다.
+- **잴 수 없으면 죽었다고 보지 않는다.** `updated_at`이 없으면 `live.json`의 mtime으로
+  대신 재고, 그것도 안 되면 stale 판정을 하지 않는다. 모르는 것과 아는 것은 다르고,
+  살아있는 run을 숨기는 쪽이 더 나쁜 실수다.
+- **명시한 run id는 언제나 이긴다.** `--repo`와 무갱신 판정은 `last`에만 적용된다.
+- `--repo`는 그 저장소와 **그 저장소의 slice worktree**(`<repo>-slices/`)를 함께 본다.
+  pipeline 단계의 run은 본진이 아니라 worktree 경로로 기록되기 때문이다. 소속을
+  기록하지 않은 run은 스코프에서 **뺀다** — 증명 못 하는 run을 넣는 것이 이 결함의
+  재발이다. `--worktree-root`로 경로 규칙 밖에 worktree를 만들었다면 run id를 직접 대야 한다.
+- **죽은 run에 붙어도 무한 폴링하지 않는다.** 예전 루프는 `status != running`일 때만
+  빠져서 영원히 돌았다. 이제 무갱신을 감지하면 한 줄 보고하고 끝낸다(exit 0 —
+  관찰이 실패한 게 아니라 관찰할 것이 끝난 것이다).
 
 ```
 AI DEV WATCH   20260813-221956-doctor
@@ -1028,7 +1121,8 @@ runner  ──write──>  live.json  <──read──  watcher (N개 가능)
 - **Ctrl+C는 watcher만 멈춘다** — 별도 프로세스이므로 runner는 영향이 없다.
   watcher를 `kill -9` 해도 runner는 끝까지 돈다.
 - **STALE 감지** — runner가 죽어서 `live.json`이 RUNNING인 채로 멈추면 10초 후
-  `STALE: no update for Ns`로 표시한다.
+  `STALE: no update for Ns`로 표시한다. 이건 **표시**용 숫자다. 어느 run에 붙을지
+  **고르는** 쪽은 30분을 쓴다(위 `last` 설명) — 다른 질문에 답하는 다른 숫자다.
 - run 종료 시 `live.json`은 **telemetry.json을 쓴 다음에** 마지막으로 갱신한다.
   watcher가 terminal status를 본 시점엔 최종 리포트가 반드시 디스크에 있다.
 

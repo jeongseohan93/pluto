@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import stat
@@ -1771,6 +1772,98 @@ def test_a_vanished_worktree_is_reported_not_recreated(repo, tmp_path, claude_bi
     assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
     err = capsys.readouterr().err
     assert "gone" in err and "--discard" in err
+    # both ways out are named: put it back, or give it up
+    assert "worktree repair" in err
+
+
+def break_the_removal(monkeypatch, orphan=True):
+    """Make ``git worktree remove`` fail the way it was measured failing on 2026-08-18.
+
+    With ``orphan``, the exact half-removed state: the admin directory under
+    .git/worktrees is deleted - so git no longer has the path registered - and
+    the worktree directory itself survives. Without it, nothing changes at all.
+    """
+    real = pipeline.workspace.worktree_remove
+
+    def refuse(repo, path):
+        if orphan:
+            marker = Path(path) / ".git"
+            if marker.is_file():
+                gitdir = marker.read_text(encoding="utf-8").split("gitdir:", 1)[-1].strip()
+                shutil.rmtree(gitdir, ignore_errors=True)
+        raise pipeline.workspace.GitError(
+            ["worktree", "remove", str(path)], 1, "fatal: failed to delete '{0}'".format(path)
+        )
+
+    monkeypatch.setattr(pipeline.workspace, "worktree_remove", refuse)
+    return real
+
+
+def test_discard_survives_a_half_removed_worktree(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """The measured dead end: unregistered, still on disk, and --discard could never finish."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    real_remove = break_the_removal(monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 2
+
+    err = capsys.readouterr().err
+    assert str(work) in err
+    assert "worktree prune" in err
+    assert "--discard {0}".format(slice_id) in err
+    # the branch is the way back, so it is never the thing that goes first
+    assert "slice/{0}".format(slice_id) in branches(repo)
+    state = state_of(repo)
+    assert state["status"] != "discarded"
+    assert state["discard_failed"]["path"] == str(work)
+    assert work.is_dir()  # the orphan, exactly as measured
+
+    # and the contract this defect was missing: the same command finishes the job
+    monkeypatch.setattr(pipeline.workspace, "worktree_remove", real_remove)
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
+    assert not work.exists()
+    assert not [name for name in branches(repo) if name.startswith("slice/")]
+    state = state_of(repo)
+    assert state["status"] == "discarded"
+    assert "discard_failed" not in state
+
+
+def test_discard_keeps_the_branch_when_the_worktree_will_not_go(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """Nothing changed: say so, keep the branch, and do not invent a repair."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    break_the_removal(monkeypatch, orphan=False)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 2
+
+    err = capsys.readouterr().err
+    assert "Nothing changed" in err and "run --discard again" in err
+    assert "slice/{0}".format(slice_id) in branches(repo)
+    assert str(work) in git(repo, "worktree", "list", "--porcelain").stdout
+    assert state_of(repo)["status"] != "discarded"
+    assert "discard_failed" not in state_of(repo)
+
+
+def test_discard_refuses_a_locked_worktree_before_touching_anything(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    work = worktree(repo, tmp_path, slice_id)
+    git(repo, "worktree", "lock", str(work))
+
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 2
+
+    err = capsys.readouterr().err
+    assert "locked" in err and "worktree unlock" in err
+    assert work.is_dir()
+    assert "slice/{0}".format(slice_id) in branches(repo)
+
+    git(repo, "worktree", "unlock", str(work))
+    assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
 
 
 # ------------------------------------------------- rollback / revert-merge
@@ -2578,6 +2671,166 @@ def test_replan_dry_run_says_what_it_would_undo_and_undoes_nothing(
     assert (slice_dir(repo) / "approvals" / "plan.md").exists()
 
 
+# ------------------------------------------------------- approval conditions
+#
+# Measured 2026-08-17/18: a plan approved with 'approved: scope=A only' was
+# implemented past that scope on attempt 2 - the words after 'approved:' were
+# dropped by the parser, so the second session, which by design remembers
+# nothing, had never been told. The condition is state now, and every prompt
+# built from that state carries it.
+
+
+def approve_the_gate_saying(repo, monkeypatch, text):
+    """Approve the plan gate with a condition written after the word."""
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            text, encoding="utf-8"
+        ),
+    )
+
+
+def test_an_approval_condition_reaches_implement_and_the_retry(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    requirement(repo)  # no front matter: the plan gate is on
+    git_repo(repo)
+    approve_the_gate_saying(repo, monkeypatch, "approved: scope=A only\n")
+    monkeypatch.setenv("AIDEV_FAKE_FAIL_AFTER", "1")  # plan lands, implement dies
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    slice_id = state_of(repo)["slice_id"]
+    assert state_of(repo)["stages"]["plan"]["approval_reason"] == "scope=A only"
+    assert "approval condition: scope=A only" in capsys.readouterr().out
+
+    monkeypatch.delenv("AIDEV_FAKE_FAIL_AFTER")
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+
+    implements = [
+        call["prompt"] for call in invocations(log) if "IMPLEMENT stage" in call["prompt"]
+    ]
+    assert len(implements) == 2  # the one that died, and the fresh session after it
+    for prompt in implements:
+        assert "APPROVAL CONDITIONS" in prompt
+        assert "- plan: scope=A only" in prompt
+    # the second session is a new one - which is exactly where the condition was lost
+    assert "A previous attempt at this stage failed" in implements[1]
+
+
+def test_a_plain_approval_leaves_the_prompt_exactly_as_it_was(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """'approved' with nothing after it is the whole contract it always was."""
+    requirement(repo)
+    git_repo(repo)
+    approve_the_gate(repo, monkeypatch)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert "approval_reason" not in state_of(repo)["stages"]["plan"]
+    for call in invocations(log):
+        assert "APPROVAL CONDITIONS" not in call["prompt"]
+
+
+def test_build_prompt_carries_the_condition_into_a_repair():
+    repair = {"n": 1, "failure": "3 tests failed", "diagnosis": ""}
+    without = pipeline.build_prompt("implement", "req", "the plan", repair=repair)
+    with_condition = pipeline.build_prompt(
+        "implement",
+        "req",
+        "the plan",
+        repair=repair,
+        approvals=[{"stage": "plan", "comment": "scope=A"}],
+    )
+
+    assert "VERIFICATION FAILED" in with_condition
+    assert "APPROVAL CONDITIONS" in with_condition and "- plan: scope=A" in with_condition
+    # no condition means the prompt is byte for byte what it was before conditions existed
+    assert "APPROVAL CONDITIONS" not in without
+    assert pipeline.build_prompt("implement", "req", "the plan", repair=repair, approvals=()) == without
+
+
+def test_approval_conditions_reads_only_approved_stages_and_changes_nothing():
+    state = {
+        "stage_order": ["plan", "implement", "test"],
+        "stages": {
+            "plan": {"approval": pipeline.APPROVED, "approval_reason": "scope=A"},
+            "implement": {"approval": pipeline.REJECTED, "approval_reason": "too broad"},
+            "test": {"approval": pipeline.APPROVED},  # approved with nothing said
+        },
+    }
+    before = copy.deepcopy(state)
+
+    assert pipeline.approval_conditions(state) == [{"stage": "plan", "comment": "scope=A"}]
+    # a prompt builder that grows state.json would blur the single-writer rule
+    assert state == before
+    assert pipeline.approval_conditions({}) == []
+
+
+# -------------------------------------------------- unknown front matter keys
+#
+# Measured 2026-08-17: 'model:' was written before the tool knew the key. It was
+# dropped in silence and the run went on with a budget nobody asked for.
+
+
+def test_an_unknown_front_matter_key_warns_and_is_ignored(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    requirement(
+        repo,
+        front="approval: none\nmodle: claude-opus-5\nmax_turns: implement=90",
+    )
+    git_repo(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+
+    out = capsys.readouterr().out
+    assert "front matter key(s) ignored: modle" in out
+    assert "known: approval, setup, test_commands, max_turns, model, spec_check" in out
+    # the measured defect itself: the unknown key must not break the known ones
+    implement = invocations(log)[1]["argv"]
+    assert implement[implement.index("--max-turns") + 1] == "90"
+
+
+@pytest.mark.parametrize(
+    "front, expected",
+    [
+        ("approval: none", []),
+        ("approval: none\nmax-turns: 120", []),  # a dash is the same key
+        ("model: claude-opus-5\nspec_check: off\nsetup: npm ci", []),
+        ("titel: 오타\nmodle: claude-opus-5", ["titel", "modle"]),
+    ],
+)
+def test_unknown_front_matter_keys(front, expected):
+    fields, _ = pipeline.parse_front_matter("---\n{0}\n---\nbody\n".format(front))
+    assert pipeline.unknown_front_matter_keys(fields) == expected
+    warning = pipeline.warn_unknown_front_matter(fields, "tasks/doctor.md")
+    if expected:
+        assert warning.startswith("warning: front matter key(s) ignored: ")
+        assert warning.endswith("(tasks/doctor.md)")
+    else:
+        assert warning == ""
+
+
+def test_every_known_front_matter_key_has_a_reader():
+    """The list and the readers move together, or the list is a lie."""
+    fields = {key: "" for key in pipeline.KNOWN_FRONT_MATTER_KEYS}
+    assert pipeline.unknown_front_matter_keys(fields) == []
+    assert set(pipeline.KNOWN_FRONT_MATTER_KEYS) == {
+        "approval", "setup", "test_commands", "max_turns", "model", "spec_check"
+    }
+
+
+def test_the_dry_run_warns_before_anything_is_built(repo, tmp_path, claude_bin, capsys):
+    """A typo is worth hearing about at the one point that costs nothing to retry."""
+    requirement(repo, front="approval: plan\nmodle: claude-opus-5\nmax_turns: implement=90")
+    assert run_slice(repo, tmp_path, claude_bin, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "front matter key(s) ignored: modle" in out
+    # and the known key it used to break is still read
+    assert "implement=90" in out
+
+
 # ------------------------------------------------------------------ model mix
 #
 # One line, the same grammar as max_turns: the stages differ in what they are
@@ -2854,6 +3107,9 @@ def test_front_matter_survives_a_bom_and_crlf():
         ("approved\n", pipeline.APPROVED, ""),
         ("# comment\n\napproved\n", pipeline.APPROVED, ""),
         ("APPROVED", pipeline.APPROVED, ""),
+        # a condition written after the word is kept, and is not a rejection
+        ("approved: scope=A only\n", pipeline.APPROVED, "scope=A only"),
+        ("approve: 선구현 금지", pipeline.APPROVED, "선구현 금지"),
         ("rejected: too broad\n", pipeline.REJECTED, "too broad"),
         ("reject: nope", pipeline.REJECTED, "nope"),
         ("rejected\n", pipeline.REJECTED, ""),

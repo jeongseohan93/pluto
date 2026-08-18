@@ -469,6 +469,10 @@ def test_a_bad_front_matter_line_names_the_item(tmp_path):
         ("max_turns: abc", "positive whole number"),
         ("test_commands: npm test && rm -rf /", "not allowed"),
         ("test_commands:", "needs a command"),
+        # the README said six keys were validated and four of them were
+        ("model: planz=claude-opus-5", "unknown stage 'planz'"),
+        ("model: implement=", "no model"),
+        ("spec_check: maybe", "needs 'on' or 'off'"),
     ],
 )
 def test_a_listed_slice_with_a_bad_new_key_is_refused_before_anything_runs(
@@ -483,6 +487,18 @@ def test_a_listed_slice_with_a_bad_new_key_is_refused_before_anything_runs(
         epic_module.validate_items(items, tmp_path / "slices.md")
     message = str(excinfo.value)
     assert "slice 2" in message and "나쁨" in message and needle in message
+
+
+def test_a_listed_slice_with_an_unknown_key_is_warned_about_not_refused(tmp_path, capsys):
+    """A whole queue is worth running with one line ignored - but not in silence."""
+    _, items = epic_module.parse_slices(
+        "=== SLICE 1: 좋음 ===\n---\napproval: none\nmodle: claude-opus-5\n---\n# 좋음\n\n본문.\n"
+    )
+    epic_module.validate_items(items, tmp_path / "slices.md")
+
+    out = capsys.readouterr().out
+    assert "front matter key(s) ignored: modle" in out
+    assert "slice 1" in out and "좋음" in out
 
 
 def test_the_decompose_prompt_quotes_the_budget_decompose_actually_gets(tmp_path):
