@@ -375,11 +375,162 @@ def read_telemetry(run_dir: Path) -> Optional[Dict[str, Any]]:
     return read_json_tolerant(Path(run_dir) / "telemetry.json")
 
 
-def find_running_run(runs_root: Path) -> Optional[Path]:
-    """Newest run whose live.json still says ``running``."""
-    for path in reversed(list_run_dirs(runs_root)):
+# --------------------------------------------------- which run is still alive
+#
+# Measured 2026-08-18: `aidev watch` attached to a run that had died two days
+# earlier. A killed runner leaves live.json saying ``running`` forever, so the
+# status alone cannot answer "is anyone still working on this".
+
+# The threshold for *choosing* a run, which has to be far more generous than the
+# one for *displaying* it (reporter.STALE_AFTER_S, 10 seconds): a session inside
+# one long Bash call emits no events at all, and verify.VERIFY_TIMEOUT_S allows
+# exactly this much of it. Beyond that there is no runner, only a stale file.
+RUN_STALE_AFTER_S = 1800.0
+
+
+def live_age(
+    live: Optional[Dict[str, Any]],
+    run_dir: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> Optional[float]:
+    """Seconds since this run last published anything, or ``None`` if unmeasurable.
+
+    @param live     the parsed live.json
+    @param run_dir  where it lives, so the file's mtime can stand in for a
+                    missing ``updated_at``
+    @param now      the current time, for tests
+    @flow  updated_at -> live.json mtime -> None
+    주요 내부 변수: stamp(마지막 갱신 시각)
+    """
+    now = time.time() if now is None else now
+    stamp = (live or {}).get("updated_at")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        stamp = None
+        if run_dir is not None:
+            try:
+                stamp = Path(run_dir).joinpath(LIVE_FILENAME).stat().st_mtime
+            except OSError:
+                stamp = None
+    if stamp is None:
+        return None
+    return max(0.0, now - float(stamp))
+
+
+def is_stale(
+    live: Optional[Dict[str, Any]],
+    run_dir: Optional[Path] = None,
+    now: Optional[float] = None,
+    stale_after: float = RUN_STALE_AFTER_S,
+) -> bool:
+    """Has nobody updated this run for long enough that its runner must be gone?
+
+    A run whose age cannot be measured is never called stale: not knowing is not
+    the same as knowing it is dead, and hiding a live run is the worse mistake.
+
+    @param live         the parsed live.json
+    @param run_dir      where it lives, for the mtime fallback
+    @param now          the current time, for tests
+    @param stale_after  how many seconds of silence is too many
+    """
+    age = live_age(live, run_dir, now)
+    return age is not None and age > stale_after
+
+
+def run_repo(run_dir: Path) -> Optional[str]:
+    """Which repository (or worktree) this run worked in, or ``None`` if it never said.
+
+    ``run.json`` is written when the run *starts*, so a run still going has it.
+
+    @param run_dir  the run directory
+    @flow  run.json config.repo -> telemetry.json repo -> None
+    주요 내부 변수: meta(run.json), config(그 안의 실행 설정)
+    """
+    meta = read_json_tolerant(Path(run_dir) / "run.json")
+    config = (meta or {}).get("config")
+    if isinstance(config, dict):
+        repo = config.get("repo")
+        if isinstance(repo, str) and repo.strip():
+            return repo
+    telemetry = read_json_tolerant(Path(run_dir) / "telemetry.json")
+    repo = (telemetry or {}).get("repo")
+    return repo if isinstance(repo, str) and repo.strip() else None
+
+
+def _normalised(path: Any) -> Optional[str]:
+    """One comparable form of a path, the way ``workspace._same_path`` compares them.
+
+    @param path  anything path-shaped, or empty for "nothing to compare"
+    """
+    if not path:
+        return None
+    try:
+        resolved = Path(str(path)).resolve()
+    except OSError:
+        resolved = Path(str(path))
+    return os.path.normcase(str(resolved))
+
+
+def in_repo_scope(
+    repo_of_run: Optional[str], repo: Path, worktree_root: Optional[Path] = None
+) -> bool:
+    """Does a run that worked in ``repo_of_run`` belong to ``repo``?
+
+    A pipeline stage records the *worktree* it ran in, not the user's checkout,
+    so the slice worktree root counts as inside the scope too. A run that never
+    recorded where it worked is out: a run that cannot prove it belongs here is
+    exactly the one that attached to the wrong repository.
+
+    @param repo_of_run    what ``run_repo`` returned
+    @param repo           the repository the scope is about
+    @param worktree_root  where this repo's slice worktrees live, if known
+    @flow  unrecorded -> False ; repo or below -> True ; worktree root or below -> True
+    주요 내부 변수: target(비교 가능한 형태의 run 경로), roots(허용 범위)
+    """
+    target = _normalised(repo_of_run)
+    if target is None:
+        return False
+    roots = [_normalised(repo), _normalised(worktree_root)]
+    for root in roots:
+        if root is None:
+            continue
+        if target == root or target.startswith(root + os.sep):
+            return True
+    return False
+
+
+def runs_for_repo(
+    runs_root: Path, repo: Optional[Path] = None, worktree_root: Optional[Path] = None
+) -> List[Path]:
+    """Run directories in scope, oldest first. Without ``repo`` that is all of them.
+
+    @param runs_root      where runs are stored
+    @param repo           limit to runs that worked in this repository
+    @param worktree_root  where this repo's slice worktrees live, if known
+    """
+    dirs = list_run_dirs(runs_root)
+    if repo is None:
+        return dirs
+    return [path for path in dirs if in_repo_scope(run_repo(path), repo, worktree_root)]
+
+
+def find_running_run(
+    runs_root: Path,
+    repo: Optional[Path] = None,
+    worktree_root: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> Optional[Path]:
+    """Newest run that says ``running`` *and* has been updated recently enough to mean it.
+
+    @param runs_root      where runs are stored
+    @param repo           limit to runs that worked in this repository
+    @param worktree_root  where this repo's slice worktrees live, if known
+    @param now            the current time, for tests
+    @flow  newest first -> status running -> not stale -> that one
+    주요 내부 변수: live(그 run의 live.json)
+    """
+    for path in reversed(runs_for_repo(runs_root, repo, worktree_root)):
         live = read_live(path)
-        if live and live.get("status") == "running":
+        if live and live.get("status") == "running" and not is_stale(live, path, now):
             return path
     return None
 

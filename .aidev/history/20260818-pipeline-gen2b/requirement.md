@@ -1,6 +1,6 @@
 ---
 approval: plan
-max_turns: implement=160
+max_turns: implement=120
 ---
 # 파이프라인 2세대 B — 규격 마무리 + 실측 수리
 

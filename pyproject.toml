@@ -7,7 +7,10 @@ name = "ai-dev-orchestrator"
 version = "0.4.0"
 description = "Telemetry runner and slice pipeline for Claude Code: raw stream-json capture, tool/file accounting, context hotspot reports, unattended plan/implement/test loop in an isolated git worktree, and an epic decomposed into an approved queue of those slices."
 readme = "README.md"
-requires-python = ">=3.9"
+# 3.10, measured 2026-08-18 on macOS: aidev/verify.py calls
+# Path.write_text(..., newline="\n"), and that argument only exists from 3.10.
+# On 3.9 it is a TypeError at the moment verification writes its log.
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 

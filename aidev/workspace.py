@@ -333,6 +333,69 @@ def worktree_remove(repo: Path, path: Path) -> None:
     git(repo, "worktree", "remove", "--force", str(path))
 
 
+# ``git worktree remove`` is not one operation: it unregisters and then deletes,
+# and measured 2026-08-18 it can do the first and fail the second. The three
+# functions below exist so a caller can look before it leaps, put the registration
+# back if it can, and finish the job by hand if it cannot.
+
+
+def removal_blockers(repo: Path, path: Path) -> List[str]:
+    """Why ``git worktree remove`` cannot work here. Empty means it is worth trying.
+
+    @param repo  the repository the worktree is registered with
+    @param path  the worktree
+    @flow  not registered -> nothing to say ; locked -> unlock ; missing on disk -> prune
+    주요 내부 변수: entry(git이 아는 등록 정보), reasons(막는 이유들)
+    """
+    entry = find_worktree(repo, path)
+    if entry is None:
+        return []
+    reasons: List[str] = []
+    if entry.locked:
+        reasons.append(
+            "the worktree is locked: {0}\n"
+            "    unlock it first: git -C {1} worktree unlock {0}".format(path, repo)
+        )
+    if not Path(path).exists():
+        reasons.append(
+            "registered but missing on disk: {0}\n"
+            "    clear the registration first: git -C {1} worktree prune".format(path, repo)
+        )
+    return reasons
+
+
+def repair_worktree(repo: Path, path: Path) -> bool:
+    """Try to put a lost registration back, and *measure* whether it came back.
+
+    Best effort by design: ``git worktree repair`` cannot help when the admin
+    directory itself is gone, and old git has no such subcommand at all. Neither
+    is an error here - the answer is simply False.
+
+    @param repo  the repository the worktree belongs to
+    @param path  the worktree
+    """
+    run(repo, ["worktree", "repair", str(path)], check=False)
+    return find_worktree(repo, path) is not None
+
+
+def remove_tree(path: Path) -> Optional[str]:
+    """Delete a directory this tool created, returning why it could not rather than raising.
+
+    Not an exception to "we never clean up leftovers": the only caller is a human
+    typing ``--discard`` about a path the slice's own state.json recorded.
+
+    @param path  the directory to delete
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    try:
+        shutil.rmtree(str(target))
+    except OSError as exc:
+        return str(exc)
+    return "the directory is still there after deleting it" if target.exists() else None
+
+
 def delete_branch(repo: Path, name: str) -> Optional[str]:
     """Delete a branch and return the commit it pointed at, so it can be recovered."""
     sha = resolve_commit(repo, "refs/heads/{0}".format(name))
