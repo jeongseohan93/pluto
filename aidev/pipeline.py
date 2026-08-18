@@ -50,7 +50,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, events as ev, progress, reporter, runner, specs, verify, workspace
+from . import __version__, events as ev, graph, progress, reporter, runner, specs, verify, workspace
 from .verify import split_command
 from .storage import (
     Database,
@@ -1910,6 +1910,8 @@ class PipelineConfig:
     # about the user's project.
     spec_check: bool = True
     verify_engine: bool = True
+    # v0.6: after a stage commit the function graph is *marked* stale, not rebuilt.
+    graph_hook: bool = True
     output_diet: bool = True
     write_guard: bool = True
     max_repairs: int = DEFAULT_MAX_REPAIRS
@@ -2782,6 +2784,16 @@ def commit_stage(
     ``label`` is what the commit is called and how it is keyed in ``commits``;
     it defaults to the stage. An amend cycle passes ``amend1/implement``, so the
     original ``implement`` commit survives beside it.
+
+    A successful commit also marks the function graph stale (v0.6). The marking
+    cannot fail the commit: the graph is a cache of what was just committed.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice's directory on disk
+    @param state  the slice state the commit sha is written into
+    @param stage  which stage just finished
+    @param label  the commit's name, defaulting to the stage
+    @flow  no worktree -> nothing ; too many files -> refuse ; commit -> record -> mark the graph
     """
     if cfg.workspace is None:
         return None
@@ -2805,7 +2817,29 @@ def commit_stage(
         if stage in stage_order(state):
             stage_entry(state, stage)["commit"] = sha
         say("committed {0} ({1})".format(COMMIT_MESSAGE.format(rec.slice_id, label), sha[:7]))
+        mark_graph_stale(cfg, label)
     return None
+
+
+def mark_graph_stale(cfg: PipelineConfig, label: str) -> None:
+    """Tell the function graph the code moved. It refreshes when somebody asks it.
+
+    Lazy on purpose. Re-parsing here would spend a stage's worth of time on a
+    cache no stage reads yet, and every commit would pay it again; writing a
+    marker costs one line and the first ``aidev graph`` query after the commit
+    pays only for the files that actually changed. A cache must never be able to
+    fail a slice, so every failure here is one warning and nothing else.
+
+    @param cfg    the slice's configuration - --no-graph turns this off entirely
+    @param label  what was just committed, written into the marker for a reader
+    @flow  hook off -> return ; mark -> done ; anything raised -> one warning line
+    """
+    if not cfg.graph_hook:
+        return
+    try:
+        graph.mark_dirty(cfg.cwd, reason="stage commit: {0}".format(label))
+    except Exception as exc:  # a derived cache does not get to stop the pipeline
+        say("warning: graph not marked stale ({0})".format(exc))
 
 
 # ------------------------------------------------------------- verify engine
@@ -3661,7 +3695,7 @@ def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def add_parser(sub: Any) -> Any:
-    """Register the ``aidev pipeline`` subcommand and all of its flags.
+    """Register the ``aidev pipeline`` subcommand and all of its flags, ``--no-graph`` included.
 
     @param sub  the subparsers object from ``cli.build_parser``
     """
@@ -3830,6 +3864,11 @@ def add_parser(sub: Any) -> Any:
         help="do not check that changed functions carry a spec comment",
     )
     cmd.add_argument(
+        "--no-graph",
+        action="store_true",
+        help="do not mark the function graph stale after a stage commit",
+    )
+    cmd.add_argument(
         "--permission-mode",
         default=None,
         help="for implement/test, e.g. bypassPermissions (plan stays readonly)",
@@ -3981,7 +4020,9 @@ def _config(
 
     CLI stage > front-matter stage > CLI base > front-matter base > the default.
     A caller with no front matter to offer (an epic's own decompose) gets exactly
-    what it got before. The ``model:`` line resolves by the same precedence.
+    what it got before. The ``model:`` line resolves by the same precedence, and
+    each ``--no-*`` switch (spec check, verify engine, graph hook, ...) turns one
+    default behaviour back off here.
 
     @param args           the parsed arguments
     @param repo           the user's repository
@@ -4040,6 +4081,7 @@ def _config(
         commit_file_limit=getattr(args, "commit_file_limit", MAX_COMMIT_FILES),
         spec_check=resolve_spec_check(fields) and not getattr(args, "no_spec_check", False),
         verify_engine=not getattr(args, "no_verify_engine", False),
+        graph_hook=not getattr(args, "no_graph", False),
         output_diet=not getattr(args, "no_output_diet", False),
         write_guard=not getattr(args, "no_write_guard", False),
         max_repairs=getattr(args, "max_repairs", DEFAULT_MAX_REPAIRS),
@@ -4163,6 +4205,7 @@ def launch_slice(
     @param epic              the epic this slice belongs to, when it has one
     @param quiet_unfinished  suppress the "other slices are open" notice, for a queue
     @flow  guard + validate front matter -> slice record -> workspace -> run_pipeline
+    주요 내부 변수: plan(worktree 계획, --no-worktree면 None), ws(만들어진 작업 공간)
     """
     body = guard_requirement(text, name)
     fields, _ = parse_front_matter(text)
@@ -4206,7 +4249,9 @@ def launch_slice(
 
     ws = None
     if plan is not None:
-        ws = _open_workspace(repo, plan, rec, state)
+        ws = _open_workspace(
+            repo, plan, rec, state, graph_hook=not getattr(args, "no_graph", False)
+        )
     rec.write_state(state)
 
     code = _finish(_config(args, repo, data_dir, ws, setup_command, fields), rec, state, body)
@@ -4262,13 +4307,26 @@ def _refuse_blocked_workspace(repo: Path, plan: workspace.WorkspacePlan) -> None
 
 
 def _open_workspace(
-    repo: Path, plan: workspace.WorkspacePlan, rec: SliceRecord, state: Dict[str, Any]
+    repo: Path,
+    plan: workspace.WorkspacePlan,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    graph_hook: bool = True,
 ) -> workspace.Workspace:
     """Create the worktree and make the requirement its first commit.
 
     The requirement being a commit rather than a working-tree file is what ends
     v0.2's circle, where copying the requirement in was itself what made the repo
     dirty enough to refuse the next stage.
+
+    This runs *before* ``_config`` does, so the one switch the requirement commit
+    can still observe is passed in by hand rather than read off a config.
+
+    @param repo        the user's repository
+    @param plan        where the worktree goes and which branch it carries
+    @param rec         the slice's directory on disk
+    @param state       the slice state this commit is recorded in
+    @param graph_hook  false when --no-graph asked for no function graph at all
     """
     injected = workspace.identity_args(repo)
     if injected:
@@ -4280,7 +4338,7 @@ def _open_workspace(
     say("  work  {0}  (branch {1} from {2})".format(ws.path, ws.branch, ws.base or "detached HEAD"))
     state["workspace"] = ws.to_dict()
 
-    cfg = PipelineConfig(repo=repo, data_dir=Path("."), workspace=ws)
+    cfg = PipelineConfig(repo=repo, data_dir=Path("."), workspace=ws, graph_hook=graph_hook)
     try:
         reason = commit_stage(cfg, rec, state, REQUIREMENT_STAGE)
         if reason is not None:

@@ -234,6 +234,30 @@ def porcelain(repo: Path) -> Optional[str]:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def list_files(repo: Path) -> Optional[List[str]]:
+    """Every tracked file plus every untracked one git is not ignoring, ``/`` separated.
+
+    The graph builder asks this instead of walking the tree: .gitignore is then
+    respected for free, so node_modules, build output and a repository's own
+    caches never reach the parser. ``None`` means git could not answer and the
+    caller has to walk.
+
+    ``-z`` because a path with a space or a quote comes back quoted otherwise.
+
+    @param repo  the repository or worktree to ask
+    @flow  no git -> None ; git fails -> None ; otherwise the NUL separated list
+    """
+    if not git_available():
+        return None
+    try:
+        proc = run(repo, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], check=False)
+    except GitError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return [entry for entry in proc.stdout.split("\0") if entry]
+
+
 def is_clean(repo: Path, tracked_only: bool = False) -> bool:
     status = porcelain(repo)
     if status is None:

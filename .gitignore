@@ -22,6 +22,11 @@ dist-electron/
 /data/runs/*
 !/data/runs/.gitkeep
 
+# Derived cache: the Function DB is rebuildable from the code at any moment.
+# aidev also writes .aidev/graph/.gitignore ('*') in whatever repo it indexes,
+# so this line is belt-and-braces for our own checkout.
+.aidev/graph/
+
 # Local agent config
 .claude/
 CLAUDE.local.md
