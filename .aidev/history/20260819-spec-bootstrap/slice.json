@@ -1,6 +1,6 @@
 {
   "slice_id": "20260819-spec-bootstrap",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260819-spec-bootstrap",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "491cd0a478e0eef9131be424d10477684cd79b2e",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 23,
+    "test_files": 2,
+    "budget": 140,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260819-040944-spec-bootstrap-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-19T04:09:44+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-040944-spec-bootstrap-plan",
+      "status": "completed",
+      "turns": 49,
+      "tokens": {
+        "input": 42,
+        "cache_creation": 140944,
+        "cache_read": 1437102,
+        "output": 43769,
+        "billed_input": 1578088,
+        "peak_context": 133657
+      },
+      "cost_usd": 3.2224259999999996
+    }
+  ],
+  "updated_at": "2026-08-19T04:19:05+09:00"
 }
