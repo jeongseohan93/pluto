@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260819-spec-bootstrap",
+  "status": "pending",
+  "branch": "slice/20260819-spec-bootstrap",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "491cd0a478e0eef9131be424d10477684cd79b2e",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-19T04:09:44+09:00"
+}
