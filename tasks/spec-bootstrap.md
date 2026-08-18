@@ -1,6 +1,6 @@
 ---
 approval: plan
-max_turns: implement=140
+max_turns: implement=160
 test_commands: python -m pytest -q
 ---
 # 명세 부트스트랩 — 핫 패스 함수 초벌 명세
