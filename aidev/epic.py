@@ -226,11 +226,12 @@ approval: plan
 === SLICE 2: <title> ===
 ...
 
-- The front matter accepts exactly four keys: 'approval:' (stage names, or the
+- The front matter accepts exactly six keys: 'approval:' (stage names, or the
   word none), 'setup:' (one plain command, no shell operators), 'test_commands:'
-  (how this project is verified, comma separated) and 'max_turns:' (a number, or
-  '<stage>=<number>'). If you are not sure, leave the line out and the defaults
-  apply.
+  (how this project is verified, comma separated), 'max_turns:' (a number, or
+  '<stage>=<number>'), 'model:' (a model name, or '<stage>=<model>') and
+  'spec_check:' (on/off). If you are not sure, leave the line out and the
+  defaults apply.
 - Any text before the first === marker is kept as a note and never executed.
 - Write the body in the language the epic is written in.
 """

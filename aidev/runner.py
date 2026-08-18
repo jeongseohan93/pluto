@@ -64,8 +64,21 @@ class RunConfig:
     resume_session: Optional[str] = None
     claude_cmd: List[str] = field(default_factory=lambda: ["claude"])
     extra_args: List[str] = field(default_factory=list)
+    # A settings file the CLI is pointed at with --settings. The pipeline writes
+    # one per slice to carry its hooks; the target repo's own .claude/settings.json
+    # is never touched.
+    settings_path: Optional[str] = None
+    # Extra environment for the child. Values are deliberately not stored in
+    # run.json - only the key names, so a path or a token cannot leak into it.
+    env: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """What run.json records about this run - every field except the prompt.
+
+        ``env`` is deliberately the sorted *key names* and not the values: the
+        environment carries paths and could one day carry a token, and run.json
+        is written to disk beside the events.
+        """
         return {
             "repo": str(self.repo),
             "prompt_path": str(self.prompt_path),
@@ -82,6 +95,8 @@ class RunConfig:
             "resume_session": self.resume_session,
             "claude_cmd": self.claude_cmd,
             "extra_args": self.extra_args,
+            "settings_path": self.settings_path,
+            "env": sorted(self.env),
         }
 
 
@@ -106,6 +121,10 @@ def resolve_disallowed_tools(cfg: RunConfig) -> Optional[str]:
 
 
 def build_command(cfg: RunConfig) -> List[str]:
+    """The headless ``claude`` argv this run needs. Order is the CLI's, not ours.
+
+    @param cfg  everything the run was configured with
+    """
     cmd = list(cfg.claude_cmd) + [
         "-p",
         "--output-format",
@@ -120,6 +139,8 @@ def build_command(cfg: RunConfig) -> List[str]:
         cmd += ["--permission-mode", cfg.permission_mode]
     if cfg.allowed_tools:
         cmd += ["--allowedTools", cfg.allowed_tools]
+    if cfg.settings_path:
+        cmd += ["--settings", str(cfg.settings_path)]
     disallowed = resolve_disallowed_tools(cfg)
     if disallowed:
         cmd += ["--disallowedTools", disallowed]
@@ -151,7 +172,13 @@ def execute(
     telemetry: Telemetry,
     on_event: Optional[EventHook] = None,
 ) -> RunResult:
-    """Run Claude to completion, feeding every event into ``telemetry``."""
+    """Run Claude to completion, feeding every event into ``telemetry``.
+
+    @param cfg        the run's configuration, including any extra environment
+    @param store      where raw events, stderr and run.json are written
+    @param telemetry  the accumulator every event is fed to
+    @param on_event   optional per-event hook, used for live views and snapshots
+    """
     command = resolve_command(build_command(cfg))
 
     process = subprocess.Popen(
@@ -164,6 +191,9 @@ def execute(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        # None keeps the child inheriting this process's environment exactly, so
+        # a run that declares nothing behaves as it always did.
+        env=({**os.environ, **cfg.env} if cfg.env else None),
     )
 
     stderr_thread = threading.Thread(

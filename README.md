@@ -287,6 +287,153 @@ plan 산출물이 파일 12개 이상 또는 테스트 파일 5개 이상을 지
 않고, 예산을 자기 마음대로 올리지도 않는다.** 규모는 `state.json`의 `plan_scale`에
 남는다.
 
+### 검증의 결정론화 (v0.5)
+
+실측 2026-08-16/17: slice 평균 $15에서 **검증 루프가 최대 지출원**이었다.
+근거 셋이 전부 같은 곳을 가리켰다.
+
+| 실측 | 원인 |
+| --- | --- |
+| test 단계 8회 중 8회 PASS, 회당 $0.4 | 에이전트를 불러 재실행+한 줄 기록만 시켰다. 정보 이득 0 |
+| implement 회전당 3~5턴 × 세션당 5~10회 | 매 수정 후 pytest 전량(233개)의 **통짜 출력**이 컨텍스트로 들어왔다 |
+| 실패·반려하면 재작업이 백지 재탐색 | 맥락이 세션과 함께 증발했다 |
+
+그래서 검증에서 **에이전트를 걷어내고**(엔진 직접 실행), 낭비의 기계적 원인은
+프롬프트 지시가 아니라 **기계**로 막는다. 실패했을 때만 규격화된 문서를 남긴다.
+
+**엔진 검증 — PASS 경로의 세션은 0개다.**
+
+`test_commands:`를 선언했으면 test 단계는 세션을 사지 않는다. 엔진이 그 명령을
+직접 돌리고, 통과하면 `state.json`에 기록하고 커밋하고 끝난다(비용 0). 명령이
+여럿이면 **첫 실패에서 멈춘다** — lint가 깨졌는데 테스트 전량을 또 도는 건 낭비다.
+미선언이면 v0.4의 에이전트 test 단계 그대로다(`--no-verify-engine`으로 강제할 수도
+있다). 판정은 `state.json`의 `test_verdict`에 그대로 남으므로 기존 reader는 바뀐 걸
+모른다.
+
+**실패하면 문서가 남고, 규모에 따라 진단을 산다.**
+
+```text
+FAIL → failure.md → 실패 N개 이하?  → 진단 없이 failure.md만 물려 implement 재시도
+                  → N개 초과/파싱실패 → diagnose 세션 1개 → diagnosis.md → 재시도
+재시도 한도 초과 → failure.md + diagnosis.md가 사람이 볼 보고서 (slice는 failed)
+```
+
+임계값은 `--diagnose-threshold`(기본 3), 재시도 한도는 `--max-repairs`(기본 1).
+`failure.md`에는 실행 명령/exit code/실패 테스트 목록(`파일:라인 — assert 메시지`)/
+카운트(성공은 **개수만**)/traceback 요약/직전 커밋이 들어가고, 전문은
+`verify/*.log`로만 남긴다. 출력을 파싱하지 못하면 원문 tail을 그대로 싣고 등급은
+**대형**으로 간다 — 요약할 수 없을 때가 진단이 가장 필요한 때다.
+진단 세션은 `readonly`라 코드를 고치지도 테스트를 다시 돌리지도 못한다. 기본 20턴.
+재시도 커밋은 `slice(<id>): repair1/implement` 형식이라 원래 커밋도 그대로 남는다.
+
+**출력 다이어트 — implement가 보는 것은 요약본뿐이다.**
+
+implement 단계에는 원본 테스트 명령 대신 `aidev verify` 하나만 허용한다. 이 래퍼는
+같은 명령을 돌리되 **실패분만** `파일:라인 — 메시지`로 찍고 성공은 개수만 찍는다.
+전문은 로그 파일로 간다. PostToolUse 훅은 이미 반환된 Bash 출력을 *줄일 수 없어서*
+(더할 수만 있다) 래퍼로 했다. `aidev`가 PATH에 없으면 다이어트를 끄고 원본 명령을
+주면서 한 줄 알린다. `--no-output-diet`로도 끈다.
+
+**Write 차단 — 기계 강제.**
+
+대형 파일을 통째로 Write로 재출력하는 것은 가장 비싼 토큰(출력)의 낭비다.
+PreToolUse 훅이 **이미 존재하는 파일에 대한 Write를 거부**하고(exit 2) 모델에게
+"Edit을 써라"고 알려준다. 신규 파일 생성은 그대로 허용한다.
+
+- 훅은 `<slice dir>/hooks/settings.json`에 쓰고 `--settings`로 넘긴다.
+  대상 repo의 `.claude/settings.json`은 **건드리지 않는다**(v0.2 규약 그대로).
+- 훅 스크립트는 무조건 **fail open**이다 — 입력을 못 읽거나 스키마가 바뀌면
+  exit 0으로 통과시킨다. 훅이 무시돼도 파이프라인은 v0.4처럼 돌 뿐이다.
+- `--no-write-guard`로 끄고, `AIDEV_WRITE_GUARD=off`로도 꺼진다.
+
+**함수 명세 규약 — 기계 검사.**
+
+이 slice부터 **신규·수정 함수는 명세 주석을 단다.** verify가 diff를 읽어 기계로
+검사하고, 위반이 있으면 FAIL이다(`failure.md`의 `Spec violations` 절).
+
+```python
+def run_verify(cfg, rec, state, requirement, amend=None):
+    """검증을 엔진이 직접 돌리고, 실패하면 등급에 따라 한 바퀴 고쳐 온다.   ← 기능 한 줄 (필수)
+
+    @param cfg          이 slice의 PipelineConfig                        ← 파라미터마다 (필수)
+    @param rec          SliceRecord - failure.md가 쓰이는 곳
+    ...
+    @flow  run_commands -> spec check -> failure.md -> 등급 -> diagnose?   ← 분기가 있을 때만
+    주요 내부 변수: attempt(1부터), result(VerifyResult)                   ← 임의
+    """
+```
+
+- 대상은 **이 slice의 diff에 걸린 함수만**이다. **기존 코드에 소급하지 않는다**
+  (자연 축적 원칙). 건드리지 않은 함수는 그대로 둔다.
+- 파이썬 파일만. 테스트 파일, `.aidev/` 하위, 중첩 함수, dunder(`__x__`)는 제외.
+  파싱되지 않는 파일은 통째로 건너뛴다 — 검사기가 FAIL의 원인이 되면 안 된다.
+- 잡는 것 셋: 명세 **없음**, `@param` **누락**, 함수를 고쳤는데 명세가 **무변경**.
+  마지막 것은 한 줄만 고친 큰 함수에도 문서 갱신을 요구한다. 의도된 것이고,
+  탈출구는 front matter `spec_check: off`(또는 `--no-spec-check`)다.
+- 커밋 범위를 알 수 없으면(`--no-worktree`, v0.2 레거시 state) **건너뛰고 알린다.**
+- implement는 `python -m aidev.specs --base <rev>`로 스스로 확인할 수 있다.
+
+**progress.md — 턴 소진 대비.**
+
+요구사항은 "턴 예산 90%에서 엔진이 세션에 신호 → 세션이 목록을 산출"이었지만,
+headless `claude -p`에는 **실행 중인 세션에 말을 거는 채널이 없다.** 그래서 엔진이
+텔레메트리에서 직접 쓴다 — 어떤 파일을 편집했고, 어떤 명령을 돌렸고, 마지막으로 뭐라
+했는지. 세션의 협조가 필요 없고, 그래서 **문장 도중에 죽은 세션에도 통한다.**
+
+- 쓰는 시점 둘: 턴이 예산의 90%에 닿았을 때, 그리고 단계가 **미완으로 끝날 때마다**.
+- `## Done`(편집된 파일 + 실행한 명령) / `## Remaining`(plan이 지목했는데 아직 손대지
+  않은 경로) / `## Last words` / `## Resume`(그대로 붙여넣을 명령).
+- resume 시 **그 단계가 아직 미완일 때만** 프롬프트에 주입한다. 끝난 단계의 메모를
+  주입하면 이미 커밋된 일을 설명하는 셈이라서다.
+- 주입 뒤에도 **지우지 않는다.** 사람이 볼 보고서이기도 하다.
+
+**반려 문서 규격 + 차분 재계획(`--replan`).**
+
+`rejected: <사유>` 한 줄은 **여전히 전체 계약이다**(하위 호환). 선택적으로
+`approvals/rejected-detail.md`(또는 `<stage>-rejected-detail.md`)에 **대상 좌표 /
+문제 / 요구 / 범위**를 쓰면 재계획에 그대로 주입된다. 범위의 기본값은 **부분 반려**이고,
+`전면`/`full rejection` 같은 말이 잡히면 전면 반려로 읽는다.
+
+```bash
+aidev pipeline --repo ~/jokertest --replan 20260817-doctor
+```
+
+- **반려된 slice를 resume하면 여전히 같은 승인 파일을 다시 읽고 멈춘다.** 그게 보호
+  장치라 그대로 둔다. 재계획은 사람이 명시적으로 시키는 별개 명령이다.
+- plan 단계에 **직전 plan 전문 + 반려 사유 + 반려 문서**를 주고, 부분 반려면
+  *"반려가 지목한 것만 고치고 나머지는 그대로 둬라 — 이건 rewrite가 아니라 diff다"*,
+  전면 반려면 *"처음부터 다시 계획해라"*를 붙인다.
+- **아무것도 지우지 않는다**: `plan.md` → `plans/001.md`, `approvals/plan.md` →
+  `approvals/plan-001.md`로 보존한다. 브랜치의 커밋도 되감지 않는다(그건
+  `--rollback --to plan`의 일이다). 대신 그 아래 단계는 전부 pending으로 되돌린다 —
+  plan이 바뀌면 그 아래는 전부 다시 결정될 일이다.
+- `state.json`에 `replans` / `rejections`가 append-only로 쌓인다.
+
+**빈 requirement 가드.**
+
+실측 2026-08-17: 빈 requirement가 worktree와 브랜치와 plan 단계와 게이트까지 사고
+나서야 들켰다. 네 진입점 중 둘만 검사하고 있었다. 이제 검사는 함수 하나이고
+**모든 진입점**(`--requirement` / `--epic` / `--resume-slice` / `--amend` /
+`--replan`)이 발사 시점에 부른다. 파일이 비었거나, front matter만 있고 본문이 없거나,
+본문이 사실상 비었으면 exit 2 + 그 셋을 구분하는 메시지다. 길이 하한은 **5자**로
+거의 0인데, 의도적이다 — 다섯 글자가 한 문장인 언어가 있고, 길이를 재는 가드는
+언어를 재는 가드가 된다.
+
+**모델 믹스.**
+
+```markdown
+---
+model: claude-sonnet-5                       # 모든 단계
+model: diagnose=claude-haiku-4-5             # 한 단계만
+model: claude-opus-5, diagnose=claude-sonnet-5
+---
+```
+
+`max_turns:`와 **같은 문법**이다. 두 줄이 같은 모양의 질문에 답하기 때문이다. 지정
+가능한 단계는 `plan` / `implement` / `test` / `diagnose` / `decompose`. CLI 쪽은
+`--model` / `--model-stage diagnose=...`. 기본값은 **현행 유지**(아무것도 안 주면
+CLI 기본이 그대로 간다). 오타난 단계, 빈 값, 한 단계를 서로 다르게 두 번은 거부한다.
+
 ### 사후 수정 (--amend, v0.4.1)
 
 완주한 slice에 사후 지시를 던지는 방법이 "새 requirement 작성"뿐이었다. 사후 감독
@@ -419,6 +566,10 @@ approved              → 다음 단계 진행
 rejected: 사유         → slice 중단, 사유를 state.json에 기록
 ```
 
+반려는 한 줄이면 충분하지만, 같은 디렉터리의 `rejected-detail.md`에 **대상 좌표 /
+문제 / 요구 / 범위**를 쓰면 `--replan`이 그걸 그대로 plan 단계에 물려준다(v0.5,
+위 "검증의 결정론화" 절). 범위의 기본은 **부분 반려**다.
+
 `#`으로 시작하는 줄은 무시하므로 템플릿 자체가 결정으로 읽히지 않는다.
 승인 전에 `plan.md`를 직접 고쳐도 된다 — implement는 **승인 시점의** plan.md를 읽는다.
 대기 중 프로세스를 죽여도 승인 파일이 곧 기록이라, `--resume-slice`로 이어가면
@@ -459,8 +610,9 @@ aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점�
 
 `slices.md`의 각 항목은 **그 자체로 실행 가능한 requirement**다. 형식은 기존
 front matter 규약과 그대로 호환이고, 마커만 추가된다. 항목의 front matter는
-`approval:` / `setup:` / `test_commands:` / `max_turns:` 네 키를 받고, **목록 전체를
-먼저 검증한다** — 4번 항목의 오타가 1~3번이 브랜치를 만들기 전에 걸린다.
+`approval:` / `setup:` / `test_commands:` / `max_turns:` / `model:` /
+`spec_check:` 여섯 키를 받고, **목록 전체를 먼저 검증한다** — 4번 항목의 오타가
+1~3번이 브랜치를 만들기 전에 걸린다.
 
 ```markdown
 === SLICE 1: state.json에 memory 키 추가 ===
@@ -573,7 +725,15 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 ├── plan.md          plan 산출물 (승인 전 사람이 고쳐도 된다)
 ├── state.json       진행 상태의 유일한 원천 (단일 writer = pipeline 프로세스)
 ├── approvals/
-│   └── plan.md      사람이 쓰는 승인 파일
+│   ├── plan.md               사람이 쓰는 승인 파일
+│   ├── rejected-detail.md    선택: 구조화된 반려 (대상/문제/요구/범위, v0.5)
+│   └── plan-001.md           --replan이 보존한 직전 승인 파일 (v0.5)
+├── plans/001.md     --replan이 보존한 직전 plan (v0.5)
+├── failure.md       검증이 실패했을 때만 (v0.5)
+├── diagnosis.md     대형 실패로 진단 세션을 샀을 때만 (v0.5)
+├── progress.md      단계가 미완으로 끝났거나 턴 90%에 닿았을 때만 (v0.5)
+├── verify/          검증 명령의 출력 전문 (attempt별 로그, v0.5)
+├── hooks/settings.json   Write 차단 훅 (--settings로 넘어간다, v0.5)
 ├── setup.log        setup을 선언했을 때만
 ├── rollbacks.json   번복 이력 (되돌린 적이 있을 때만, append-only)
 └── runs.json        단계 → run_id (상세는 data/runs/로 연결)
@@ -614,6 +774,10 @@ overwritten by merge"* 로 죽는다 — 본진에 그 파일이 이미 untracke
 v0.4.2가 더한 `rollback` / `revert` / `stages.*.rewound`도 같은 이유로 전부 optional이고,
 `schema`는 여전히 **2**다. status 값은 열린 집합이라 reader는 `rolled_back` /
 `reverted`를 모르더라도 **문자열 그대로 표시하면 된다.**
+v0.5가 더한 `repairs` / `replans` / `rejections` / `progress` /
+`stages.test.verify`도 전부 optional이라 `schema`는 **2 그대로다.** 반대로 v0.5는
+옛 state를 그대로 받는다 — `commits`도 `workspace`도 없는 v0.2 기록은 명세 검사가
+읽을 커밋 범위가 없으므로 **검사를 건너뛰고 그렇다고 알린 뒤** 계속 돈다.
 
 Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 WinError 5로 죽는다
 (CPython의 `open()`이 delete 공유를 주지 않는다). 지연이 아니라 순간 충돌이므로
@@ -622,14 +786,23 @@ Windows에서는 reader가 파일을 열고 있는 것만으로 `os.replace`가 
 
 ### 테스트 판정
 
-`claude` 프로세스는 테스트가 빨갛게 떠도 "정상 종료"한다. 그래서 exit code로는
-성공을 판정할 수 없다. test 단계에는 마지막 줄에 `TEST_RESULT: PASS` 또는
-`TEST_RESULT: FAIL`을 쓰라고 요구하고, 그 값을 `state.json`의
-`test_verdict`(+ `stages.test.verdict`)에 남긴다.
+**`test_commands:`를 선언했으면 엔진이 직접 돌리고 exit code로 판정한다**(v0.5,
+위 "검증의 결정론화" 절). 모델의 자기신고가 아니므로 판정은 결정론적이고, 세션은
+0개다.
 
-- `FAIL` → slice는 **failed**로 끝난다 (exit 1).
-- 줄이 아예 없으면 `unknown`으로 기록하고 요약에 표시한다. 아무 주장도 없는 걸
-  실패로 단정하지는 않지만, **절대 통과로도 읽히지 않는다.**
+아래는 **`test_commands:`를 선언하지 않은 폴백 경로**(또는 `--no-verify-engine`)에만
+남는 v0.4 규약이다. `claude` 프로세스는 테스트가 빨갛게 떠도 "정상 종료"하기 때문에
+exit code로는 성공을 판정할 수 없다. 그래서 test 단계에 마지막 줄로
+`TEST_RESULT: PASS` 또는 `TEST_RESULT: FAIL`을 쓰라고 요구한다.
+
+두 경로 모두 결과는 `state.json`의 `test_verdict`(+ `stages.test.verdict`)에 같은
+모양으로 남으므로, 기존 reader는 어느 쪽이 돌았는지 몰라도 된다. 엔진이 돌았을 때만
+`stages.test.verify`에 명령별 exit code와 로그 경로가 함께 남는다.
+
+- `FAIL` → 엔진 경로는 `failure.md`를 쓰고 등급에 따라 재시도한다. 폴백 경로는
+  v0.4 그대로 slice가 **failed**로 끝난다 (exit 1).
+- 폴백 경로에서 줄이 아예 없으면 `unknown`으로 기록하고 요약에 표시한다. 아무 주장도
+  없는 걸 실패로 단정하지는 않지만, **절대 통과로도 읽히지 않는다.**
 
 ### 실패와 쿼터
 
@@ -721,6 +894,18 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   선언하면 **그것만** 허용된다(위 "검증 명령" 절).
 - 단계별 `--max-turns` 기본 80. front matter `max_turns:`나 `--max-turns-stage`로
   단계별로 올릴 수 있다(위 "단계별 턴 예산" 절).
+- **이미 있는 파일에 대한 Write는 거부한다**(v0.5). PreToolUse 훅이 exit 2로 막고
+  "Edit을 써라"고 알려준다. 신규 파일 생성은 그대로 허용한다. 훅은 슬라이스
+  디렉터리의 `hooks/settings.json`에 쓰고 `--settings`로 넘기므로 대상 repo의
+  `.claude/settings.json`은 여전히 건드리지 않는다. 훅은 무조건 **fail open**이라
+  (입력을 못 읽으면 통과) 스키마가 바뀌어도 파이프라인이 벽돌이 되지 않는다.
+  `--no-write-guard` 또는 `AIDEV_WRITE_GUARD=off`로 끈다.
+- **이 slice가 고친 함수에 명세 주석이 없으면 verify가 FAIL이다**(v0.5).
+  대상은 diff에 걸린 파이썬 함수만이고, 테스트 파일·`.aidev/`·중첩 함수·dunder는
+  제외, **기존 코드에 소급하지 않는다.** 커밋 범위를 모르면 건너뛰고 알린다.
+  `spec_check: off` 또는 `--no-spec-check`로 끈다. (위 "검증의 결정론화" 절)
+- **빈 requirement는 발사 시점에 거부한다**(v0.5, exit 2). 모든 진입점이 같은
+  검사를 부른다.
 
 주요 옵션:
 
@@ -732,6 +917,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--resume-epic` | 중단된 에픽 큐를 실패 지점부터 이어가기 (id / prefix / `last`) |
 | `--list` | slice 목록과 상태 (에픽이 있으면 에픽 진행 상황도 위에 함께) |
 | `--amend` | 끝난 slice에 지시문 하나로 implement → test 한 바퀴 더 (v0.4.1) |
+| `--replan` | 반려된 slice의 plan 단계를 반려 문서와 함께 다시 열기 — 차분 재계획 (v0.5) |
 | `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
 | `--push` | `--merge`와 함께: base 브랜치만 원격에 push (slice 브랜치는 절대 안 함) |
 | `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
@@ -746,6 +932,15 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--commit-file-limit` | 단계 커밋이 건드릴 수 있는 최대 파일 수 (기본 2000) |
 | `--max-turns` | 모든 단계의 기본 상한 (기본 80) |
 | `--max-turns-stage` | 한 단계만 지정, `implement=140` (반복 가능, front matter보다 우선) |
+| `--model` | 모든 단계의 기본 모델 |
+| `--model-stage` | 한 단계만 지정, `diagnose=claude-haiku-4-5` (반복 가능, front matter보다 우선, v0.5) |
+| `--max-repairs` | 검증 실패가 implement를 다시 부를 수 있는 횟수 (기본 1, v0.5) |
+| `--diagnose-threshold` | 이 개수를 넘는 실패면 진단 세션을 산다 (기본 3, v0.5) |
+| `--verify-timeout` | 검증 명령 하나의 제한 시간 (기본 1800초, v0.5) |
+| `--no-verify-engine` | test 단계를 v0.4처럼 에이전트 세션으로 (v0.5) |
+| `--no-write-guard` | 기존 파일에 대한 Write 차단을 끈다 (v0.5) |
+| `--no-output-diet` | implement에 `aidev verify` 대신 원본 테스트 명령을 준다 (v0.5) |
+| `--no-spec-check` | 함수 명세 기계 검사를 끈다 (v0.5) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
 | `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
 | `--session-reset-after` | 같은 단계가 비쿼터 실패 N회면 새 session (기본 1) |
@@ -1081,10 +1276,16 @@ v0.1  Telemetry Runner            ← 완료
 v0.2  Slice Pipeline              ← 완료
 v0.3  Workspace 격리               ← 완료 (worktree / 브랜치 / 단계별 커밋 / merge·discard)
 v0.4  Epic → Slice Planner        ← 완료 (decompose / 목록 게이트 / 순차 큐 / --resume-epic)
-v0.5  Codebase Memory             ← 지금 여기
-v0.6  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
+v0.5  파이프라인 2세대              ← 완료 (엔진 검증 / 실패 문서 규격 / Write 차단 / 명세 검사)
+v0.6  Codebase Memory             ← 지금 여기
+v0.7  Pluto IDE 바인딩 (state.json / live.json → window.aidev)
       (v0.2.5에서 상태/plan/승인 3종 선행)
 ```
+
+v0.5는 새 기능이 아니라 **비용 구조를 고친 것**이다. 실측된 slice당 $15에서 검증
+루프가 최대 지출원이었고, 원인 셋(정보 이득 0인 test 세션 / 통짜 테스트 출력 /
+증발하는 실패 맥락)을 각각 엔진 실행·요약 래퍼·산출물 규격으로 막았다.
+프롬프트 지시는 하나만 늘렸다 — **기계 > 양식 > 지시** 순서다.
 
 Planner(에픽→slice 자동 분해)를 뒤로 미룬 이유: 그건 지금 사람이 직접 해도
 진행이 되지만, Pipeline(무인 실행 루프)이 없으면 사람이 자리를 비우는 순간 모든

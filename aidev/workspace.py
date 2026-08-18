@@ -169,6 +169,39 @@ def diff_paths(repo: Path, a: str, b: str) -> List[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def diff_unified(
+    repo: Path, a: str, b: str, paths: Sequence[str] = (), context: int = 0
+) -> str:
+    """A unified diff between two commits. Empty when git cannot answer.
+
+    ``context=0`` is the useful default here: the spec check attributes changed
+    *lines* to functions, and a hunk carrying three lines of context on each side
+    would claim the neighbours changed too.
+
+    @param repo     the repository or worktree to ask
+    @param a        the older commit
+    @param b        the newer commit
+    @param paths    pathspecs to limit the diff to, e.g. ``("*.py",)``
+    @param context  lines of context per hunk
+    """
+    args = ["diff", "--unified={0}".format(int(context)), "--no-color", a, b]
+    if paths:
+        args += ["--"] + [str(p) for p in paths]
+    proc = run(repo, args, check=False)
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def show_file(repo: Path, rev: str, path: str) -> Optional[str]:
+    """One file's contents at one commit, or ``None`` when it is not there.
+
+    @param repo  the repository or worktree to ask
+    @param rev   the commit
+    @param path  a repository-relative path
+    """
+    proc = run(repo, ["show", "{0}:{1}".format(rev, path)], check=False)
+    return proc.stdout if proc.returncode == 0 else None
+
+
 def branch_exists(repo: Path, name: str) -> bool:
     return run(
         repo, ["show-ref", "--verify", "--quiet", "refs/heads/{0}".format(name)], check=False
