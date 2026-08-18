@@ -1,6 +1,6 @@
 {
   "slice_id": "20260818-pipeline-gen2b",
-  "status": "running:implement",
+  "status": "running:test",
   "branch": "slice/20260818-pipeline-gen2b",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "f8d8bfedcf4eaf647977716a717801a9ca9341d9",
@@ -50,9 +50,10 @@
       "commit": "4f432ba6bfa77038dedde6d07b5c5b5c587f7a53"
     },
     "test": {
-      "status": "pending",
-      "run_id": "20260818-165501-pipeline-gen2b-test",
-      "attempts": 1
+      "status": "done",
+      "run_id": "20260818-181831-pipeline-gen2b-test-2",
+      "verdict": "pass",
+      "attempts": 2
     }
   },
   "runs": [
@@ -135,7 +136,23 @@
         "peak_context": 64808
       },
       "cost_usd": 1.8946305000000003
+    },
+    {
+      "stage": "test",
+      "attempt": 2,
+      "run_id": "20260818-181831-pipeline-gen2b-test-2",
+      "status": "completed",
+      "turns": 37,
+      "tokens": {
+        "input": 56,
+        "cache_creation": 75418,
+        "cache_read": 1666819,
+        "output": 26046,
+        "billed_input": 1742293,
+        "peak_context": 83533
+      },
+      "cost_usd": 2.239019500000001
     }
   ],
-  "updated_at": "2026-08-18T18:18:31+09:00"
+  "updated_at": "2026-08-18T18:34:51+09:00"
 }
