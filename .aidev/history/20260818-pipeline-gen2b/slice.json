@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260818-pipeline-gen2b",
+  "status": "pending",
+  "branch": "slice/20260818-pipeline-gen2b",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "f8d8bfedcf4eaf647977716a717801a9ca9341d9",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-18T15:53:08+09:00"
+}
