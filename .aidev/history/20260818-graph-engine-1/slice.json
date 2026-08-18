@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260818-graph-engine-1",
+  "status": "pending",
+  "branch": "slice/20260818-graph-engine-1",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9b00363951aa11e3b18813bb04c2d819840293e7",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-18T19:06:05+09:00"
+}
