@@ -1,6 +1,6 @@
 {
   "slice_id": "20260818-graph-engine-1",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260818-graph-engine-1",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9b00363951aa11e3b18813bb04c2d819840293e7",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 27,
+    "test_files": 4,
+    "budget": 160,
+    "warn": false
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260818-190606-graph-engine-1-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-18T19:06:05+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260818-190606-graph-engine-1-plan",
+      "status": "completed",
+      "turns": 34,
+      "tokens": {
+        "input": 42,
+        "cache_creation": 145660,
+        "cache_read": 1841790,
+        "output": 43477,
+        "billed_input": 1987492,
+        "peak_context": 145662
+      },
+      "cost_usd": 3.464629999999999
+    }
+  ],
+  "updated_at": "2026-08-18T19:16:31+09:00"
 }
