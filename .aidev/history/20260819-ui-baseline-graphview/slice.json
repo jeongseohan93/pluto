@@ -1,6 +1,6 @@
 {
   "slice_id": "20260819-ui-baseline-graphview",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260819-ui-baseline-graphview",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "51f0b3f6cfd536b7365f3fd83b039d275f000ea1",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 67,
+    "test_files": 7,
+    "budget": 160,
+    "warn": false
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260819-174419-ui-baseline-graphview-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-19T17:44:18+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-174419-ui-baseline-graphview-plan",
+      "status": "completed",
+      "turns": 86,
+      "tokens": {
+        "input": 126,
+        "cache_creation": 212269,
+        "cache_read": 7982457,
+        "output": 55751,
+        "billed_input": 8194852,
+        "peak_context": 219235
+      },
+      "cost_usd": 7.508323500000001
+    }
+  ],
+  "updated_at": "2026-08-19T17:58:10+09:00"
 }
