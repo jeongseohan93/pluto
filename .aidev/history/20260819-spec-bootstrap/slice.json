@@ -31,10 +31,12 @@
     "implement": {
       "status": "done",
       "run_id": "20260819-113014-spec-bootstrap-implement-2",
-      "attempts": 2
+      "attempts": 2,
+      "commit": "1c1b65841eab869d41615b489641355ac0673198"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -87,5 +89,5 @@
       "cost_usd": 5.875358499999998
     }
   ],
-  "updated_at": "2026-08-19T11:44:26+09:00"
+  "updated_at": "2026-08-19T11:47:04+09:00"
 }
