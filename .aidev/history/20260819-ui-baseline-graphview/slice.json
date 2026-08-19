@@ -1,6 +1,6 @@
 {
   "slice_id": "20260819-ui-baseline-graphview",
-  "status": "running:implement",
+  "status": "running:test",
   "branch": "slice/20260819-ui-baseline-graphview",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "51f0b3f6cfd536b7365f3fd83b039d275f000ea1",
@@ -32,10 +32,14 @@
     "implement": {
       "status": "done",
       "run_id": "20260819-185247-ui-baseline-graphview-implement-2",
-      "attempts": 2
+      "attempts": 2,
+      "commit": "7e46f0fb543d3164adae691901584ef3f228074a"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260819-185956-ui-baseline-graphview-test",
+      "verdict": "pass",
+      "attempts": 1
     }
   },
   "runs": [
@@ -86,7 +90,23 @@
         "peak_context": 364478
       },
       "cost_usd": 9.576889
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260819-185956-ui-baseline-graphview-test",
+      "status": "completed",
+      "turns": 7,
+      "tokens": {
+        "input": 10,
+        "cache_creation": 28031,
+        "cache_read": 142459,
+        "output": 2323,
+        "billed_input": 170500,
+        "peak_context": 36146
+      },
+      "cost_usd": 0.40966449999999993
     }
   ],
-  "updated_at": "2026-08-19T18:59:56+09:00"
+  "updated_at": "2026-08-19T19:04:00+09:00"
 }
