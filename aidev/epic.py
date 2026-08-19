@@ -226,12 +226,13 @@ approval: plan
 === SLICE 2: <title> ===
 ...
 
-- The front matter accepts exactly seven keys: 'approval:' (stage names, or the
+- The front matter accepts exactly nine keys: 'approval:' (stage names, or the
   word none), 'setup:' (one plain command, no shell operators), 'test_commands:'
   (how this project is verified, comma separated), 'max_turns:' (a number, or
   '<stage>=<number>'), 'model:' (a model name, or '<stage>=<model>'),
-  'spec_check:' (on/off) and 'briefing:' (on/off). If you are not sure, leave
-  the line out and the defaults apply.
+  'spec_check:' (on/off), 'briefing:' (on/off), 'auto_resume:' (on/off) and
+  'auto_extend:' (off/conservative/aggressive). If you are not sure, leave the
+  line out and the defaults apply.
 - Any text before the first === marker is kept as a note and never executed.
 - Write the body in the language the epic is written in.
 """
@@ -298,10 +299,11 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
     """Every item has to be a requirement this pipeline can actually run.
 
     Checked once, before the queue starts, so a typo in item 4 is not discovered
-    after items 1..3 have already built branches. All seven declared keys are
+    after items 1..3 have already built branches. All nine declared keys are
     read here: ``model:`` and ``spec_check:`` were documented as validated and
     were not, which is the same defect as a key that is ignored in silence, and
-    ``briefing:`` joins them here rather than repeating it.
+    ``briefing:`` and v0.7's two recovery switches join them here rather than
+    repeating it.
 
     @param items  the parsed slice list
     @param path   the file the list came from, named in every message
@@ -321,6 +323,8 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
             pipeline.resolve_models(fields)
             pipeline.resolve_spec_check(fields)
             pipeline.resolve_briefing(fields)
+            pipeline.resolve_auto_resume(fields)
+            pipeline.resolve_auto_extend(fields)
         except pipeline.PipelineError as exc:
             raise pipeline.PipelineError("{0}: {1}".format(where, exc))
         # Not an error: the queue is worth running with one line ignored, but
@@ -548,10 +552,24 @@ def _run_entry(
 
 def run_epic(args: Any, cfg: pipeline.PipelineConfig, erec: EpicRecord, state: Dict[str, Any],
              epic_body: str) -> int:
-    """Decompose, gate the list, then run the list in order."""
+    """Decompose, gate the list, then run the list in order.
+
+    The two things a resumed epic has to pick back up are the same two a resumed
+    slice does: an unfinished usage-limit wait, and any turn budget the engine
+    already raised for the decompose stage.
+
+    @param args       the parsed arguments, passed on to each queued slice
+    @param cfg        the epic's configuration - budgets, models, the worktree
+    @param erec       the epic record, whose state.json this writes
+    @param state      the epic's state, updated in place
+    @param epic_body  the epic requirement, which decompose is given
+    @flow  resume a wait and any extension -> decompose (readonly, verified after)
+           -> gate the list -> run the items in order
+    """
     repo = cfg.repo
     state.pop("reason", None)
     pipeline.resume_quota_wait(cfg, erec, state)
+    pipeline.restore_extensions(cfg, state)
 
     entry = pipeline.stage_entry(state, DECOMPOSE)
     if entry.get("status") != "done":

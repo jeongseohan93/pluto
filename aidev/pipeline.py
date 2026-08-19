@@ -56,6 +56,7 @@ from . import (
     events as ev,
     graph,
     progress,
+    recovery,
     reporter,
     runner,
     specs,
@@ -83,12 +84,17 @@ STAGES: Tuple[str, ...] = ("plan", "implement", "test")
 DEFAULT_GATES: Tuple[str, ...] = ("plan",)
 
 # Stages that are not slice stages but are still run, budgeted and modelled the
-# same way: an epic's 'decompose' and the repair loop's 'diagnose'.
+# same way: an epic's 'decompose', the repair loop's 'diagnose', and v0.7's
+# 'observe' - the outside eye a pathological turn death summons.
 DIAGNOSE_STAGE = "diagnose"
-TURN_STAGES: Tuple[str, ...] = STAGES + (DIAGNOSE_STAGE,)
-MODEL_STAGES: Tuple[str, ...] = STAGES + (DIAGNOSE_STAGE, "decompose")
-# A diagnosis that needs 80 turns is not a diagnosis. It reads and answers.
-STAGE_TURN_DEFAULTS: Dict[str, int] = {DIAGNOSE_STAGE: 20}
+OBSERVE_STAGE = "observe"
+TURN_STAGES: Tuple[str, ...] = STAGES + (DIAGNOSE_STAGE, OBSERVE_STAGE)
+# 'observe' joins these so the model mix reaches it with no new front matter key
+# at all: ``model: observe=claude-sonnet-5`` is 다른 눈, said in the existing grammar.
+MODEL_STAGES: Tuple[str, ...] = STAGES + (DIAGNOSE_STAGE, "decompose", OBSERVE_STAGE)
+# A diagnosis that needs 80 turns is not a diagnosis. It reads and answers, and
+# an observer reads even less: it is given the logs and nothing else.
+STAGE_TURN_DEFAULTS: Dict[str, int] = {DIAGNOSE_STAGE: 20, OBSERVE_STAGE: 20}
 
 # How each stage is constrained. plan may not touch the repository at all, so it
 # runs under the readonly profile with no permission mode to unlock it.
@@ -189,6 +195,16 @@ DEFAULT_MAX_TURNS = 80
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_QUOTA_WAIT_S = 15 * 60.0
 DEFAULT_QUOTA_MAX_RETRIES = 20
+
+# How far past the advertised reset a retry waits. 30s was the v0.6 figure; the
+# requirement raised it to 60 after two limit deaths in one night, one of which
+# came back to a limit that had not quite lifted.
+QUOTA_RESET_MARGIN_S = 60.0
+
+# 자동 연장의 세 모드. conservative is the default: one extension, no Observer -
+# the automation that costs at most one extra session per slice.
+AUTO_EXTEND_MODES: Tuple[str, ...] = ("off", "conservative", "aggressive")
+DEFAULT_AUTO_EXTEND = "conservative"
 
 # A resumed session carries its own conclusion with it ("I was blocked"), so
 # after this many consecutive non-quota failures of one stage the retry starts a
@@ -563,6 +579,56 @@ def resolve_briefing(fields: Dict[str, str]) -> bool:
     )
 
 
+def resolve_auto_resume(fields: Dict[str, str]) -> bool:
+    """Does a usage limit wait itself out and carry on? On unless told otherwise.
+
+    Off is for the human who would rather be told the reset time than have a
+    process sit on a terminal for four hours. It changes nothing about *what* is
+    recorded: the wait, its reset time and the resume command are written down
+    either way, and ``--resume-slice`` still finishes the remainder of the wait.
+
+    @param fields  the requirement's front matter
+    @flow  no line -> on ; off word -> off ; on word -> on ; anything else -> refuse
+    """
+    raw = fields.get("auto_resume")
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if value in _OFF_WORDS:
+        return False
+    if value in _ON_WORDS:
+        return True
+    raise PipelineError(
+        "auto_resume: needs 'on' or 'off', got {0!r}".format(raw.strip())
+    )
+
+
+def resolve_auto_extend(fields: Dict[str, str]) -> str:
+    """How far the engine may go on its own after a turn death: off / conservative / aggressive.
+
+    Not an on/off switch, because the two automatic answers cost different
+    amounts: an extension is one more session on the same work, an Observer is a
+    session that buys only an opinion. conservative allows the first and not the
+    second, which is the setting an unattended night is actually run at.
+
+    @param fields  the requirement's front matter
+    @flow  no line -> conservative ; a known mode -> itself ; anything else -> refuse
+    """
+    raw = fields.get("auto_extend")
+    if raw is None:
+        return DEFAULT_AUTO_EXTEND
+    value = raw.strip().lower()
+    if value in AUTO_EXTEND_MODES:
+        return value
+    if value in _OFF_WORDS:
+        return "off"
+    raise PipelineError(
+        "auto_extend: needs one of {0}, got {1!r}".format(
+            ", ".join(AUTO_EXTEND_MODES), raw.strip()
+        )
+    )
+
+
 # ------------------------------------------------------- unknown front matter
 #
 # Measured 2026-08-17: 'model:' was written into a requirement's front matter
@@ -581,6 +647,8 @@ KNOWN_FRONT_MATTER_KEYS: Tuple[str, ...] = (
     "model",
     "spec_check",
     "briefing",
+    "auto_resume",
+    "auto_extend",
 )
 
 
@@ -1327,6 +1395,36 @@ def stage_entry(state: Dict[str, Any], stage: str) -> Dict[str, Any]:
     return entry
 
 
+# --------------------------------------------------------- 자동 복구 원장 (v0.7)
+#
+# Every automatic action - a wait, an extension, an Observer, and the pin that
+# stopped one - is written here with its time, its reason and its size. This is
+# the Ledger's source: 자동으로 한 일은 사람이 나중에 셀 수 있어야 한다.
+#
+# Made on first ask, exactly like ``stage_entry``, so ``new_state`` does not
+# change, an older state.json still reads, and a slice that never needed
+# recovering carries no key at all. Optional like every key added after schema
+# 2, which is why STATE_SCHEMA stays 2.
+
+
+def recovery_record(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The slice's 자동 복구 ledger inside state.json, made the first time it is asked for.
+
+    The dict handed back is the live one: writing to it is writing to the state.
+
+    @param state  the slice's state, mutated in place
+    @flow  not a dict -> replace ; then each ledger list, created when absent
+    """
+    record = state.get("recovery")
+    if not isinstance(record, dict):
+        record = {}
+        state["recovery"] = record
+    for key in ("extensions", "observations", "waits"):
+        if not isinstance(record.get(key), list):
+            record[key] = []
+    return record
+
+
 # ---------------------------------------------------------------- amendments
 #
 # An amend is neither a new stage nor a new slice: it is a new *cycle* over the
@@ -1757,6 +1855,19 @@ WHERE THE PREVIOUS ATTEMPT GOT TO
 {progress}
 """
 
+# What the one retry after an Observer is given. The last two lines are the
+# whole point of an outside eye: it saw the behaviour and not the code, so it is
+# authoritative about the first and must never be trusted about the second.
+_OBSERVATION_NOTE = """\
+
+AN OUTSIDE OBSERVER READ THIS STAGE'S LOGS
+------------------------------------------
+{observation}
+
+It saw only the logs, never the code: where the code contradicts it, the code
+wins. Do not repeat the behaviour it names - take its suggestion first.
+"""
+
 # What a re-planned plan stage is given: its own rejected plan, and why.
 _REPLAN_NOTE = """\
 
@@ -1808,6 +1919,54 @@ INSTRUCTIONS
 <2-5 lines: what to change, and why that fixes it>
 ## Where
 - <path>:<line> - <what is wrong there>
+"""
+
+_OBSERVE_PROMPT = """\
+You are the OBSERVE STEP of an unattended pipeline running on this repository.
+Nobody is watching: never ask a question.
+
+A stage ran out of turns, and the engine judged the way it spent them to be
+pathological rather than honest. You are the outside eye. You cannot read the
+code, list the files or run anything - every tool is blocked, on purpose.
+Everything you are allowed to know is written below.
+
+WHAT DIED
+---------
+stage {stage}, attempt {attempt}, turn budget {budget}
+
+WHY THE ENGINE CALLED YOU
+-------------------------
+{reasons}
+
+WHAT THE SESSION ACTUALLY DID
+-----------------------------
+{activity}
+
+PROGRESS THE ENGINE RECORDED
+----------------------------
+{progress}
+{failure}
+REQUIREMENT
+-----------
+{requirement}
+
+INSTRUCTIONS
+- Judge from the logs above and nothing else. Where they do not say something,
+  say you cannot tell rather than filling the gap in.
+- The engine already knows the counts. What it cannot see is the shape: what
+  this session was trying to do over and over, and why that is not working.
+- Your final message is saved verbatim as observation.md and injected into the
+  one retry this slice has left. Emit exactly this and nothing else:
+
+# OBSERVATION
+## 반복 중인 행동
+<1-3 lines: what it did again and again>
+## 막힌 지점 - 추정 원인
+<1-3 lines: where it is stuck, and the most likely reason the logs support>
+## 제안
+suggestion: <one of: switch-approach, rescope, call-human>
+<2-5 lines: what the retry must do differently. Choose 'call-human' only when
+no retry could help - it stops the pipeline instead of buying one.>
 """
 
 _TEST_PROMPT = """\
@@ -2129,6 +2288,11 @@ class PipelineConfig:
     max_repairs: int = DEFAULT_MAX_REPAIRS
     diagnose_threshold: int = DEFAULT_DIAGNOSE_THRESHOLD
     verify_timeout: float = verify.VERIFY_TIMEOUT_S
+    # v0.7 자동 복구. auto_resume waits a usage limit out; auto_extend decides how
+    # much the engine may do about a turn death; turn_cap is the pin under both.
+    auto_resume: bool = True
+    auto_extend: str = DEFAULT_AUTO_EXTEND
+    turn_cap: int = recovery.DEFAULT_TURN_CAP
 
     @property
     def cwd(self) -> Path:
@@ -2148,6 +2312,14 @@ class PipelineConfig:
         @param stage  the stage name
         """
         return self.stage_models.get(stage) or self.model
+
+    def extension_limit(self) -> int:
+        """How many automatic turn extensions this slice may take, by mode."""
+        return recovery.EXTENSION_LIMITS.get(self.auto_extend, 0)
+
+    def observer_limit(self) -> int:
+        """How many times an Observer may be summoned for this slice, by mode."""
+        return recovery.OBSERVER_LIMITS.get(self.auto_extend, 0)
 
     def engine_verifies(self) -> bool:
         """Does the engine run verification itself, or does an agent test stage?
@@ -2324,6 +2496,9 @@ class StageSpec:
     policy: Dict[str, Optional[str]]
     phase: str
     allowed: Tuple[str, ...] = ()
+    # Blocked on top of whatever the safety profile already blocks. Empty for
+    # every stage but 'observe', so this changes not one byte of the other argv.
+    disallowed: Tuple[str, ...] = ()
     prompt: Optional[str] = None  # a fixed prompt; None means build one per attempt
     # Environment for the child, and the settings file carrying this slice's hooks.
     env: Dict[str, str] = field(default_factory=dict)
@@ -2383,7 +2558,8 @@ def execute_stage(
     @param resume_session  a session id to ``--resume``, or None for a fresh one
     @param spec            a pre-built StageSpec, for the stages outside STAGES
     @param state           state.json, so a progress snapshot can be recorded live
-    @flow  spec -> RunConfig -> runner.execute (turn watcher on_event) -> StageRun
+    @flow  spec -> RunConfig (allowed and, since v0.7, blocked tools)
+           -> runner.execute (turn watcher on_event) -> StageRun
     주요 내부 변수: policy(안전 프로파일), wrote_progress(스냅샷을 이미 썼는지)
     """
     spec = spec or StageSpec.for_slice(stage, cfg, rec)
@@ -2410,6 +2586,9 @@ def execute_stage(
         # Rule-scoped, never a blanket Bash unlock: acceptEdits alone would leave
         # every verification command waiting for an approval nobody is there to give.
         allowed_tools=",".join(spec.allowed) or None,
+        # Almost always None, which is what it has always been: only a stage that
+        # must not even *look* at the repository names anything here.
+        disallowed_tools=",".join(spec.disallowed) or None,
         safety_profile=policy["safety_profile"] or "default",
         resume_session=resume_session,
         claude_cmd=list(cfg.claude_cmd),
@@ -2609,6 +2788,182 @@ def count_graph_queries(telemetry: Dict[str, Any]) -> int:
     return total
 
 
+# --------------------------------------------------------- 자동 복구 (v0.7)
+#
+# Measured 2026-08-18/19: two usage-limit deaths in 24 hours, each resumed by
+# hand after a human worked out the reset time, and every turn death diagnosed
+# by hand as well - read the log, decide whether to raise the budget, launch it
+# again. 멈춤 자체가 비용이다. What follows is that judgement, made by the engine
+# and written down. No new launch is ever automated: only a resume.
+
+
+def quota_line(resume_at: datetime, waiting: bool) -> str:
+    """The one line a human wants at 03:40: when the limit lifts, and who acts on it.
+
+    @param resume_at  when the wait ends, as a local datetime
+    @param waiting    whether this process is going to sit on the wait itself
+    """
+    return "한도 도달 — {0} {1}".format(
+        resume_at.strftime("%H:%M"), "자동 재개 예정" if waiting else "이후 재개 가능"
+    )
+
+
+def record_wait(
+    state: Dict[str, Any],
+    stage: str,
+    attempt: int,
+    resume_at: datetime,
+    wait: float,
+    source: str,
+) -> None:
+    """Append one usage-limit wait to the ledger, whether or not it is waited out.
+
+    ``state["quota"]`` keeps only the current wait, because that is what a
+    resume reads. This is the append-only history beside it: the Ledger has to
+    be able to count how many nights ended on a limit.
+
+    @param stage      the stage that hit the limit
+    @param attempt    which attempt of it
+    @param state      the slice's state, mutated in place
+    @param resume_at  when the wait ends
+    @param wait       how long it is, in seconds
+    @param source     where the reset time came from
+    """
+    recovery_record(state)["waits"].append(
+        {
+            "stage": stage,
+            "attempt": attempt,
+            "at": now_iso(),
+            "kind": recovery.CAUSE_QUOTA,
+            "resume_at": resume_at.isoformat(timespec="seconds"),
+            "wait_s": round(float(wait), 1),
+            "source": source,
+        }
+    )
+
+
+def stop_auto(
+    cfg: PipelineConfig,
+    rec: Any,
+    state: Dict[str, Any],
+    stage: str,
+    pin: str,
+    detail: str,
+) -> None:
+    """Stop automating this slice, say which pin caught it, and hand it back to a human.
+
+    The outcome is deliberately the ordinary failed state and not a new one: a
+    slice that ran out of automatic answers is in exactly the position v0.6 left
+    every failed slice in, and every existing reader already understands it.
+
+    @param cfg     the slice's configuration, for the repository in the command
+    @param rec     the record, whose label goes into the resume command
+    @param state   the slice's state, where the stop is recorded
+    @param stage   the stage the automation gave up on
+    @param pin     which safety pin caught it - extensions / observer / turn-cap / auto_resume
+    @param detail  one line a human can act on
+    """
+    recovery_record(state)["stopped"] = {
+        "at": now_iso(),
+        "stage": stage,
+        "pin": pin,
+        "detail": detail,
+    }
+    say("자동 복구 중지 — {0}".format(detail))
+    say(
+        "  사람이 판단할 차례다:  aidev pipeline --repo {0} --resume-slice {1}".format(
+            cfg.repo, rec.label
+        )
+    )
+
+
+def plan_recovery(
+    cfg: PipelineConfig,
+    rec: Any,
+    state: Dict[str, Any],
+    stage: str,
+    run: StageRun,
+    attempt: int,
+) -> Optional[Dict[str, Any]]:
+    """What to do about a stage that just died: extend it, observe it, or nothing.
+
+    ``None`` is the answer for everything this feature does not claim - a real
+    error, a stage already at a pin, the switch turned off - and it means the
+    caller takes the failure path it always took.
+
+    An observer is never observed and a diagnosis is never observed either:
+    both are already the cheap readonly answer to something, and buying an
+    opinion about an opinion is how a loop would start.
+
+    @param cfg      the slice's configuration - the mode and the pins live there
+    @param rec      the record, for plan.md and for the message
+    @param state    the slice's state, where every decision is written down
+    @param stage    the stage that died
+    @param run      what it did before it died
+    @param attempt  which attempt of it that was
+    @flow  off / observer stage / not a turn death -> None
+           ; healthy -> extension pin -> estimate -> turn cap -> extend
+           ; 병리 -> diagnose? None -> observer pin -> observe
+    주요 내부 변수: v(건강 판정), remaining(plan.md가 남긴 파일 수), extra(연장량)
+    """
+    if cfg.auto_extend == "off" or stage in (OBSERVE_STAGE, DIAGNOSE_STAGE):
+        return None
+    subtype = (run.telemetry.get("exact") or {}).get("result_subtype")
+    if not recovery.is_turn_death(subtype, failure_text(run.run_dir)):
+        return None  # 그 외 에러는 기존 failure 경로 그대로
+
+    v = recovery.verdict(run.telemetry)
+    record = recovery_record(state)
+    budget = cfg.turns_for(stage)
+
+    if v.healthy:
+        if len(record["extensions"]) >= cfg.extension_limit():
+            stop_auto(
+                cfg, rec, state, stage, "extensions",
+                "자동 연장 상한({0}회) 도달 — 더 늘리지 않는다".format(cfg.extension_limit()),
+            )
+            return None
+        done = progress.touched_paths(run.telemetry, (cfg.cwd, cfg.repo))
+        remaining = len(progress.remaining_paths(plan_paths(rec), done))
+        extra = recovery.extension_turns(remaining, v, budget, cfg.turn_cap)
+        if extra <= 0:
+            stop_auto(
+                cfg, rec, state, stage, "turn-cap",
+                "총 턴 상한({0}) 도달 — {1}은 이미 {2}턴".format(cfg.turn_cap, stage, budget),
+            )
+            return None
+        say("정직한 소진 — Remaining {0}건, +{1}턴 연장 재개".format(remaining, extra))
+        record["extensions"].append(
+            {
+                "stage": stage,
+                "attempt": attempt,
+                "at": now_iso(),
+                "from": budget,
+                "to": budget + extra,
+                "remaining": remaining,
+                "units": v.units,
+                "turns": v.turns,
+                "pace": round(v.pace, 2),
+                "reason": "healthy turn death",
+            }
+        )
+        return {"kind": "extend", "to": budget + extra, "verdict": v}
+
+    if len(record["observations"]) >= cfg.observer_limit():
+        stop_auto(
+            cfg, rec, state, stage, "observer",
+            "병리 소진 — {0} / Observer는 {1}".format(
+                v.reasons[0],
+                "이 slice에서 이미 소환됐다"
+                if cfg.observer_limit()
+                else "auto_extend: aggressive에서만 소환된다",
+            ),
+        )
+        return None
+    say("병리 소진 — {0} → Observer 소환".format(v.reasons[0]))
+    return {"kind": "observe", "verdict": v}
+
+
 def run_stage(
     cfg: PipelineConfig,
     rec: SliceRecord,
@@ -2620,7 +2975,14 @@ def run_stage(
     repair: Optional[Dict[str, Any]] = None,
     replan: Optional[Dict[str, Any]] = None,
 ) -> StageRun:
-    """Run one stage, waiting out usage limits on the same session as it goes.
+    """Run one stage, and answer its death here rather than handing it to a human.
+
+    This is the pipeline's single launch point - plan, implement, test, an epic's
+    decompose, a repair's diagnose and v0.7's observe all come through it - so
+    every automatic answer to a death lives in this one loop and every path
+    inherits it: wait out a usage limit, widen an honest turn budget, or buy one
+    outside opinion and start over with it. Anything else is v0.6's failure path,
+    byte for byte.
 
     @param cfg          the slice's configuration
     @param rec          the record whose state and runs.json this writes
@@ -2631,9 +2993,12 @@ def run_stage(
     @param amend        the open amend cycle, if any
     @param repair       a failed verification this run must fix, if any
     @param replan       the rejected plan and its rejection, for a re-plan
-    @flow  session policy -> set the table (v0.6) -> build prompt (+approval conditions)
-           -> execute -> record what the briefing cost -> quota? wait and retry : return
-    주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수), brief(상차림)
+    @flow  session policy -> set the table (v0.6) -> build prompt (+approval conditions,
+           +observation) -> execute -> record what the briefing cost
+           -> ok? return : write progress -> plan_recovery -> extend | observe | return
+           ; quota -> record the wait -> auto_resume? sleep and retry : return
+    주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수),
+                   brief(상차림), action(자동 조치)
     """
     spec = spec or StageSpec.for_slice(stage, cfg, rec)
     entry = stage_entry(state, stage)
@@ -2690,6 +3055,7 @@ def run_stage(
         elif fresh:
             prompt += _FRESH_SESSION_NOTE
         prompt += resume_progress_note(rec, state, stage)
+        prompt += observation_note(rec, state, stage)
         banner(stage, rec.label, attempt, resumed=bool(session), fresh=fresh)
 
         run = execute_stage(
@@ -2707,9 +3073,13 @@ def run_stage(
                 entry["failures"] = 0
                 if isinstance(state.get("quota"), dict):
                     state["quota"].update({"waiting": False, "resume_at": None})
-            else:
-                # A stage that stopped without finishing is exactly the case the
-                # resume has nothing to go on. Rewritten, so it reflects the end.
+                return run
+            # A stage that stopped without finishing is exactly the case the
+            # resume has nothing to go on. Rewritten, so it reflects the end -
+            # and written *first*, because this file is both the estimate's
+            # input (Remaining) and the Observer's. An observer has no progress
+            # of its own to record and must not overwrite the dying stage's.
+            if spec.stage != OBSERVE_STAGE:
                 write_progress(
                     cfg,
                     rec,
@@ -2722,7 +3092,24 @@ def run_stage(
                     budget=cfg.turns_for(spec.stage),
                     state=state,
                 )
-            return run
+            action = plan_recovery(cfg, rec, state, spec.stage, run, attempt)
+            if action is None:
+                return run  # 그 외 에러, 상한 도달, 스위치 off: v0.6's failure path
+            if action["kind"] == "extend":
+                cfg.stage_max_turns[spec.stage] = action["to"]
+                rec.write_state(state)
+                continue  # same session, wider budget
+            text = run_observer(cfg, rec, state, spec.stage, run, requirement, attempt, action)
+            if not text:
+                return run
+            # Handing the observation to the same session would put the outside
+            # eye on the head that earned it. The retry starts over knowing only
+            # what the observation and the progress file say.
+            entry.pop("session_id", None)
+            session = None
+            fresh = True
+            rec.write_state(state)
+            continue
 
         if retries >= cfg.quota_max_retries:
             say("usage limit again after {0} retries - giving up".format(retries))
@@ -2732,7 +3119,7 @@ def run_stage(
         wait = cfg.quota_wait_s
         source = "fallback interval"
         if run.reset_at is not None:
-            wait = max(0.0, run.reset_at - time.time()) + 30.0  # a little past the reset
+            wait = max(0.0, run.reset_at - time.time()) + QUOTA_RESET_MARGIN_S
             source = "reset time from the error"
         resume_at = datetime.fromtimestamp(time.time() + wait).astimezone()
         state["quota"] = {
@@ -2741,9 +3128,17 @@ def run_stage(
             "retries": retries,
             "source": source,
         }
+        record_wait(state, spec.stage, attempt, resume_at, wait, source)
         set_status(rec, state, STATUS_QUOTA_WAIT)
+        if not cfg.auto_resume:
+            # Nothing is lost by not sleeping: the wait stays open in state.json,
+            # so --resume-slice finishes whatever is left of it and carries on.
+            say(quota_line(resume_at, waiting=False))
+            stop_auto(cfg, rec, state, spec.stage, "auto_resume", "auto_resume: off - 대기하지 않는다")
+            return run
+        say(quota_line(resume_at, waiting=True))
         say(
-            "usage limit hit - retry {0}/{1} in {2} ({3}), resuming session {4}".format(
+            "  retry {0}/{1} in {2} ({3}), resuming session {4}".format(
                 retries,
                 cfg.quota_max_retries,
                 reporter.format_duration(wait),
@@ -2863,6 +3258,22 @@ def run_setup(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> O
 # still works for a session that died mid-sentence.
 
 
+def plan_paths(rec: Any) -> List[str]:
+    """Every path plan.md names, deduplicated - what "Remaining" is measured against.
+
+    One function for two readers on purpose: progress.md's ``## Remaining`` list
+    and the turn estimate's ``Remaining N건`` are the same count, and two
+    extractions of it would eventually disagree in front of a human.
+
+    A record with no plan of its own - an epic's, before it has one - answers
+    with an empty list rather than raising.
+
+    @param rec  the record holding plan.md
+    """
+    text = rec.read_plan() if hasattr(rec, "read_plan") else ""
+    return list(dict.fromkeys(match.group(0) for match in _PLAN_PATH_RE.finditer(text or "")))
+
+
 def write_progress(
     cfg: PipelineConfig,
     rec: Any,
@@ -2890,12 +3301,12 @@ def write_progress(
     @param turn       turns used at this moment
     @param budget     the stage's turn budget
     @param state      state.json, so a resume can tell whether this file is stale
-    @flow  plan paths -> progress.render -> write -> record it in state
-    주요 내부 변수: path(progress.md 경로), plan_paths(plan.md가 지목한 경로들)
+    @flow  plan_paths -> progress.render -> write -> record it in state
+    주요 내부 변수: path(progress.md 경로), named(plan.md가 지목한 경로들)
     """
     path = Path(rec.dir) / "progress.md"
-    plan_text = rec.read_plan() if hasattr(rec, "read_plan") else ""
-    plan_paths = [match.group(0) for match in _PLAN_PATH_RE.finditer(plan_text or "")]
+    # The same list the turn estimate counts, so the file and the log agree.
+    named = plan_paths(rec)
     try:
         write_text_atomic(
             path,
@@ -2904,7 +3315,7 @@ def write_progress(
                 stage=stage,
                 attempt=attempt,
                 telemetry=telemetry,
-                plan_paths=list(dict.fromkeys(plan_paths)),
+                plan_paths=named,
                 last_text=last_text,
                 reason=reason,
                 turn=turn,
@@ -2951,6 +3362,30 @@ def resume_progress_note(rec: Any, state: Dict[str, Any], stage: str) -> str:
         return ""
     text = progress.read(Path(rec.dir) / "progress.md").strip()
     return _PROGRESS_NOTE.format(progress=text) if text else ""
+
+
+def observation_note(rec: Any, state: Dict[str, Any], stage: str) -> str:
+    """The outside eye's answer, given to the one retry it was bought for.
+
+    Deliberately the same shape as ``resume_progress_note``: it belongs to one
+    stage, it stops being injected once that stage is done, and it travels
+    through state.json rather than memory - so a process that died between the
+    observation and the retry still hands it over when ``--resume-slice`` picks
+    the slice back up.
+
+    @param rec    the record holding observation.md
+    @param state  state.json, which says which stage the observation was for
+    @param stage  the stage about to run
+    @flow  no open observation for this stage -> "" ; stage already done -> "" ; else the note
+    """
+    record = state.get("recovery")
+    open_record = record.get("open") if isinstance(record, dict) else None
+    if not isinstance(open_record, dict) or open_record.get("stage") != stage:
+        return ""
+    if stage_entry(state, stage).get("status") == "done":
+        return ""
+    text = progress.read(Path(rec.dir) / "observation.md").strip()
+    return _OBSERVATION_NOTE.format(observation=text) if text else ""
 
 
 # ------------------------------------------------------------- the write guard
@@ -3355,6 +3790,115 @@ def run_diagnosis(
     return text
 
 
+# The tools an Observer is blocked from on top of the readonly profile, which
+# already takes Bash, every editor and Task. What is left after this is nothing:
+# it cannot read a file, glob for one or search the web. "로그만 입력"이 지시가
+# 아니라 기계가 된다 - and a machine is worth more than a sentence in a prompt.
+OBSERVER_BLOCKED_TOOLS: Tuple[str, ...] = (
+    "Read",
+    "NotebookRead",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+)
+
+
+def run_observer(
+    cfg: PipelineConfig,
+    rec: Any,
+    state: Dict[str, Any],
+    stage: str,
+    run: StageRun,
+    requirement: str,
+    attempt: int,
+    action: Dict[str, Any],
+) -> str:
+    """One blind readonly session whose only output is observation.md. Returns its text.
+
+    Blind is the whole idea. The stage that died had the code and spent its
+    whole budget in it; a second session with the same access would most likely
+    reach the same place. This one is given the *behaviour* - what was edited,
+    what was re-read, what was run again and again - and nothing else, so what
+    it can add is the one thing the dead session could not see: its own shape.
+
+    Returning ``""`` means "do not retry": either the session produced nothing,
+    or it answered ``call-human``, and buying another attempt after an outside
+    eye asked for a person would erase the reason it was bought.
+
+    @param cfg          the slice's configuration
+    @param rec          the record observation.md is written into
+    @param state        state.json, where the observation is recorded like any run
+    @param stage        the stage that died
+    @param run          what it did before it died
+    @param requirement  the requirement body - without it 'rescope' is unjudgeable
+    @param attempt      which attempt of the dead stage this answers
+    @param action       what ``plan_recovery`` decided, carrying the verdict
+    @flow  StageSpec(readonly, every tool blocked, phase=review) -> run_stage
+           -> no text -> "" ; save -> ledger -> call-human? "" : open it for the retry
+    주요 내부 변수: spec(관찰 세션 설정), text(모델의 최종 답), suggestion(제안)
+    """
+    v = action.get("verdict") or recovery.Verdict()
+    path = Path(rec.dir) / "observation.md"
+    failure = progress.read(Path(rec.dir) / "failure.md").strip()
+    spec = StageSpec(
+        stage=OBSERVE_STAGE,
+        policy={"safety_profile": "readonly", "permission_mode": None},
+        # An existing telemetry phase that nothing else uses, so `aidev stats`
+        # aggregates observers without PHASES having to learn a new word.
+        phase="review",
+        allowed=(),
+        disallowed=OBSERVER_BLOCKED_TOOLS,
+        prompt=_OBSERVE_PROMPT.format(
+            stage=stage,
+            attempt=attempt,
+            budget=cfg.turns_for(stage),
+            reasons="\n".join("- " + reason for reason in v.reasons) or "- (판정 근거 없음)",
+            activity=recovery.render_activity(run.telemetry),
+            progress=progress.read(Path(rec.dir) / "progress.md").strip()
+            or "(progress.md was not written)",
+            failure=(
+                "\nLAST FAILURE REPORT\n-------------------\n{0}\n".format(failure)
+                if failure
+                else ""
+            ),
+            requirement=requirement.strip(),
+        ),
+    )
+    observed = run_stage(cfg, rec, state, OBSERVE_STAGE, requirement, spec=spec)
+    entry = stage_entry(state, OBSERVE_STAGE)
+    entry["status"] = "done" if observed.ok else "failed"
+    entry["run_id"] = observed.run_id
+    text = observed.text.strip()
+    if not text:
+        say("the observer produced no text - leaving the stage failed")
+        return ""
+    write_text_atomic(path, text + "\n")
+    suggestion = recovery.parse_suggestion(text)
+    record = recovery_record(state)
+    record["observations"].append(
+        {
+            "stage": stage,
+            "attempt": attempt,
+            "at": now_iso(),
+            "run_id": observed.run_id,
+            "suggestion": suggestion,
+            "path": str(path),
+            "reasons": list(v.reasons),
+        }
+    )
+    say("observation saved: {0}  (suggestion: {1})".format(path, suggestion))
+    if suggestion == recovery.CALL_HUMAN:
+        stop_auto(
+            cfg, rec, state, stage, "call-human",
+            "외부 눈이 사람을 불렀다 — {0}".format(path),
+        )
+        return ""
+    record["open"] = {"stage": stage, "at": now_iso(), "path": str(path)}
+    return text
+
+
 def run_verify(
     cfg: PipelineConfig,
     rec: SliceRecord,
@@ -3669,23 +4213,65 @@ def _diff_lines(before: str, after: str) -> str:
 
 
 def resume_quota_wait(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> None:
-    """A slice resumed mid-wait finishes the wait; it does not retry straight away."""
+    """A slice resumed mid-wait finishes the wait; it does not retry straight away.
+
+    This is the answer to the process that was not there to sleep - killed, or
+    told not to wait by ``auto_resume: off``. The wait is durable because it is
+    in state.json, so whatever picks the slice up serves out the remainder and
+    goes on. It says the same sentence the waiting process says.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice whose state carries the open wait
+    @param state  state.json, updated in place
+    @flow  no open wait -> return ; time left -> say it and sleep it out ; then clear it
+    주요 내부 변수: remaining(남은 대기 초), resume_at(재개 시각)
+    """
     quota = state.get("quota")
     if not isinstance(quota, dict) or not quota.get("waiting"):
         return
     remaining = 0.0
     resume_at = quota.get("resume_at")
+    parsed: Optional[datetime] = None
     if isinstance(resume_at, str):
         try:
-            remaining = datetime.fromisoformat(resume_at).timestamp() - time.time()
+            parsed = datetime.fromisoformat(resume_at)
+            remaining = parsed.timestamp() - time.time()
         except ValueError:
             remaining = 0.0
     if remaining > 0:
+        if parsed is not None:
+            say(quota_line(parsed, waiting=True))
         say("still inside a usage-limit wait, {0} left".format(reporter.format_duration(remaining)))
         set_status(rec, state, STATUS_QUOTA_WAIT)
         sleep_seconds(remaining)
     quota.update({"waiting": False, "resume_at": None})
     rec.write_state(state)
+
+
+def restore_extensions(cfg: PipelineConfig, state: Dict[str, Any]) -> None:
+    """Put back the budgets the engine already raised, so a resume does not start over at 80.
+
+    The ledger is the record and this is what makes it one: an extension that
+    only ever lived in a process's memory would be spent again by the next
+    process, which is how a pin that counts extensions could be walked past.
+
+    A budget the human raised further, by flag or by front matter, is left alone
+    - restoring is putting a floor back, never overruling what was asked for.
+
+    @param cfg    the slice's configuration, whose per-stage budgets are raised
+    @param state  state.json, whose ``recovery`` ledger says what was granted
+    @flow  no ledger -> return ; per extension: higher than what this run has? -> take it
+    """
+    record = state.get("recovery")
+    if not isinstance(record, dict):
+        return
+    for entry in record.get("extensions") or []:
+        if not isinstance(entry, dict):
+            continue
+        stage = str(entry.get("stage") or "")
+        granted = int(entry.get("to") or 0)
+        if stage and granted > cfg.turns_for(stage):
+            cfg.stage_max_turns[stage] = granted
 
 
 def run_pipeline(
@@ -3697,7 +4283,8 @@ def run_pipeline(
     @param rec          the slice record - state.json's single writer is this loop
     @param state        state.json, updated in place
     @param requirement  the requirement body every stage is given
-    @flow  per stage: dirty check -> setup? -> run (or verify engine) -> commit -> gate
+    @flow  per stage: dirty check -> setup? -> run (or verify engine)
+           -> close the stage's progress and observation notes -> commit -> gate
     주요 내부 변수: gates(켜진 승인 게이트), amend(열려 있는 amend 사이클)
     """
     # The last safety pin for the empty-requirement guard: every entry point
@@ -3712,6 +4299,7 @@ def run_pipeline(
     # Why it stopped last time is stale the moment it moves again.
     state.pop("reason", None)
     resume_quota_wait(cfg, rec, state)
+    restore_extensions(cfg, state)
     gates = {str(name) for name in (state.get("gates") or ())}
     # Inside an amend only that cycle's stages run, so plan is history and its
     # gate is never re-read - which is also what lets a rejected slice be amended.
@@ -3793,9 +4381,14 @@ def run_pipeline(
                     note_stage_failure(state, stage)
                     return fail_slice(rec, state, reason)
             # A stage that finished has nothing left to resume into, so its
-            # progress notes stop being injected - the file itself stays.
+            # progress notes stop being injected - the file itself stays. An
+            # observation is closed on the same rule and for the same reason:
+            # it was about this stage, and the next one is not it.
             if (state.get("progress") or {}).get("stage") == stage:
                 state.pop("progress", None)
+            open_observation = (state.get("recovery") or {}).get("open")
+            if isinstance(open_observation, dict) and open_observation.get("stage") == stage:
+                state["recovery"].pop("open", None)
             if stage == "plan":
                 # The new plan is written: the rejected one is history now.
                 state.pop("replan_open", None)
@@ -3891,6 +4484,9 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     slice's work - measured 2026-08-19, a session's own ``~/.claude`` memory
     file was showing up there.
 
+    v0.7 adds one more line under it, on the same rule: what the engine did on
+    its own, and silence when it did nothing.
+
     @param state  state.json, which names the stages and what they decided
     @param runs   the stored runs, where the tokens and the cost come from
     """
@@ -3970,6 +4566,7 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
         note = {"pass": "", "fail": "  <- tests failed", "unknown": "  <- no TEST_RESULT line"}
         lines.extend(_verify_lines(state, note.get(verdict, ""), verdict))
     lines.extend(_briefing_lines(state, runs))
+    lines.extend(_recovery_lines(state))
     amends = [entry for entry in (state.get("amends") or []) if isinstance(entry, dict)]
     if amends:
         said = str(amends[-1].get("instruction") or "").strip().splitlines()
@@ -4011,6 +4608,48 @@ def _briefing_lines(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> Li
             ", ".join(parts), reused, queries
         )
     ]
+
+
+def _recovery_lines(state: Dict[str, Any]) -> List[str]:
+    """What the engine did on its own, and which pin stopped it. Silent when it did nothing.
+
+    Read straight off the ledger rather than recomputed, so what is shown is
+    exactly what was recorded at the moment of acting - and a slice that never
+    died prints the summary it printed before this feature existed.
+
+    @param state  state.json, whose ``recovery`` key is the ledger
+    @flow  no ledger -> [] ; extensions / observations / waits -> one line ; stopped -> a second
+    주요 내부 변수: record(원장), parts(줄에 실릴 조각들)
+    """
+    record = state.get("recovery")
+    if not isinstance(record, dict):
+        return []
+    extensions = [e for e in (record.get("extensions") or []) if isinstance(e, dict)]
+    observations = [o for o in (record.get("observations") or []) if isinstance(o, dict)]
+    waits = [w for w in (record.get("waits") or []) if isinstance(w, dict)]
+    parts: List[str] = []
+    if extensions:
+        last = extensions[-1]
+        parts.append(
+            "연장 {0} ({1} {2}->{3})".format(
+                len(extensions), last.get("stage", "?"), last.get("from", "?"), last.get("to", "?")
+            )
+        )
+    if observations:
+        parts.append(
+            "Observer {0} ({1})".format(
+                len(observations), observations[-1].get("suggestion", "?")
+            )
+        )
+    if waits:
+        parts.append("한도 대기 {0}".format(len(waits)))
+    if not parts:
+        return []
+    lines = ["Auto      {0}".format(", ".join(parts))]
+    stopped = record.get("stopped")
+    if isinstance(stopped, dict):
+        lines.append("Stopped   {0}  ({1})".format(stopped.get("detail", "?"), stopped.get("pin", "?")))
+    return lines
 
 
 def _verify_lines(state: Dict[str, Any], note: str, verdict: Any) -> List[str]:
@@ -4186,7 +4825,7 @@ def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def add_parser(sub: Any) -> Any:
-    """Register the ``aidev pipeline`` subcommand and all of its flags, ``--no-briefing`` included.
+    """Register the ``aidev pipeline`` subcommand and all of its flags, v0.7's 자동 복구 included.
 
     @param sub  the subparsers object from ``cli.build_parser``
     """
@@ -4400,6 +5039,26 @@ def add_parser(sub: Any) -> Any:
         "--quota-wait", type=float, default=DEFAULT_QUOTA_WAIT_S, help="fallback retry interval"
     )
     cmd.add_argument("--quota-max-retries", type=int, default=DEFAULT_QUOTA_MAX_RETRIES)
+    cmd.add_argument(
+        "--no-auto-resume",
+        action="store_true",
+        help="do not sit on a usage-limit wait; report the reset time and stop",
+    )
+    # No default: the front matter sits between 'the user said conservative' and
+    # 'the user said nothing', exactly as it does for --max-turns.
+    cmd.add_argument(
+        "--auto-extend",
+        default=None,
+        choices=list(AUTO_EXTEND_MODES),
+        help="what the engine may do about a turn death (default conservative)",
+    )
+    cmd.add_argument(
+        "--turn-cap",
+        type=int,
+        default=recovery.DEFAULT_TURN_CAP,
+        metavar="N",
+        help="no automatic extension may raise a stage past this budget (default 300)",
+    )
     cmd.add_argument("--dry-run", action="store_true", help="print what would run and exit")
     # Optional, so every invocation that existed before this argument still parses.
     cmd.add_argument(
@@ -4526,8 +5185,9 @@ def _config(
     A caller with no front matter to offer (an epic's own decompose) gets exactly
     what it got before. The ``model:`` line resolves by the same precedence, and
     each ``--no-*`` switch (spec check, verify engine, graph hook, briefing, ...)
-    turns one default behaviour back off here. The two-sided ones - ``spec_check``
-    and ``briefing`` - are off when *either* the front matter or the flag says so.
+    turns one default behaviour back off here. The two-sided ones - ``spec_check``,
+    ``briefing`` and v0.7's ``auto_resume`` - are off when *either* the front
+    matter or the flag says so.
 
     @param args           the parsed arguments
     @param repo           the user's repository
@@ -4593,6 +5253,12 @@ def _config(
         max_repairs=getattr(args, "max_repairs", DEFAULT_MAX_REPAIRS),
         diagnose_threshold=getattr(args, "diagnose_threshold", DEFAULT_DIAGNOSE_THRESHOLD),
         verify_timeout=getattr(args, "verify_timeout", verify.VERIFY_TIMEOUT_S),
+        # Two-sided like spec_check and briefing: either side may turn the wait
+        # off. auto_extend is a value rather than a switch, so it follows the
+        # precedence the budgets follow - the flag first, the file second.
+        auto_resume=resolve_auto_resume(fields) and not getattr(args, "no_auto_resume", False),
+        auto_extend=getattr(args, "auto_extend", None) or resolve_auto_extend(fields),
+        turn_cap=getattr(args, "turn_cap", None) or recovery.DEFAULT_TURN_CAP,
     )
 
 
@@ -4629,8 +5295,9 @@ class SliceOutcome:
 def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     """``--requirement``: the ordinary launch, and the ``--dry-run`` that previews it.
 
-    The dry run prints every switch that is on, briefing included, because the
-    point of it is that nothing about the coming run is a surprise.
+    The dry run prints every switch that is on - briefing, and since v0.7 what
+    the engine is allowed to do about a death - because the point of it is that
+    nothing about the coming run is a surprise.
 
     @param args      the parsed arguments
     @param repo      the user's repository
@@ -4689,6 +5356,13 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
             "on" if diet_is_on(turns) else "off",
             "on" if (turns.briefing and turns.graph_hook) else "off",
         ))
+        print("recovery  auto-resume {0}, auto-extend {1} (연장 {2}회, Observer {3}회), turn cap {4}".format(
+            "on" if turns.auto_resume else "off",
+            turns.auto_extend,
+            turns.extension_limit(),
+            turns.observer_limit(),
+            turns.turn_cap,
+        ))
         print("gates     {0}".format(", ".join(gates) or "(none: fully unattended)"))
         print("slice dir {0}".format(rec.dir))
         print("run dir   {0}".format(data_dir / "runs"))
@@ -4724,7 +5398,8 @@ def launch_slice(
     @param start             an explicit commit to start at, for a queued slice
     @param epic              the epic this slice belongs to, when it has one
     @param quiet_unfinished  suppress the "other slices are open" notice, for a queue
-    @flow  guard + validate front matter -> slice record -> workspace -> run_pipeline
+    @flow  guard + validate every front matter key (recovery switches included)
+           -> slice record -> workspace -> run_pipeline
     주요 내부 변수: plan(worktree 계획, --no-worktree면 None), ws(만들어진 작업 공간)
     """
     body = guard_requirement(text, name)
@@ -4736,6 +5411,8 @@ def launch_slice(
     resolve_max_turns(fields)
     resolve_models(fields)
     resolve_spec_check(fields)
+    resolve_auto_resume(fields)
+    resolve_auto_extend(fields)
 
     root = slices_root(repo)
     unfinished = [
@@ -4891,7 +5568,8 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
     @param repo        the user's repository
     @param data_dir    where runs are stored
     @param repo_given  whether --repo was named, so an empty answer can say which repo it looked in
-    @flow  find the slice -> dry-run? print status, worktree and stages : continue_slice
+    @flow  find the slice -> dry-run? print status, worktree, stages and any open
+           usage-limit wait : continue_slice
     """
     rec = find_slice(repo, args.resume_slice, repo_given, data_dir)
     if args.dry_run:
@@ -4907,6 +5585,13 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
                 for name in stage_order(state)
             )
         ))
+        quota = state.get("quota")
+        if isinstance(quota, dict) and quota.get("waiting"):
+            # The process that was going to sleep this out is gone, or was never
+            # allowed to. Saying the time and the command is the whole recovery.
+            print("wait    {0} 이후 재개 예정 — aidev pipeline --repo {1} --resume-slice {2}".format(
+                str(quota.get("resume_at", ""))[11:16] or "?", repo, rec.slice_id
+            ))
         return EXIT_DONE
     return continue_slice(args, repo, data_dir, rec)
 
@@ -5988,7 +6673,8 @@ def list_slices(repo: Path, repo_given: bool = True, data_dir: Optional[Path] = 
     @param repo        the repository whose slices are listed
     @param repo_given  whether --repo was named; an empty list says which repo it looked in
     @param data_dir    where recently used repos are remembered, for that same hint
-    @flow  no slices -> the hint and stop ; else a header and one row per slice, stages spelled out
+    @flow  no slices -> the hint and stop ; else a header and one row per slice
+           (its status through ``_status_cell``), stages spelled out
     주요 내부 변수: records(디스크에 있는 슬라이스들), detail(스테이지=상태 나열)
     """
     records = _existing_slices(slices_root(repo))
@@ -6011,12 +6697,32 @@ def list_slices(repo: Path, repo_given: bool = True, data_dir: Optional[Path] = 
         )
         print(
             _list_row(
-                (rec.slice_id, str(state.get("status", "(unreadable)")), detail),
+                (rec.slice_id, _status_cell(state), detail),
                 widths,
                 str(state.get("updated_at", ""))[:19],
             )
         )
     return EXIT_DONE
+
+
+def _status_cell(state: Dict[str, Any]) -> str:
+    """The STATUS column: the status, and for an open usage-limit wait the clock time too.
+
+    The process that was sleeping on the wait may not be there any more - that
+    is exactly the case this answers. 'quota_wait 03:40' says when it lifts
+    without anyone having to open state.json, and it still fits the column.
+
+    @param state  one slice's state.json, or {} when it would not parse
+    @flow  not waiting -> the status alone ; else append the resume time
+    """
+    status = str(state.get("status", "(unreadable)"))
+    quota = state.get("quota")
+    if status != STATUS_QUOTA_WAIT or not isinstance(quota, dict):
+        return status
+    try:
+        return "{0} {1}".format(status, datetime.fromisoformat(quota["resume_at"]).strftime("%H:%M"))
+    except (KeyError, TypeError, ValueError):
+        return status
 
 
 def _list_row(cells: Sequence[str], widths: Sequence[int], last: str) -> str:
