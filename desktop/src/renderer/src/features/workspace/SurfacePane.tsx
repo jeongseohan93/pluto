@@ -9,13 +9,26 @@ import { BrowserSurface } from '@renderer/features/browser/BrowserSurface'
 import { PlanSurface, type PlanSurfaceProps } from '@renderer/features/pipeline/PlanSurface'
 import type { SymbolLocation } from '@renderer/lib/graph-lookup'
 import { Icon } from '@renderer/components/Icon'
+import { DemoBadge } from '@shared/ui/DemoBadge'
+import { FunctionGraphSurface } from '@domains/graph-view/ui/FunctionGraphSurface'
+import type { GraphIndexResult } from '@domains/graph-view/types'
 
-export type SurfaceId = 'plan' | 'graph' | 'code' | 'test' | 'diff' | 'browser'
+export type SurfaceId = 'plan' | 'functions' | 'graph' | 'code' | 'test' | 'diff' | 'browser'
 
 export interface SurfaceData {
-  /** The real pipeline. Every other field here is still mock data. */
+  /** The real pipeline. */
   pipeline: PlanSurfaceProps
+  /** The real Function DB. */
+  functions: {
+    index: GraphIndexResult | null
+    loading: boolean
+    selected: number | null
+    onSelect: (id: number) => void
+    onBuild: () => void
+    busy: boolean
+  }
   waitingCount: number
+  /** Mock from here down — every surface that shows these wears a [DEMO] badge. */
   graph: CodeGraph | null
   changes: ChangeSummary | null
   tests: TestCase[] | null
@@ -58,26 +71,36 @@ export function SurfacePane({
           </span>
         ) : undefined
     },
-    { id: 'graph' as const, label: 'Graph' },
-    { id: 'code' as const, label: 'Code' },
+    { id: 'functions' as const, label: 'Function graph' },
+    { id: 'graph' as const, label: 'Graph', badge: <DemoBadge /> },
+    { id: 'code' as const, label: 'Code', badge: <DemoBadge /> },
     {
       id: 'test' as const,
       label: 'Test',
-      badge:
-        failed > 0 ? (
-          <span className="rounded-sm bg-bad/20 px-1 font-mono text-micro text-bad">{failed}</span>
-        ) : undefined
+      badge: (
+        <>
+          {failed > 0 ? (
+            <span className="rounded-sm bg-bad/20 px-1 font-mono text-micro text-bad">{failed}</span>
+          ) : null}
+          <DemoBadge />
+        </>
+      )
     },
     {
       id: 'diff' as const,
       label: 'Diff',
-      badge: data.changes?.filesChanged ? (
-        <span className="rounded-sm bg-active px-1 font-mono text-micro text-fg-mute">
-          {data.changes.filesChanged}
-        </span>
-      ) : undefined
+      badge: (
+        <>
+          {data.changes?.filesChanged ? (
+            <span className="rounded-sm bg-active px-1 font-mono text-micro text-fg-mute">
+              {data.changes.filesChanged}
+            </span>
+          ) : null}
+          <DemoBadge />
+        </>
+      )
     },
-    { id: 'browser' as const, label: 'Browser' }
+    { id: 'browser' as const, label: 'Browser', badge: <DemoBadge /> }
   ]
 
   return (
@@ -88,7 +111,7 @@ export function SurfacePane({
         onChange={onSurfaceChange}
         right={
           <>
-            {surface === 'graph' ? (
+            {surface === 'graph' || surface === 'functions' ? (
               <div className="flex items-center gap-0.5 font-mono text-micro text-fg-mute">
                 <ZoomButton label="−" onClick={() => onZoomChange(Math.max(0.6, zoom - 0.2))} />
                 <span className="w-9 text-center">{Math.round(zoom * 100)}%</span>
@@ -113,6 +136,16 @@ export function SurfacePane({
       <div className="min-h-0 flex-1">
         {surface === 'plan' ? (
           <PlanSurface {...data.pipeline} />
+        ) : surface === 'functions' ? (
+          <FunctionGraphSurface
+            index={data.functions.index}
+            loading={data.functions.loading}
+            selected={data.functions.selected}
+            onSelect={data.functions.onSelect}
+            onBuild={data.functions.onBuild}
+            busy={data.functions.busy}
+            zoom={zoom}
+          />
         ) : surface === 'graph' ? (
           <GraphSurface
             graph={data.graph}

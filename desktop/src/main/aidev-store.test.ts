@@ -344,6 +344,104 @@ describe('writeApproval', () => {
     writeApproval(root, { sliceId: 's', stage: 'plan', decision: 'approved' })
     assert.deepEqual(readdirSync(join(root, '.aidev', 'slices', 's', 'approvals')), ['plan.md'])
   })
+
+  test('an approval with a comment round-trips as a conditional approval', () => {
+    const root = repo()
+    const result = writeApproval(root, {
+      sliceId: 's',
+      stage: 'plan',
+      decision: 'approved',
+      reason: 'keep desktop/domains as the folder shape'
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.effective, 'approved')
+    assert.equal(
+      readFileSync(approvalPath(root), 'utf8'),
+      'approved: keep desktop/domains as the folder shape\n'
+    )
+    // What Python will read back, not what we meant to write.
+    assert.deepEqual(readDecision(approvalPath(root)), {
+      verdict: 'approved',
+      reason: 'keep desktop/domains as the folder shape'
+    })
+  })
+
+  test('a pasted paragraph is folded to the one line read_decision looks at', () => {
+    const root = repo()
+    writeApproval(root, {
+      sliceId: 's',
+      stage: 'plan',
+      decision: 'approved',
+      reason: 'first line\nsecond   line\n'
+    })
+    assert.equal(readFileSync(approvalPath(root), 'utf8'), 'approved: first line second line\n')
+  })
+})
+
+describe('the finishing fields of state.json', () => {
+  test('a merged slice carries its merge record', () => {
+    const root = repoWith({
+      s: sliceState({
+        status: 'merged',
+        merge: {
+          at: '2026-08-19T10:00:00+09:00',
+          status: 'merged',
+          commit: 'abcdef1234',
+          branch: 'slice/s',
+          base: 'master',
+          push: { status: 'failed', remote: 'origin', error: "no git remote named 'origin'" }
+        }
+      })
+    })
+    const [slice] = listSlices(root)
+    assert.equal(slice.merge?.status, 'merged')
+    assert.equal(slice.merge?.base, 'master')
+    assert.equal(slice.merge?.push?.status, 'failed')
+    assert.deepEqual(slice.merge?.conflicts, [])
+  })
+
+  test('a conflict keeps the file list the merge stopped on', () => {
+    const root = repoWith({
+      s: sliceState({
+        merge: { status: 'conflict', conflicts: ['aidev/pipeline.py', 'tests/test_x.py'] }
+      })
+    })
+    assert.deepEqual(listSlices(root)[0].merge?.conflicts, ['aidev/pipeline.py', 'tests/test_x.py'])
+  })
+
+  test('a slice with no merge record says so rather than inventing one', () => {
+    const root = repoWith({ s: sliceState() })
+    assert.equal(listSlices(root)[0].merge, null)
+  })
+
+  test('an open usage-limit wait and a stopped recovery are both carried', () => {
+    const root = repoWith({
+      s: sliceState({
+        status: 'quota_wait',
+        quota: {
+          waiting: true,
+          resume_at: '2026-08-19T23:00:00+09:00',
+          retries: 2,
+          source: 'reset time from the error'
+        },
+        recovery: {
+          stopped: { at: 'now', stage: 'implement', pin: 'turn-cap', detail: '상한에 닿았다' }
+        }
+      })
+    })
+    const [slice] = listSlices(root)
+    assert.equal(slice.quota?.waiting, true)
+    assert.equal(slice.quota?.retries, 2)
+    assert.equal(slice.stopped?.pin, 'turn-cap')
+  })
+
+  test('an unreadable slice has no merge, quota or stop to report', () => {
+    const root = repoWith({ broken: '{"status":' })
+    const [slice] = listSlices(root)
+    assert.equal(slice.merge, null)
+    assert.equal(slice.quota, null)
+    assert.equal(slice.stopped, null)
+  })
 })
 
 describe('parseDecision', () => {
@@ -352,6 +450,10 @@ describe('parseDecision', () => {
     ['approve\n', 'approved', ''],
     ['Approved.\n', 'approved', ''],
     ['APPROVED!\n', 'approved', ''],
+    // v0.2.6: a conditional approval keeps its condition, exactly as
+    // `read_decision` does — the engine carries it into every later stage.
+    ['approved: keep the folder shape\n', 'approved', 'keep the folder shape'],
+    ['approve:  trim it first  \n', 'approved', 'trim it first'],
     ['rejected: too broad\n', 'rejected', 'too broad'],
     ['reject:nope\n', 'rejected', 'nope'],
     ['rejected\n', 'rejected', ''],

@@ -7,6 +7,9 @@ import { IPC, type ApprovalInput, type ApprovalResult, type RepoState } from '..
 import * as mock from './mock-data'
 import * as store from './aidev-store'
 import { addRecent, readRecents } from './recent-repos'
+import { CommandRunner, resolveAidevBin } from '../domains/pipeline/main/cli-runner'
+import type { CommandEvent } from '../domains/pipeline/types'
+import { registerSliceHandlers } from '../app/main/register-handlers'
 
 function createWindow(): void {
   // Create the browser window.
@@ -66,6 +69,7 @@ app.whenReady().then(() => {
 
   registerIdeHandlers()
   registerRepoHandlers()
+  registerSliceHandlers({ repoRoot: () => repoRoot, runner })
 
   createWindow()
 
@@ -83,6 +87,13 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+// A launched run is tied to this app the way it would be tied to the terminal
+// it was started from. Leaving an orphan `aidev` writing into a repository
+// after its window is gone would be worse than ending it.
+app.on('will-quit', () => {
+  runner.dispose()
 })
 
 /**
@@ -112,6 +123,20 @@ function registerIdeHandlers(): void {
  * could pass any string would be a read-anything capability by another name.
  */
 let repoRoot: string | null = null
+
+/**
+ * The one command slot. Its output is pushed to every open window as it
+ * arrives — this is the only channel that goes main -> renderer, and it carries
+ * log lines and nothing else.
+ */
+const runner = new CommandRunner(
+  (event: CommandEvent) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(IPC.commandEvent, event)
+    }
+  },
+  () => resolveAidevBin(process.env, existsSync)
+)
 
 function recentsFile(): string {
   // userData, never inside a repo: Pluto writes one file into a repo, and this

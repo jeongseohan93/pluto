@@ -1,10 +1,12 @@
 import type { JSX } from 'react'
 import type { SymbolLocation } from '@renderer/lib/graph-lookup'
 import { EmptyState } from '@renderer/components/primitives'
+import { DemoBadge } from '@shared/ui/DemoBadge'
 
 /**
  * Code is reached by drill-down, not by default. v0.0.1 shows the excerpt that
  * belongs to the selected symbol; a real editor component arrives in v0.0.6.
+ * The excerpt is authored mock text, not a file read — hence the badge.
  */
 export function CodeSurface({ location }: { location: SymbolLocation | null }): JSX.Element {
   if (!location) {
@@ -22,6 +24,7 @@ export function CodeSurface({ location }: { location: SymbolLocation | null }): 
   return (
     <div className="flex h-full flex-col">
       <div className="flex h-7 shrink-0 items-center gap-2 border-b border-line px-3">
+        <DemoBadge />
         <span className="truncate font-mono text-tiny text-fg-dim" title={file.path}>
           {file.path}
         </span>

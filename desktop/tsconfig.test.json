@@ -20,6 +20,10 @@
     "src/main/aidev-store.ts",
     "src/main/recent-repos.ts",
     "src/main/*.test.ts",
-    "src/shared/**/*"
-  ]
+    "src/shared/**/*.ts",
+    "src/domains/**/*.ts"
+  ],
+  // `ui/` is React and needs the web project's jsx setting; nothing under test
+  // imports it.
+  "exclude": ["src/domains/**/ui/**"]
 }

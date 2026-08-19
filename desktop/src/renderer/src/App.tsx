@@ -15,11 +15,16 @@ import { SurfacePane, type SurfaceId } from '@renderer/features/workspace/Surfac
 import { Inspector } from '@renderer/features/inspector/Inspector'
 import { BottomPanel, type BottomTab } from '@renderer/features/bottom/BottomPanel'
 import { StatusBar } from '@renderer/features/statusbar/StatusBar'
+import { useCommandState } from '@domains/pipeline/ui/useCommandState'
+import { useSliceFailure } from '@domains/pipeline/ui/useSliceFailure'
+import { useFunctionGraph } from '@domains/graph-view/ui/useFunctionGraph'
+import type { CommandRequest, CommandState } from '@domains/pipeline/types'
 import mark from '@renderer/assets/pluto-mark.png'
 
 /** Which surface each activity opens in the main pane. */
 const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
   pipeline: 'plan',
+  functions: 'functions',
   graph: 'graph',
   changes: 'diff',
   tests: 'test'
@@ -35,13 +40,17 @@ function App(): JSX.Element {
   // Split is one click away in the surface tab bar.
   const [splitOpen, setSplitOpen] = useState(false)
   const [zoom, setZoom] = useState(1)
-  const [bottomTab, setBottomTab] = useState<BottomTab>('agent')
+  const [bottomTab, setBottomTab] = useState<BottomTab>('run')
   const [bottomCollapsed, setBottomCollapsed] = useState(false)
   const [pipelineSliceId, setPipelineSliceId] = useState<string | null>(null)
+  const [functionId, setFunctionId] = useState<number | null>(null)
+  // Bumped when a command ends, so the failure panel re-reads what it left.
+  const [runsDone, setRunsDone] = useState(0)
 
   const global = useGlobalData()
   const workspace = useWorkspaceData(workspaceId)
   const repo = useRepoState()
+  const graph = useFunctionGraph()
   const bottomRef = usePanelRef()
 
   const location = useMemo(
@@ -66,6 +75,25 @@ function App(): JSX.Element {
   const artifact = useStageArtifact(pipelineSlice?.id ?? null, artifactStage)
 
   const refreshRepo = repo.refresh
+  const reloadGraph = graph.reload
+
+  // A command that has ended has changed something on disk: state.json, a
+  // branch, or the graph itself. Re-read rather than wait out the next poll.
+  const onCommandFinished = useCallback(
+    (finished: CommandState) => {
+      refreshRepo()
+      setRunsDone((n) => n + 1)
+      if (finished.request.kind === 'graph-build') reloadGraph()
+    },
+    [refreshRepo, reloadGraph]
+  )
+  const command = useCommandState(onCommandFinished)
+  const failure = useSliceFailure(
+    pipelineSlice?.id ?? null,
+    pipelineSlice?.status ?? null,
+    runsDone
+  )
+
   const decide = useCallback(
     async (decision: ApprovalDecision, reason: string): Promise<ApprovalResult> => {
       if (!pipelineSlice?.waitingStage) {
@@ -89,8 +117,40 @@ function App(): JSX.Element {
 
   const activeWorkspace = global.workspaces.find((w) => w.id === workspaceId)
 
+  /**
+   * Start one command, and open the panel that shows what it says. Every
+   * button in the app comes through here, so "watching" is never optional.
+   */
+  function runCommand(request: CommandRequest): void {
+    setBottomTab('run')
+    const panel = bottomRef.current
+    if (panel?.isCollapsed()) {
+      panel.expand()
+      setBottomCollapsed(false)
+    }
+    void command.run(request)
+  }
+
+  const functionsData = {
+    index: graph.index,
+    loading: graph.loading,
+    selected: functionId,
+    onSelect: setFunctionId,
+    onBuild: () => runCommand({ kind: 'graph-build' }),
+    busy: command.busy
+  }
+
   const surfaceData = {
-    pipeline: { slice: pipelineSlice, artifact, onDecide: decide },
+    pipeline: {
+      slice: pipelineSlice,
+      artifact,
+      onDecide: decide,
+      busy: command.busy,
+      lastMerge: command.lastMerge,
+      failure,
+      onRun: runCommand
+    },
+    functions: functionsData,
     waitingCount: waiting.length,
     graph: workspace?.graph ?? null,
     changes: workspace?.changes ?? null,
@@ -139,7 +199,17 @@ function App(): JSX.Element {
                 selectedSliceId: pipelineSliceId,
                 onSelectSlice: setPipelineSliceId,
                 onOpenRepo: repo.open,
-                onSelectRepo: repo.select
+                onSelectRepo: repo.select,
+                busy: command.busy,
+                onLaunch: (requirement) => runCommand({ kind: 'pipeline', requirement })
+              }}
+              functions={{
+                index: graph.index,
+                selected: functionId,
+                onSelect: (id) => {
+                  setFunctionId(id)
+                  setPrimary('functions')
+                }
               }}
               workspaces={global.workspaces}
               activeWorkspaceId={workspaceId}
@@ -205,6 +275,8 @@ function App(): JSX.Element {
                   telemetry={global.telemetry}
                   collapsed={bottomCollapsed}
                   onToggleCollapsed={toggleBottom}
+                  command={command.state}
+                  onStop={command.stop}
                 />
               </Panel>
             </Group>
@@ -234,6 +306,7 @@ function App(): JSX.Element {
         workspace={activeWorkspace}
         telemetry={global.telemetry}
         selectionLabel={location ? `${location.file.path}:${location.symbol.startLine}` : null}
+        notice={command.error}
       />
     </div>
   )

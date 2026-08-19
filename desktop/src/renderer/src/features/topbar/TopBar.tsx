@@ -3,11 +3,15 @@ import type { ProjectInfo, TelemetrySnapshot, WorkspaceSummary } from '@shared/i
 import { Icon } from '@renderer/components/Icon'
 import { RunStateBadge } from '@renderer/components/primitives'
 import { tokens, usd } from '@renderer/lib/format'
+import { DemoBadge } from '@shared/ui/DemoBadge'
 import mark from '@renderer/assets/pluto-mark.png'
 
 /**
  * The top bar answers the first three questions in the information hierarchy:
  * which project, what is the agent doing, and what is that costing.
+ *
+ * Every figure on it is still v0.0.1 mock — the real repository is named in the
+ * Pipeline panel — so it carries the badge.
  */
 export function TopBar({
   project,
@@ -50,6 +54,7 @@ export function TopBar({
       ) : null}
 
       <div className="ml-auto flex shrink-0 items-center gap-3">
+        <DemoBadge />
         <div className="flex items-center gap-2 rounded-sm bg-raised px-2 py-1">
           <span className="text-tiny text-fg-dim">{telemetry.agent}</span>
           <span className="font-mono text-micro text-fg-mute">{telemetry.model}</span>

@@ -21,6 +21,7 @@ import {
   writeFileSync
 } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
+import { readMerge, readQuota, readStopped } from '../domains/pipeline/state'
 import type {
   ApprovalInput,
   ApprovalResult,
@@ -85,6 +86,17 @@ export function readJsonTolerant(file: string): Record<string, unknown> | null {
  * blank nor a comment decides). Kept literal on purpose: this is the contract
  * that decides whether the pipeline moves, so the UI must predict it exactly —
  * including the part where anything else means PENDING and stops the scan.
+ *
+ * `approved: <조건>` keeps its condition, exactly as `read_decision` does: the
+ * text after the colon becomes `Decision.reason` and the engine carries it into
+ * every later stage's briefing as an approval condition. Dropping it here (as
+ * this function used to) made the UI report a conditional approval as an
+ * unconditional one.
+ *
+ * @param text  the approval file's contents
+ * @flow  skip blanks and comments -> split the first real line at ':' ->
+ *        approved / rejected keep what follows -> anything else is PENDING and
+ *        stops the scan
  */
 export function parseDecision(text: string): Decision {
   for (const raw of stripBom(text).split(/\r\n|\r|\n/)) {
@@ -94,7 +106,7 @@ export function parseDecision(text: string): Decision {
     const head = cut === -1 ? line : line.slice(0, cut)
     const rest = cut === -1 ? '' : line.slice(cut + 1)
     const word = head.trim().toLowerCase().replace(/[.!]+$/, '')
-    if (word === 'approved' || word === 'approve') return { verdict: 'approved', reason: '' }
+    if (word === 'approved' || word === 'approve') return { verdict: 'approved', reason: rest.trim() }
     if (word === 'rejected' || word === 'reject') return { verdict: 'rejected', reason: rest.trim() }
     return { ...PENDING } // anything else: the human is still writing
   }
@@ -127,6 +139,18 @@ export function listSlices(repoRoot: string): SliceState[] {
   return out
 }
 
+/**
+ * One slice as `--list` would print it, plus what finishing it needs to know.
+ *
+ * `merge` / `quota` / `stopped` are carried here rather than fetched per click
+ * because the discard guard has to be able to answer for every row in the list,
+ * not only for the selected one.
+ *
+ * @param dir  the slice's directory
+ * @param id   its id, which is also the directory name
+ * @flow  no readable state.json -> the "(unreadable)" row `--list` prints ->
+ *        otherwise every field, with freshness only for a running slice
+ */
 function readSlice(dir: string, id: string): SliceState {
   const state = readJsonTolerant(join(dir, STATE_FILENAME))
   if (!state) {
@@ -143,6 +167,9 @@ function readSlice(dir: string, id: string): SliceState {
       testVerdict: null,
       epic: null,
       live: null,
+      merge: null,
+      quota: null,
+      stopped: null,
       unreadable: true
     }
   }
@@ -165,6 +192,9 @@ function readSlice(dir: string, id: string): SliceState {
     // the 10s rule to it would call every healthy run stale. Only live.json
     // carries freshness, and only a running slice has one worth reading.
     live: status.startsWith('running:') ? liveStatusFor(dir) : null,
+    merge: readMerge(state),
+    quota: readQuota(state),
+    stopped: readStopped(state),
     unreadable: false
   }
 }
@@ -302,6 +332,17 @@ export function readStageArtifact(
  *    read, not what we meant to write;
  *  - the reason is folded to one line, because `read_decision` only ever looks
  *    at the rest of the deciding line.
+ *
+ * An approval may carry a comment: `approved: <문구>` is the conditional
+ * approval the engine already understands — it survives `read_decision` as the
+ * decision's reason and is handed to every later stage. A bare `approved` is
+ * still written when no comment was typed.
+ *
+ * @param repoRoot  the repository the slice lives in
+ * @param input     the slice, stage, decision and the human's one line
+ * @flow  already decided -> refuse ; build the decision line (with the comment
+ *        when there is one) -> append below the template -> atomic write ->
+ *        re-read, and report what Python will see rather than what we meant
  */
 export function writeApproval(repoRoot: string, input: ApprovalInput): ApprovalResult {
   const dir = sliceDir(repoRoot, input.sliceId)
@@ -313,8 +354,13 @@ export function writeApproval(repoRoot: string, input: ApprovalInput): ApprovalR
     return { ok: false, path: file, effective: before.verdict, conflict: before.verdict }
   }
 
+  const comment = oneLine(input.reason ?? '')
   const line =
-    input.decision === 'approved' ? 'approved' : `rejected: ${oneLine(input.reason ?? '')}`.trimEnd()
+    input.decision === 'approved'
+      ? comment === ''
+        ? 'approved'
+        : `approved: ${comment}`
+      : `rejected: ${comment}`.trimEnd()
   // The template (all comments) is kept: it is the human-readable record of
   // what the gate was, and read_decision skips it anyway.
   const kept = existing === null || existing === '' || existing.endsWith('\n') ? existing : `${existing}\n`

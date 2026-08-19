@@ -2,6 +2,7 @@ import type { JSX } from 'react'
 import type { EpicState, RepoState, SliceState } from '@shared/ide'
 import { EmptyState } from '@renderer/components/primitives'
 import { SliceStatusBadge } from '@renderer/features/pipeline/SliceStatusBadge'
+import { LaunchPanel } from '@domains/pipeline/ui/LaunchPanel'
 
 export interface PipelineSidebarProps {
   repo: RepoState | null
@@ -9,23 +10,42 @@ export interface PipelineSidebarProps {
   onSelectSlice: (id: string) => void
   onOpenRepo: () => void
   onSelectRepo: (root: string) => void
+  /** A command is running — one slot, so Launch is disabled while it is. */
+  busy: boolean
+  /** A1: start `aidev pipeline --requirement <path>`. */
+  onLaunch: (requirement: string) => void
 }
 
 /**
- * What the terminal's `--list` shows, without the terminal. Read-only: the
- * judgement stays in the Python core, and the only thing this panel can cause
- * is one approval file being written from the Plan surface.
+ * What the terminal's `--list` shows, without the terminal — and, since v0.2.6,
+ * the button that starts one.
+ *
+ * Still no judgement of its own: Launch is `aidev pipeline --requirement`,
+ * nothing more, and everything below it is a read of `.aidev/`.
+ *
+ * @param repo             the open repository's state, or null
+ * @param selectedSliceId  which slice the surfaces are showing
+ * @param onSelectSlice    select another slice
+ * @param onOpenRepo       open the folder dialog
+ * @param onSelectRepo     switch to a repository already in `recent`
+ * @param busy             is a command running?
+ * @param onLaunch         launch the chosen requirement
+ * @flow  no repo -> say so ; no .aidev -> say so ; else the launcher, the
+ *        epics, and the slice list
  */
 export function PipelineSidebar({
   repo,
   selectedSliceId,
   onSelectSlice,
   onOpenRepo,
-  onSelectRepo
+  onSelectRepo,
+  busy,
+  onLaunch
 }: PipelineSidebarProps): JSX.Element {
   return (
     <>
       <RepoHeader repo={repo} onOpenRepo={onOpenRepo} onSelectRepo={onSelectRepo} />
+      {repo?.root && repo.isAidevRepo ? <LaunchPanel busy={busy} onLaunch={onLaunch} /> : null}
       {!repo || !repo.root ? (
         <EmptyState
           title="No repository selected"

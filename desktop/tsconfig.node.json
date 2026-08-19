@@ -4,8 +4,14 @@
     "electron.vite.config.*",
     "src/main/**/*",
     "src/preload/**/*",
-    "src/shared/**/*"
+    "src/shared/**/*",
+    "src/domains/**/*",
+    "src/app/**/*"
   ],
+  // A domain's `ui/` and the shared UI are React, compiled by the web project.
+  // Main never imports them, so type-checking them twice would only mean
+  // teaching this project about JSX for no reader's benefit.
+  "exclude": ["src/domains/**/ui/**", "src/shared/ui/**"],
   "compilerOptions": {
     "composite": true,
     "types": ["electron-vite/node"]

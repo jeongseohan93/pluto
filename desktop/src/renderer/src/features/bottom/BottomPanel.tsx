@@ -1,24 +1,47 @@
-import type { JSX } from 'react'
+import { useEffect, useRef, type JSX } from 'react'
 import type { LogLine, SessionLogs, TelemetrySnapshot } from '@shared/ide'
 import { Meter, TabBar } from '@renderer/components/primitives'
 import { tokens, usd } from '@renderer/lib/format'
+import { DemoBadge } from '@shared/ui/DemoBadge'
+import type { CommandState } from '@domains/pipeline/types'
 
-export type BottomTab = 'agent' | 'terminal' | 'test' | 'telemetry'
+export type BottomTab = 'run' | 'agent' | 'terminal' | 'test' | 'telemetry'
 
+/**
+ * `run` is the only real one — it is the output of the process this app
+ * launched. The other four are still v0.0.1 mock and say so.
+ */
 const TABS = [
-  { id: 'agent', label: 'Agent' },
-  { id: 'terminal', label: 'Terminal' },
-  { id: 'test', label: 'Test' },
-  { id: 'telemetry', label: 'Telemetry' }
+  { id: 'run', label: 'Run' },
+  { id: 'agent', label: 'Agent', badge: <DemoBadge /> },
+  { id: 'terminal', label: 'Terminal', badge: <DemoBadge /> },
+  { id: 'test', label: 'Test', badge: <DemoBadge /> },
+  { id: 'telemetry', label: 'Telemetry', badge: <DemoBadge /> }
 ] as const
 
+/**
+ * The watching half of 관전: whatever the launched `aidev` is saying, live.
+ *
+ * @param tab                which tab is open
+ * @param onTabChange        switch tabs
+ * @param logs               the mock session logs (the other four tabs)
+ * @param telemetry          the mock telemetry
+ * @param collapsed          is the panel collapsed to its tab bar?
+ * @param onToggleCollapsed  collapse / expand
+ * @param command            the running or last-finished command, or null
+ * @param onStop             end the running command
+ * @flow  collapsed -> nothing but the tabs ; run -> the live log ; telemetry ->
+ *        the meters ; otherwise one of the mock logs
+ */
 export function BottomPanel({
   tab,
   onTabChange,
   logs,
   telemetry,
   collapsed,
-  onToggleCollapsed
+  onToggleCollapsed,
+  command,
+  onStop
 }: {
   tab: BottomTab
   onTabChange: (tab: BottomTab) => void
@@ -26,6 +49,8 @@ export function BottomPanel({
   telemetry: TelemetrySnapshot
   collapsed: boolean
   onToggleCollapsed: () => void
+  command: CommandState | null
+  onStop: () => void
 }): JSX.Element {
   return (
     <section className="flex h-full min-h-0 flex-col bg-panel">
@@ -34,16 +59,30 @@ export function BottomPanel({
         value={tab}
         onChange={onTabChange}
         right={
-          <button
-            type="button"
-            onClick={onToggleCollapsed}
-            className="px-1 text-micro text-fg-mute hover:text-fg-dim"
-          >
-            {collapsed ? 'expand' : 'collapse'}
-          </button>
+          <>
+            {command?.running ? (
+              <button
+                type="button"
+                onClick={onStop}
+                title="SIGTERM — the same thing Ctrl-C does"
+                className="rounded-sm border border-line px-1.5 py-0.5 text-micro text-fg-dim hover:bg-hover hover:text-bad"
+              >
+                Stop
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={onToggleCollapsed}
+              className="px-1 text-micro text-fg-mute hover:text-fg-dim"
+            >
+              {collapsed ? 'expand' : 'collapse'}
+            </button>
+          </>
         }
       />
-      {collapsed ? null : (
+      {collapsed ? null : tab === 'run' ? (
+        <RunView command={command} />
+      ) : (
         <div className="min-h-0 flex-1 overflow-auto">
           {tab === 'telemetry' ? (
             <TelemetryDetail telemetry={telemetry} />
@@ -55,6 +94,77 @@ export function BottomPanel({
         </div>
       )}
     </section>
+  )
+}
+
+/**
+ * The launched command: what is running, and everything it has said.
+ *
+ * Scroll follows the tail only while the reader is already at the bottom —
+ * yanking the view away from a line someone is reading is worse than falling
+ * behind.
+ *
+ * @param command  the running or last-finished command, or null
+ * @flow  nothing has run -> say how to start one ; else the header and the log
+ * 주요 내부 변수: box(스크롤 컨테이너), stuck(바닥에 붙어 있었는가)
+ */
+function RunView({ command }: { command: CommandState | null }): JSX.Element {
+  const box = useRef<HTMLDivElement>(null)
+  const stuck = useRef(true)
+  const seq = command?.seq ?? 0
+
+  useEffect(() => {
+    const node = box.current
+    if (node && stuck.current) node.scrollTop = node.scrollHeight
+  }, [seq])
+
+  /** Remember whether the reader is at the tail, before the next line lands. */
+  function onScroll(): void {
+    const node = box.current
+    if (node) stuck.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24
+  }
+
+  if (!command) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        <p className="text-tiny text-fg-mute">
+          Nothing launched yet. Pick a requirement in the Pipeline panel and press Launch.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <>
+      <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-1">
+        <span
+          className={`shrink-0 font-mono text-micro ${command.running ? 'text-warn' : command.exitCode === 0 ? 'text-ok' : 'text-bad'}`}
+        >
+          {command.running
+            ? 'RUNNING'
+            : command.error
+              ? 'STOPPED'
+              : `EXIT ${command.exitCode ?? '?'}`}
+        </span>
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-micro text-fg-mute"
+          title={command.argv.join(' ')}
+        >
+          {command.argv.join(' ')}
+        </span>
+        {command.running ? (
+          <span
+            className="shrink-0 text-micro text-fg-mute"
+            title="the child process is tied to this window, the way it would be tied to a terminal"
+          >
+            runs while Pluto is open
+          </span>
+        ) : null}
+      </div>
+      <div ref={box} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
+        <LogView lines={command.lines} />
+      </div>
+    </>
   )
 }
 
@@ -72,7 +182,7 @@ function LogView({ lines }: { lines: LogLine[] }): JSX.Element {
       {lines.map((line, i) => (
         <li key={i} className="flex gap-3 px-3 hover:bg-hover">
           <span className="shrink-0 select-none text-fg-mute">{line.ts}</span>
-          <span className={`min-w-0 whitespace-pre-wrap break-words ${tone[line.level]}`}>
+          <span className={`min-w-0 whitespace-pre-wrap break-words select-text ${tone[line.level]}`}>
             {line.text}
           </span>
         </li>
