@@ -226,12 +226,12 @@ approval: plan
 === SLICE 2: <title> ===
 ...
 
-- The front matter accepts exactly six keys: 'approval:' (stage names, or the
+- The front matter accepts exactly seven keys: 'approval:' (stage names, or the
   word none), 'setup:' (one plain command, no shell operators), 'test_commands:'
   (how this project is verified, comma separated), 'max_turns:' (a number, or
-  '<stage>=<number>'), 'model:' (a model name, or '<stage>=<model>') and
-  'spec_check:' (on/off). If you are not sure, leave the line out and the
-  defaults apply.
+  '<stage>=<number>'), 'model:' (a model name, or '<stage>=<model>'),
+  'spec_check:' (on/off) and 'briefing:' (on/off). If you are not sure, leave
+  the line out and the defaults apply.
 - Any text before the first === marker is kept as a note and never executed.
 - Write the body in the language the epic is written in.
 """
@@ -298,9 +298,10 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
     """Every item has to be a requirement this pipeline can actually run.
 
     Checked once, before the queue starts, so a typo in item 4 is not discovered
-    after items 1..3 have already built branches. All six declared keys are read
-    here: ``model:`` and ``spec_check:`` were documented as validated and were
-    not, which is the same defect as a key that is ignored in silence.
+    after items 1..3 have already built branches. All seven declared keys are
+    read here: ``model:`` and ``spec_check:`` were documented as validated and
+    were not, which is the same defect as a key that is ignored in silence, and
+    ``briefing:`` joins them here rather than repeating it.
 
     @param items  the parsed slice list
     @param path   the file the list came from, named in every message
@@ -319,6 +320,7 @@ def validate_items(items: Sequence[SliceItem], path: Path) -> None:
             pipeline.resolve_max_turns(fields)
             pipeline.resolve_models(fields)
             pipeline.resolve_spec_check(fields)
+            pipeline.resolve_briefing(fields)
         except pipeline.PipelineError as exc:
             raise pipeline.PipelineError("{0}: {1}".format(where, exc))
         # Not an error: the queue is worth running with one line ignored, but

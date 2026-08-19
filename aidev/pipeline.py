@@ -50,7 +50,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, events as ev, graph, progress, reporter, runner, specs, verify, workspace
+from . import (
+    __version__,
+    briefing,
+    events as ev,
+    graph,
+    progress,
+    reporter,
+    runner,
+    specs,
+    verify,
+    workspace,
+)
 from .verify import split_command
 from .storage import (
     Database,
@@ -526,6 +537,31 @@ def resolve_spec_check(fields: Dict[str, str]) -> bool:
     )
 
 
+def resolve_briefing(fields: Dict[str, str]) -> bool:
+    """Is the engine setting the table before this slice's sessions? On unless told otherwise.
+
+    The switch exists for two reasons at once. It is the escape hatch for a
+    repository where the graph is not worth its tokens, and it is the A/B
+    control: the same requirement run with it off produces a prompt that is
+    byte-for-byte the pre-briefing one, which is the only honest way to measure
+    what the briefing bought.
+
+    @param fields  the requirement's front matter
+    @flow  no line -> on ; off word -> off ; on word -> on ; anything else -> refuse
+    """
+    raw = fields.get("briefing")
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if value in _OFF_WORDS:
+        return False
+    if value in _ON_WORDS:
+        return True
+    raise PipelineError(
+        "briefing: needs 'on' or 'off', got {0!r}".format(raw.strip())
+    )
+
+
 # ------------------------------------------------------- unknown front matter
 #
 # Measured 2026-08-17: 'model:' was written into a requirement's front matter
@@ -543,6 +579,7 @@ KNOWN_FRONT_MATTER_KEYS: Tuple[str, ...] = (
     "max_turns",
     "model",
     "spec_check",
+    "briefing",
 )
 
 
@@ -988,6 +1025,25 @@ class SliceRecord:
         @param number  which replan superseded it, counting from 1
         """
         return self.plans_dir / "{0:03d}.md".format(number)
+
+    @property
+    def briefings_dir(self) -> Path:
+        """Where each stage's 상차림 is kept, so a retry or an amend reuses what it paid for."""
+        return self.dir / "briefings"
+
+    def briefing_path(self, stage: str) -> Path:
+        """The briefing one stage was launched with, as a human can read it.
+
+        @param stage  the stage the briefing was built for
+        """
+        return self.briefings_dir / "{0}.md".format(stage)
+
+    def briefing_meta_path(self, stage: str) -> Path:
+        """The sidecar that says which commit and plan that briefing answers.
+
+        @param stage  the stage the briefing was built for
+        """
+        return self.briefings_dir / "{0}.json".format(stage)
 
     @property
     def hooks_dir(self) -> Path:
@@ -1608,7 +1664,7 @@ You are the PLAN stage of an unattended pipeline running on this repository.
 REQUIREMENT
 -----------
 {requirement}
-
+{briefing}
 INSTRUCTIONS
 - This stage is read-only. Do not create, modify or delete any file, and do not
   run commands. Mutating tools are blocked; do not look for a way around them.
@@ -1632,7 +1688,7 @@ REQUIREMENT
 APPROVED PLAN
 -------------
 {plan}
-{approval}
+{approval}{briefing}
 INSTRUCTIONS
 - Follow the approved plan. Where the real code contradicts it, follow the code
   and say so in your final message.
@@ -1642,6 +1698,14 @@ INSTRUCTIONS
   each stage for you when it finishes.
 {allowed}
 Finish with a short summary: files changed and anything the plan got wrong.
+"""
+
+# The 상차림 (v0.6, 2단계). Context, never an instruction: the engine looked the
+# code up so the session does not have to, and the slot renders to nothing at all
+# when there is no briefing - which is what keeps 'briefing: off' byte-identical
+# to the prompt as it was before this existed.
+_BRIEFING_NOTE = """
+{briefing}
 """
 
 # The one instruction this slice adds. Everything else it introduces is a
@@ -1882,6 +1946,7 @@ def build_prompt(
     spec_check: bool = True,
     diet: bool = False,
     approvals: Sequence[Dict[str, Any]] = (),
+    briefing: str = "",
 ) -> str:
     """The prompt one stage is given, built from what the engine already knows.
 
@@ -1898,11 +1963,14 @@ def build_prompt(
     @param spec_check     whether the 함수 명세 convention is being enforced
     @param diet           whether verification reaches the stage through ``aidev verify``
     @param approvals      conditions a human attached to this slice's approvals
+    @param briefing       the 상차림 the engine set for this stage, '' for none
     @flow  plan (+replan) -> implement/test template -> allowed/test-command/workspace/approval notes
     주요 내부 변수: note(허용 규칙 + 검증 명령 안내), where(워크스페이스 안내)
     """
     if stage == "plan":
-        return _PLAN_PROMPT.format(requirement=requirement.strip()) + _replan_note(replan)
+        return _PLAN_PROMPT.format(
+            requirement=requirement.strip(), briefing=_brief_note(briefing)
+        ) + _replan_note(replan)
     template = _IMPLEMENT_PROMPT if stage == "implement" else _TEST_PROMPT
     note = ""
     if allowed:
@@ -1916,9 +1984,12 @@ def build_prompt(
         where = _WORKSPACE_NOTE.format(branch=branch, base=base or "the repository's HEAD")
     extra: Dict[str, str] = {}
     if stage == "implement":
+        # Only implement's template carries these, so passing them here is also
+        # what keeps the test template exactly as it was.
         extra = {
             "repair": _repair_note(repair),
             "spec": _SPEC_NOTE if spec_check else "",
+            "briefing": _brief_note(briefing),
         }
     return template.format(
         requirement=requirement.strip(),
@@ -1929,6 +2000,24 @@ def build_prompt(
         approval=_approval_note(approvals),
         **extra
     )
+
+
+def _brief_note(text: str) -> str:
+    """The briefing slot: the document, or nothing whatsoever.
+
+    Nothing whatsoever is the load-bearing half. An empty briefing has to leave
+    the prompt byte-for-byte as it was before this feature existed, or the A/B
+    the switch is for measures two things at once.
+
+    The text is an *argument* to ``format`` and never a template, so a briefing
+    carrying ``{`` from a JS signature or a JSX excerpt cannot break the build.
+
+    @param text  the rendered briefing, possibly empty
+    @flow  nothing to say -> '' ; otherwise the document in its own block
+    """
+    if not (text or "").strip():
+        return ""
+    return _BRIEFING_NOTE.format(briefing=text.strip())
 
 
 def _repair_note(repair: Optional[Dict[str, Any]]) -> str:
@@ -2031,6 +2120,9 @@ class PipelineConfig:
     verify_engine: bool = True
     # v0.6: after a stage commit the function graph is *marked* stale, not rebuilt.
     graph_hook: bool = True
+    # v0.6 2단계: the engine reads the graph and sets the table before a session.
+    # Off means the prompt is exactly what it was before briefings existed.
+    briefing: bool = True
     output_diet: bool = True
     write_guard: bool = True
     max_repairs: int = DEFAULT_MAX_REPAIRS
@@ -2144,6 +2236,10 @@ class StageRun:
     text: str
     quota: bool = False
     reset_at: Optional[float] = None
+    # v0.6 2단계 계측: what the table cost to set, and whether the session ever
+    # used the query verbs the briefing points it at.
+    briefing_tokens: int = 0
+    graph_queries: int = 0
 
     @property
     def ok(self) -> bool:
@@ -2411,6 +2507,107 @@ def execute_stage(
     )
 
 
+# ------------------------------------------------------------- 상차림 (v0.6)
+#
+# The stages a briefing is set for. test is not one of them: with the verify
+# engine on there is no test session at all, and when there is one its job is to
+# run a declared command, not to find code. decompose and diagnose exclude
+# themselves - their prompts are fixed, so they never reach build_prompt.
+
+BRIEFING_STAGES: Tuple[str, ...] = ("plan", "implement")
+
+# What a session's own graph query looks like from telemetry's side.
+GRAPH_QUERY_PREFIX = "aidev graph"
+
+
+def prepare_briefing(
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    stage: str,
+    requirement: str,
+    fixed: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Set the table before the session is launched, and write down what it cost.
+
+    A derived cache must never be able to kill a slice - the same rule
+    ``mark_graph_stale`` already runs on - so every failure here is one warning
+    line and a stage that launches with the prompt it would have had anyway.
+
+    @param cfg          the slice's configuration - the switch and the worktree
+    @param rec          the record the briefing is written into
+    @param state        state.json, where the cost is published
+    @param stage        the stage about to run
+    @param requirement  the requirement body
+    @param fixed        the stage's fixed prompt, when it has one (decompose, diagnose)
+    @flow  not ours -> {} ; build (cached or fresh) -> record it in state -> say what it cost
+    주요 내부 변수: brief(차려진 상), record(계기판에 실릴 항목)
+    """
+    if fixed is not None or stage not in BRIEFING_STAGES:
+        return {}
+    # --no-graph is a promise that this run does not touch the function graph at
+    # all, and a briefing is the largest thing that would.
+    if not (cfg.briefing and cfg.graph_hook):
+        return {}
+    if getattr(rec, "briefings_dir", None) is None:
+        return {}
+    try:
+        brief = briefing.build(
+            cfg.cwd,
+            stage,
+            requirement,
+            rec.read_plan(),
+            cache_dir=rec.briefings_dir,
+        )
+    except Exception as exc:  # a set table is not worth a dead slice
+        say("warning: no briefing this stage ({0})".format(exc))
+        return {}
+    if not brief.text.strip():
+        return {}
+    briefings = state.setdefault("briefing", {})
+    if isinstance(briefings, dict):
+        briefings[stage] = {
+            "tokens": brief.tokens,
+            "chars": len(brief.text),
+            "sections": list(brief.sections),
+            "scope": list(brief.scope),
+            "path": str(rec.briefing_path(stage)),
+            "reused": brief.reused,
+            "graph_functions": int(brief.graph.get("functions") or 0),
+            "at": now_iso(),
+        }
+    say(
+        "briefing: {0} tokens, sections {1} -> {2}{3}".format(
+            brief.tokens,
+            ", ".join(brief.sections) or "none",
+            rec.briefing_path(stage),
+            " (reused)" if brief.reused else "",
+        )
+    )
+    return {"text": brief.text, "tokens": brief.tokens}
+
+
+def count_graph_queries(telemetry: Dict[str, Any]) -> int:
+    """How many times a session asked the graph instead of going looking.
+
+    This is the origin of the 예외 경로 발생률: a briefing that answers everything
+    reads zero here, and a rising number is the graph telling the engine what it
+    left off the table.
+
+    @param telemetry  the run's telemetry dict
+    @flow  every observed Bash call -> target starting with 'aidev graph' -> count it
+    주요 내부 변수: calls(관측된 도구 호출들)
+    """
+    calls = ((telemetry or {}).get("observed") or {}).get("calls") or []
+    total = 0
+    for call in calls:
+        if not isinstance(call, dict) or call.get("tool") != "Bash":
+            continue
+        if str(call.get("target") or "").strip().startswith(GRAPH_QUERY_PREFIX):
+            total += 1
+    return total
+
+
 def run_stage(
     cfg: PipelineConfig,
     rec: SliceRecord,
@@ -2433,8 +2630,9 @@ def run_stage(
     @param amend        the open amend cycle, if any
     @param repair       a failed verification this run must fix, if any
     @param replan       the rejected plan and its rejection, for a re-plan
-    @flow  session policy -> build prompt (+approval conditions) -> execute -> quota? wait and retry : return
-    주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수)
+    @flow  session policy -> set the table (v0.6) -> build prompt (+approval conditions)
+           -> execute -> record what the briefing cost -> quota? wait and retry : return
+    주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수), brief(상차림)
     """
     spec = spec or StageSpec.for_slice(stage, cfg, rec)
     entry = stage_entry(state, stage)
@@ -2461,6 +2659,9 @@ def run_stage(
         attempt += 1
         entry["status"] = "running"
         entry["attempts"] = attempt
+        # Before the status is published, so the state a watcher reads while the
+        # session runs already says what the table cost to set.
+        brief = prepare_briefing(cfg, rec, state, stage, requirement, fixed=spec.prompt)
         set_status(rec, state, "running:{0}".format(stage))
 
         prompt = spec.prompt or build_prompt(
@@ -2481,6 +2682,7 @@ def run_stage(
             # Rebuilt every time round this loop, so a quota retry, a resume, a
             # repair and an amend all carry the condition without asking for it.
             approvals=approval_conditions(state),
+            briefing=brief.get("text", ""),
         )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
@@ -2492,6 +2694,8 @@ def run_stage(
         run = execute_stage(
             cfg, rec, stage, prompt, attempt, resume_session=session, spec=spec, state=state
         )
+        run.briefing_tokens = int(brief.get("tokens") or 0)
+        run.graph_queries = count_graph_queries(run.telemetry)
         record_run(rec, run)
         if run.session_id:
             entry["session_id"] = run.session_id
@@ -2558,6 +2762,10 @@ def record_run(rec: SliceRecord, run: StageRun) -> None:
     the bill is the sum of the tries, not of the successes. The text is clipped
     at 2000 characters so a chatty stage cannot make the ledger unreadable.
 
+    Since v0.6 each entry also carries what the briefing cost this session and
+    how often the session asked the graph, so the two halves of the 상차림
+    trade-off can be read off one file.
+
     @param rec  the slice whose ledger this is
     @param run  the finished stage run, with its telemetry attached
     """
@@ -2576,6 +2784,10 @@ def record_run(rec: SliceRecord, run: StageRun) -> None:
             "tokens": exact.get("tokens"),
             "quota": run.quota,
             "finished_at": run.telemetry.get("finished_at"),
+            # v0.6 2단계, both optional: an older reader of runs.json does not
+            # know these keys and does not have to.
+            "briefing_tokens": run.briefing_tokens,
+            "graph_queries": run.graph_queries,
             "summary": run.text[:2000],
         }
     )
@@ -3663,6 +3875,10 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     Every attempt counts: a stage retried through a usage limit spent tokens on
     each try, and a summary showing only the last one understates the bill.
 
+    The table itself is never widened - too many tests read its exact shape - so
+    v0.6's briefing cost arrives as one line underneath it, and only when there
+    was a briefing at all.
+
     @param state  state.json, which names the stages and what they decided
     @param runs   the stored runs, where the tokens and the cost come from
     """
@@ -3737,6 +3953,7 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     if verdict:
         note = {"pass": "", "fail": "  <- tests failed", "unknown": "  <- no TEST_RESULT line"}
         lines.extend(_verify_lines(state, note.get(verdict, ""), verdict))
+    lines.extend(_briefing_lines(state, runs))
     amends = [entry for entry in (state.get("amends") or []) if isinstance(entry, dict)]
     if amends:
         said = str(amends[-1].get("instruction") or "").strip().splitlines()
@@ -3747,6 +3964,37 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
         lines.append("Reason    {0}".format(state["reason"]))
     lines.extend(_workspace_lines(state))
     return "\n".join(lines)
+
+
+def _briefing_lines(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> List[str]:
+    """What the 상차림 cost, and whether the session ever asked for more.
+
+    Silent when nothing was set, so a slice run with ``briefing: off`` prints
+    exactly the summary it printed before briefings existed. The table above is
+    deliberately not widened: this is one line under it, not a new column.
+
+    @param state  state.json, which carries one record per briefed stage
+    @param runs   the stored runs, where the query count per session lives
+    @flow  no briefing -> [] ; else per stage its tokens, then reuse and query counts
+    주요 내부 변수: parts(단계별 토큰 조각), reused(재사용된 브리핑 수)
+    """
+    briefings = state.get("briefing")
+    if not isinstance(briefings, dict) or not briefings:
+        return []
+    parts = []
+    for stage in stage_order(state):
+        entry = briefings.get(stage)
+        if isinstance(entry, dict) and entry.get("tokens"):
+            parts.append("{0} {1}".format(stage, reporter.format_tokens(int(entry["tokens"]))))
+    if not parts:
+        return []
+    reused = len([e for e in briefings.values() if isinstance(e, dict) and e.get("reused")])
+    queries = sum(int(entry.get("graph_queries") or 0) for entry in runs)
+    return [
+        "Briefing  {0} tok   reused {1}   graph queries {2}".format(
+            ", ".join(parts), reused, queries
+        )
+    ]
 
 
 def _verify_lines(state: Dict[str, Any], note: str, verdict: Any) -> List[str]:
@@ -3875,7 +4123,7 @@ def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def add_parser(sub: Any) -> Any:
-    """Register the ``aidev pipeline`` subcommand and all of its flags, ``--no-graph`` included.
+    """Register the ``aidev pipeline`` subcommand and all of its flags, ``--no-briefing`` included.
 
     @param sub  the subparsers object from ``cli.build_parser``
     """
@@ -4049,6 +4297,11 @@ def add_parser(sub: Any) -> Any:
         help="do not mark the function graph stale after a stage commit",
     )
     cmd.add_argument(
+        "--no-briefing",
+        action="store_true",
+        help="do not set a briefing from the function graph before a session launches",
+    )
+    cmd.add_argument(
         "--permission-mode",
         default=None,
         help="for implement/test, e.g. bypassPermissions (plan stays readonly)",
@@ -4209,8 +4462,9 @@ def _config(
     CLI stage > front-matter stage > CLI base > front-matter base > the default.
     A caller with no front matter to offer (an epic's own decompose) gets exactly
     what it got before. The ``model:`` line resolves by the same precedence, and
-    each ``--no-*`` switch (spec check, verify engine, graph hook, ...) turns one
-    default behaviour back off here.
+    each ``--no-*`` switch (spec check, verify engine, graph hook, briefing, ...)
+    turns one default behaviour back off here. The two-sided ones - ``spec_check``
+    and ``briefing`` - are off when *either* the front matter or the flag says so.
 
     @param args           the parsed arguments
     @param repo           the user's repository
@@ -4270,6 +4524,7 @@ def _config(
         spec_check=resolve_spec_check(fields) and not getattr(args, "no_spec_check", False),
         verify_engine=not getattr(args, "no_verify_engine", False),
         graph_hook=not getattr(args, "no_graph", False),
+        briefing=resolve_briefing(fields) and not getattr(args, "no_briefing", False),
         output_diet=not getattr(args, "no_output_diet", False),
         write_guard=not getattr(args, "no_write_guard", False),
         max_repairs=getattr(args, "max_repairs", DEFAULT_MAX_REPAIRS),
@@ -4310,6 +4565,9 @@ class SliceOutcome:
 
 def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     """``--requirement``: the ordinary launch, and the ``--dry-run`` that previews it.
+
+    The dry run prints every switch that is on, briefing included, because the
+    point of it is that nothing about the coming run is a surprise.
 
     @param args      the parsed arguments
     @param repo      the user's repository
@@ -4362,10 +4620,11 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
                 for name in STAGES
             )
         ))
-        print("guards    write-guard {0}, spec-check {1}, output-diet {2}".format(
+        print("guards    write-guard {0}, spec-check {1}, output-diet {2}, briefing {3}".format(
             "on" if turns.write_guard else "off",
             "on" if turns.spec_check else "off",
             "on" if diet_is_on(turns) else "off",
+            "on" if (turns.briefing and turns.graph_hook) else "off",
         ))
         print("gates     {0}".format(", ".join(gates) or "(none: fully unattended)"))
         print("slice dir {0}".format(rec.dir))

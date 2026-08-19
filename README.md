@@ -665,17 +665,18 @@ aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점�
 `slices.md`의 각 항목은 **그 자체로 실행 가능한 requirement**다. 형식은 기존
 front matter 규약과 그대로 호환이고, 마커만 추가된다. 항목의 front matter는
 `approval:` / `setup:` / `test_commands:` / `max_turns:` / `model:` /
-`spec_check:` 여섯 키를 받고, **목록 전체를 먼저 검증한다** — 4번 항목의 오타가
-1~3번이 브랜치를 만들기 전에 걸린다. (여섯 키 전부를 실제로 검증한다. `model:`과
-`spec_check:`는 여기 적혀 있으면서 정작 검사에서 빠져 있었다 — 선언한 줄이 조용히
-아무 일도 안 하는 것은 아래 미지 키와 같은 결함이라 함께 닫았다.)
+`spec_check:` / `briefing:` 일곱 키를 받고, **목록 전체를 먼저 검증한다** — 4번
+항목의 오타가 1~3번이 브랜치를 만들기 전에 걸린다. (일곱 키 전부를 실제로
+검증한다. `model:`과 `spec_check:`는 여기 적혀 있으면서 정작 검사에서 빠져 있었다
+— 선언한 줄이 조용히 아무 일도 안 하는 것은 아래 미지 키와 같은 결함이라 함께
+닫았고, `briefing:`은 처음부터 같은 자리에 넣었다.)
 
 **모르는 키는 무시하되 경고한다**(v0.5). 실측 2026-08-17: `model:`이 아직 미지 키이던
 시절 조용히 버려졌고, 그 바람에 **`max_turns` 적용까지 깨졌다.** 조용한 무시가 결함이지
 무시 자체가 결함은 아니다.
 
 ```
-warning: front matter key(s) ignored: modle - known: approval, setup, test_commands, max_turns, model, spec_check
+warning: front matter key(s) ignored: modle - known: approval, setup, test_commands, max_turns, model, spec_check, briefing
 ```
 
 - **에러가 아니다.** 오타일 수도, 사람이 남긴 메모일 수도, 다음 버전이 추가할 키일 수도
@@ -976,6 +977,9 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   `spec_check: off` 또는 `--no-spec-check`로 끈다. (위 "검증의 결정론화" 절)
 - **빈 requirement는 발사 시점에 거부한다**(v0.5, exit 2). 모든 진입점이 같은
   검사를 부른다.
+- **plan / implement는 발사 직전에 그래프 브리핑을 받는다**(v0.6). `briefing: off`
+  / `--no-briefing` / `--no-graph`로 끄고, 끄면 프롬프트는 바이트 단위로 예전과
+  같다. (아래 "브리핑 생성기 — 상차림" 절)
 
 주요 옵션:
 
@@ -1011,7 +1015,8 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--no-write-guard` | 기존 파일에 대한 Write 차단을 끈다 (v0.5) |
 | `--no-output-diet` | implement에 `aidev verify` 대신 원본 테스트 명령을 준다 (v0.5) |
 | `--no-spec-check` | 함수 명세 기계 검사를 끈다 (v0.5) |
-| `--no-graph` | 단계 커밋 뒤 Function Graph를 stale로 표시하지 않는다 (v0.6) |
+| `--no-graph` | 단계 커밋 뒤 Function Graph를 stale로 표시하지 않는다 (브리핑도 함께 꺼진다, v0.6) |
+| `--no-briefing` | 세션 발사 전 브리핑을 차리지 않는다 (v0.6) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |
 | `--allow-tool` | implement/test에 추가할 권한 규칙 (반복 가능) |
 | `--session-reset-after` | 같은 단계가 비쿼터 실패 N회면 새 session (기본 1) |
@@ -1126,7 +1131,116 @@ JS/TS는 자체 문자 스캐너다. tree-sitter를 쓰지 않은 이유: 이 �
 움직인 파일만 다시 읽는다. 마커 쓰기가 실패해도 경고 한 줄이고 slice는 계속 간다 —
 파생 캐시가 파이프라인을 죽일 수는 없다. `--no-graph`면 아무것도 하지 않는다.
 
-브리핑 생성기와 plan 프롬프트 주입은 2단계, 그래프 화면은 3단계다.
+## 브리핑 생성기 — 상차림 (v0.6, 2단계)
+
+> 에이전트는 찾지 않는다. 좌표로 요청한다. 좌표는 그래프가 안다.
+
+**왜.** 실측 2026-08-15~18: plan이 계획할 코드를 **찾는 데만** 20~59턴을 썼고,
+implement는 같은 파일을 다시 찾느라 slice당 $2~4를 썼으며, 한 세션 안에서 같은
+파일을 5~11번 읽었다. 그건 사고가 아니라 상차림이고, 방 안에서 가장 비싼 사람이
+매번 다시 차리고 있었다. 그래서 **엔진이 세션 발사 직전에 한 번 차린다** — 이미
+갖고 있는 DB에서.
+
+**LOD 3단.** 축척이 큰 것부터, 그 순서 그대로 프롬프트에 들어간다. 앞쪽(저해상)은
+같은 커밋이면 단계가 바뀌어도 그대로라 **프롬프트 캐시가 맞고**, 뒤쪽(고해상)은
+plan마다 바뀐다.
+
+| 절 | 무엇 | 언제 |
+|---|---|---|
+| `1. REPO MAP` | 디렉터리별 파일·함수 수 + 피호출 상위 진입점 | 항상 |
+| `2. RELATED` | requirement(+plan)의 식별자와 겹치는 함수 + 좌표 | 항상 |
+| `3. SCOPE` | plan이 지목한 파일/함수의 명세 전문 + 호출/피호출 + 본문 발췌 | plan 이후 |
+| `4. ALREADY EXISTS` | scope와 이름이 겹치는 **기존** 함수 (재발명 방지) | implement |
+
+```
+# BRIEFING  implement
+
+graph: 1252 functions, 76 files, spec 70%   (base ce7ccfd, 2026-08-19T13:10:26+09:00)
+
+## 1. REPO MAP   (the whole repository, at a distance)
+aidev/                        23 files    610 functions
+tests/                        18 files    528 functions
+entry points (most called):
+  say                     aidev/pipeline.py:3712            142 callers
+
+## 2. RELATED   (what the requirement's words name)
+matched on: briefing, graph, prompt, stage, cache
+  build_prompt            aidev/pipeline.py:1889            The prompt one stage is given, ...
+  +18 more (aidev graph summaries --dir aidev)
+
+## 3. SCOPE   (what the plan names, in full)
+aidev/pipeline.py  610 functions indexed   (aidev graph summaries --dir aidev/pipeline.py)
+
+prepare_briefing(cfg, rec, state, stage, requirement, fixed=None)  aidev/pipeline.py:2432-2489  py
+  Set the table before the session is launched, and write down what it cost.
+  @param cfg  the slice's configuration - the switch and the worktree
+  @flow  not ours -> {} ; build (cached or fresh) -> record it in state -> say what it cost
+  calls 6: briefing.build aidev/briefing.py:249 | say aidev/pipeline.py:3712
+  callers 1: run_stage aidev/pipeline.py:2586
+   2432 | def prepare_briefing(
+
+## 4. ALREADY EXISTS   (before you write a new one)
+  Briefing.to_meta        aidev/briefing.py:124             The sidecar written beside the md
+기존 함수 재사용 우선. 유사 기능 신설 시 사유 명시. 통합 리팩토링은 금지.
+
+---
+이외는 aidev graph show/callers/calls/summaries로 요청하라.
+파일 통읽기 전에 조회 우선.
+```
+
+**마법은 없다.** 매칭은 식별자 부분 문자열이 전부다 — requirement에서 `[A-Za-z_]\w{2,}`
+를 뽑아 snake/camel로 쪼개고, 불용어를 빼고, `LIKE %토큰%`으로 이름·qualname·기능
+한 줄을 훑는다. **임베딩도 시맨틱 검색도 하지 않는다.** 새벽 세 시에 "왜 이게
+브리핑에 들어왔나"를 단어만 보고 설명할 수 없으면 그건 디버깅할 수 없는 브리핑이다.
+
+**상한이 곧 설계다.** 절마다 토큰 상한(900 / 1200 / 2500 / 500)이 있고, 넘으면
+**줄 단위로 뒤에서 버린다** — 줄 중간을 자르지 않는다. 좌표가 깨지면 브리핑의 존재
+이유가 없어지기 때문이다. 잘린 자리에는 `+N more (aidev graph summaries --dir ...)`
+처럼 **나머지를 여는 동사**를 남긴다. 이 저장소 자신(1252 함수) 기준 실측 3619 토큰.
+
+**언제·어디에.** plan / implement 발사 직전(=repair·amend·쿼터 재시도 포함)에 만들고,
+`.aidev/slices/<id>/briefings/<stage>.md`에 사이드카(`.json`)와 함께 남긴다.
+브랜치에는 싣지 않는다 — 그래프에서 언제든 다시 만들 수 있는 파생물에 단계 커밋마다
+수천 토큰짜리 md를 태우는 것은 값을 두 번 치르는 일이다. test 단계는 브리핑하지
+않는다(검증 엔진이 켜져 있으면 세션 자체가 없고, 있어도 그 단계의 일은 선언된 명령을
+돌리는 것이지 코드를 찾는 것이 아니다).
+
+**신선도와 캐시.** 그래프가 dirty로 표시돼 있으면 **먼저 증분 갱신**하고 차린다.
+worktree에 DB가 아예 없으면(gitignore되므로 따라오지 않는다) 전체 빌드를 한 번
+치른다. `sha1(stage + HEAD + requirement + plan)`이 같으면 **다시 만들지 않고**
+파일을 그대로 재사용한다 — plan digest가 scope의 상위집합이라 "같은 커밋 + 같은
+scope"를 정확히 덮고, 게이트에서 사람이 plan.md를 고친 경우도 놓치지 않는다.
+커밋을 읽을 수 없으면(비-git) 같음을 증명할 수 없으므로 **재사용하지 않는다.**
+
+**끄는 법 셋.** front matter `briefing: off`, 플래그 `--no-briefing`, 그리고
+`--no-graph`(그래프를 아예 안 쓴다는 약속이므로 브리핑도 함께 꺼진다). 껐을 때의
+프롬프트는 **바이트 단위로** 이 기능이 없던 때와 같다 — A/B가 두 가지를 한꺼번에
+재는 일이 없도록.
+
+**계측.** RESULT에 한 줄:
+
+```
+Briefing  plan 1.2k, implement 3.1k tok   reused 1   graph queries 0
+```
+
+`runs.json`의 각 세션에 `briefing_tokens`와 `graph_queries`가 함께 남는다.
+`graph_queries`는 **지금은 항상 0으로 읽힌다** — 어떤 단계도 `aidev graph`를 실행할
+권한이 없기 때문이다(plan은 readonly 프로파일이 Bash 자체를 막고, implement/test가
+받는 규칙에 조회 동사가 없다). 이 slice는 권한을 새로 열지 않는다. 열고 싶으면
+사람이 직접 준다:
+
+```bash
+aidev pipeline --requirement tasks/x.md --allow-tool 'Bash(aidev graph:*)'
+```
+
+그 순간부터 이 카운터가 0이 아닌 값을 읽고, 그 값이 **예외 경로 발생률** — 상차림이
+빠뜨린 것의 양 — 의 원천이 된다.
+
+**실패해도 slice는 죽지 않는다.** 그래프를 못 읽든 파일을 못 쓰든 경고 한 줄
+(`warning: no briefing this stage (...)`)을 찍고 그 단계는 브리핑 없이 발사된다.
+`mark_graph_stale`과 같은 원칙이다 — 파생 캐시는 파이프라인을 죽일 자격이 없다.
+
+그래프 화면(사람이 보는 시선)은 3단계다.
 
 ## 다른 터미널에서 관찰 (v0.1.2)
 
