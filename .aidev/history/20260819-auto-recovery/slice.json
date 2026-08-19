@@ -31,10 +31,12 @@
     "implement": {
       "status": "done",
       "run_id": "20260819-142959-auto-recovery-implement",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "2c25a8f78e0a5c5369afdd3d30f28504a0a2dad5"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -71,5 +73,5 @@
       "cost_usd": 19.840101750000006
     }
   ],
-  "updated_at": "2026-08-19T15:12:06+09:00"
+  "updated_at": "2026-08-19T15:15:31+09:00"
 }
