@@ -31,10 +31,12 @@
     "implement": {
       "status": "done",
       "run_id": "20260819-124618-graph-briefing-implement",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "1e22b3a7e586173a723ae2afe12cc4be17880e63"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -71,5 +73,5 @@
       "cost_usd": 18.752354999999998
     }
   ],
-  "updated_at": "2026-08-19T13:18:10+09:00"
+  "updated_at": "2026-08-19T13:21:18+09:00"
 }
