@@ -1,6 +1,6 @@
 {
   "slice_id": "20260819-graph-briefing",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260819-graph-briefing",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "01a06768ae653351b9ce562e3eb3720eeee25d27",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 19,
+    "test_files": 5,
+    "budget": 160,
+    "warn": false
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260819-123353-graph-briefing-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-19T12:33:53+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-123353-graph-briefing-plan",
+      "status": "completed",
+      "turns": 51,
+      "tokens": {
+        "input": 80,
+        "cache_creation": 204946,
+        "cache_read": 5353831,
+        "output": 41289,
+        "billed_input": 5558857,
+        "peak_context": 204948
+      },
+      "cost_usd": 5.7590005
+    }
+  ],
+  "updated_at": "2026-08-19T12:44:33+09:00"
 }
