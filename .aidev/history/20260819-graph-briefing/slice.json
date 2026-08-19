@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260819-graph-briefing",
+  "status": "pending",
+  "branch": "slice/20260819-graph-briefing",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "01a06768ae653351b9ce562e3eb3720eeee25d27",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-19T12:33:53+09:00"
+}
