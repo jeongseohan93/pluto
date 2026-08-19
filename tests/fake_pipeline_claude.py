@@ -6,10 +6,14 @@ the pipeline has to survive.
 
     AIDEV_FAKE_LOG        append one JSON line per invocation: argv, cwd, prompt
     AIDEV_FAKE_SESSION    session id to report (default: pipe-session)
-    AIDEV_FAKE_MODE       ok | quota | fail | touch | forge | requires_approval
-                          (default: ok)
+    AIDEV_FAKE_MODE       ok | quota | turns | fail | touch | forge |
+                          requires_approval  (default: ok)
                           quota  - report a usage limit for the first
                                    AIDEV_FAKE_QUOTA_FAILS invocations
+                          turns  - run out of turns (error_max_turns) on the
+                                   first AIDEV_FAKE_TURN_FAILS invocations of
+                                   AIDEV_FAKE_TURN_STAGE, leaving real tool
+                                   traffic behind for the engine to judge
                           fail   - report a plain error
                           touch  - write a file into cwd, then succeed
                           forge  - self-approve the plan gate from inside .aidev/
@@ -37,6 +41,14 @@ the pipeline has to survive.
     AIDEV_FAKE_SPEC_FIX     with SPECLESS: from the Nth invocation on, write the
                           same function *with* a spec - a repair that works
     AIDEV_FAKE_DIAGNOSIS    what the diagnose step answers with
+    AIDEV_FAKE_TURN_FAILS   how many invocations of the turn stage die at the
+                          turn limit (default: 1)
+    AIDEV_FAKE_TURN_STAGE   which stage 'turns' mode kills (default: implement)
+    AIDEV_FAKE_SICK         that death leaves a pathological pattern - one file
+                          edited six times and one test command run three
+                          times, every result an error - instead of the healthy
+                          one (three different files edited, nothing repeated)
+    AIDEV_FAKE_OBSERVATION  what the observe step answers with
 """
 
 import glob
@@ -76,6 +88,17 @@ DIAGNOSIS = (
     "Clamp the index to the seat count before returning it.\n"
     "## Where\n"
     "- aidev/thing.py:12 - off by one\n"
+)
+
+OBSERVATION = (
+    "# OBSERVATION\n"
+    "## 반복 중인 행동\n"
+    "aidev/stuck.py 한 파일만 여섯 번 고치고 같은 테스트를 세 번 돌렸다.\n"
+    "## 막힌 지점 - 추정 원인\n"
+    "같은 실패를 같은 방법으로 다시 고치고 있다.\n"
+    "## 제안\n"
+    "suggestion: switch-approach\n"
+    "그 파일을 더 고치지 말고, 실패하는 테스트가 무엇을 요구하는지부터 읽어라.\n"
 )
 
 # A function with no spec comment at all, and the same function with one. The
@@ -176,6 +199,8 @@ def final_text(stage, mode):
         return decompose_report()
     if stage == "diagnose":
         return os.environ.get("AIDEV_FAKE_DIAGNOSIS") or DIAGNOSIS
+    if stage == "observe":
+        return os.environ.get("AIDEV_FAKE_OBSERVATION") or OBSERVATION
     if stage == "plan" and os.environ.get("AIDEV_FAKE_BIG_PLAN"):
         return big_plan()
     if stage != "test":
@@ -184,9 +209,11 @@ def final_text(stage, mode):
 
 
 def detect_stage(prompt):
-    # decompose and diagnose first: they are the stages whose prompts quote a
-    # whole other document, which may well talk about planning or testing.
+    # observe, decompose and diagnose first: they are the stages whose prompts
+    # quote whole other documents, which may well talk about planning or testing.
     upper = prompt.upper()
+    if "OBSERVE STEP" in upper:
+        return "observe"
     if "DIAGNOSE STEP" in upper:
         return "diagnose"
     for stage in ("decompose",) + tuple(STAGE_TEXT):
@@ -195,15 +222,19 @@ def detect_stage(prompt):
     return "plan"
 
 
-def log_invocation(prompt):
-    """Returns how many invocations came before this one."""
+def log_invocation(prompt, stage):
+    """How many invocations came before this one: in total, and of this same stage.
+
+    The per-stage count is what lets 'turns' mode kill one stage's first N
+    attempts without counting the other stages that ran in between.
+    """
     path = os.environ.get("AIDEV_FAKE_LOG")
     if not path:
-        return 0
-    previous = 0
+        return 0, 0
+    previous = []
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
-            previous = sum(1 for line in handle if line.strip())
+            previous = [json.loads(line) for line in handle if line.strip()]
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -211,7 +242,38 @@ def log_invocation(prompt):
             )
             + "\n"
         )
-    return previous
+    same = sum(1 for entry in previous if detect_stage(entry.get("prompt") or "") == stage)
+    return len(previous), same
+
+
+def argv_value(flag, fallback=None):
+    """What the CLI was actually given for one flag - the stub reports its own budget."""
+    for index, arg in enumerate(sys.argv):
+        if arg == flag and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+    return fallback
+
+
+def turn_death_events():
+    """The tool traffic a turn-limited session leaves behind, healthy or pathological.
+
+    Healthy is three different files edited and nothing read twice - a session
+    that was working through a list when the budget ran out. Pathological is one
+    file edited six times and one command run three times with every result an
+    error, which is the shape the engine's thresholds are written against.
+    """
+    calls = []
+    if os.environ.get("AIDEV_FAKE_SICK"):
+        for index in range(6):
+            calls.append(
+                ({"file_path": "aidev/stuck.py"}, "Edit", False),
+            )
+        for index in range(3):
+            calls.append(({"command": "python -m pytest -q"}, "Bash", True))
+    else:
+        for name in ("aidev_first.py", "aidev_second.py", "aidev_third.py"):
+            calls.append(({"file_path": name}, "Edit", False))
+    return calls
 
 
 def limit_message():
@@ -221,10 +283,66 @@ def limit_message():
     return "Claude AI usage limit reached. Try again later."
 
 
+def emit_turn_death(stage):
+    """Spend the whole budget on real tool traffic, then die at the turn limit.
+
+    ``num_turns`` is whatever ``--max-turns`` this invocation was given, so the
+    engine's estimate is made from the budget it actually handed out - and a
+    test can prove an extension reached the CLI by reading the same number back.
+    """
+    turns = int(argv_value("--max-turns", "80"))
+    for index, (tool_input, tool, is_error) in enumerate(turn_death_events()):
+        call_id = "t{0}".format(index)
+        emit(
+            {
+                "type": "assistant",
+                "session_id": SESSION,
+                "request_id": "req_{0}_{1}".format(stage, index),
+                "message": {
+                    "id": "msg_{0}_{1}".format(stage, index),
+                    "usage": dict(FAILED_USAGE),
+                    "content": [
+                        {"type": "text", "text": "still on {0}".format(stage)},
+                        {"type": "tool_use", "id": call_id, "name": tool, "input": tool_input},
+                    ],
+                },
+            }
+        )
+        emit(
+            {
+                "type": "user",
+                "session_id": SESSION,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": "x" * 64,
+                            "is_error": is_error,
+                        }
+                    ]
+                },
+            }
+        )
+    emit(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "session_id": SESSION,
+            "is_error": True,
+            "num_turns": turns,
+            "duration_ms": 1000,
+            "total_cost_usd": 0.02,
+            "usage": dict(FAILED_USAGE),
+            "result": "error_max_turns: reached the maximum number of turns",
+        }
+    )
+
+
 def main():
     prompt = sys.stdin.read()
     stage = detect_stage(prompt)
-    previous = log_invocation(prompt)
+    previous, previous_stage = log_invocation(prompt, stage)
     mode = os.environ.get("AIDEV_FAKE_MODE", "ok")
     sys.stderr.write("fake-pipeline-claude: {0} stage, {1} prompt chars\n".format(stage, len(prompt)))
     sys.stderr.flush()
@@ -244,6 +362,14 @@ def main():
                 "result": limit_message(),
             }
         )
+        return 1
+
+    if (
+        mode == "turns"
+        and stage == os.environ.get("AIDEV_FAKE_TURN_STAGE", "implement")
+        and previous_stage < int(os.environ.get("AIDEV_FAKE_TURN_FAILS", "1"))
+    ):
+        emit_turn_death(stage)
         return 1
 
     fail_after = os.environ.get("AIDEV_FAKE_FAIL_AFTER")

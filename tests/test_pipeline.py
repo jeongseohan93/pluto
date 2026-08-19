@@ -525,8 +525,9 @@ def test_quota_failure_waits_for_the_reset_and_resumes_the_session(
     )
     assert code == 0
 
-    # the reset time in the error wins over the fallback interval
-    assert 120 <= sum(slept) <= 160
+    # the reset time in the error wins over the fallback interval, plus the 60s
+    # margin v0.7 raised it to - a limit that had not quite lifted cost a night
+    assert 120 <= sum(slept) <= 190
     calls = invocations(log)
     assert len(calls) == 4  # plan failed once, then plan, implement, test
     assert calls[1]["argv"][calls[1]["argv"].index("--resume") + 1] == "pipe-session"
@@ -580,6 +581,282 @@ def test_quota_retries_are_capped(repo, tmp_path, claude_bin, log, monkeypatch):
     assert state["status"] == "failed"
     assert state["stages"]["plan"]["status"] == "failed"
     assert state["quota"]["retries"] == 2
+
+
+# ---------------------------------------------------------- 자동 복구 (v0.7)
+#
+# Measured 2026-08-18/19: two usage-limit deaths in 24 hours, each resumed by a
+# human who worked out the reset time by hand, and every turn death diagnosed by
+# hand as well. 멈춤이 사람을 기다리는 것이 비용이다. These are the paths that
+# stop it waiting - and the pins that stop *them*.
+
+
+def turns_argv(call):
+    return int(call["argv"][call["argv"].index("--max-turns") + 1])
+
+
+def stage_calls(log_path, stage):
+    """Every invocation whose prompt *opens* by naming this stage, in order.
+
+    The opening line and not a substring: the plan prompt ends by telling the
+    model "plan.md is all the implement stage receives", and a substring match
+    counted that as an implement run.
+    """
+    head = "YOU ARE THE {0} ST".format(stage.upper())  # ... stage / ... step
+    return [c for c in invocations(log_path) if c["prompt"].lstrip().upper().startswith(head)]
+
+
+def recovery_of(repo):
+    return state_of(repo).get("recovery") or {}
+
+
+def test_a_usage_limit_says_when_it_will_resume_and_records_the_wait(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """The one line a human wants at 03:40, and the ledger entry behind it."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "quota")
+    monkeypatch.setenv("AIDEV_FAKE_QUOTA_FAILS", "1")
+    monkeypatch.setenv("AIDEV_FAKE_RESET_IN", "120")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: None)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    out = capsys.readouterr().out
+    assert "한도 도달 —" in out and "자동 재개 예정" in out
+
+    waits = recovery_of(repo)["waits"]
+    assert len(waits) == 1
+    assert waits[0]["kind"] == "usage_limit"
+    assert waits[0]["stage"] == "plan"
+    assert waits[0]["source"] == "reset time from the error"
+    assert waits[0]["wait_s"] >= 120
+
+
+def test_auto_resume_off_reports_the_reset_instead_of_sitting_on_it(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """Off does not lose the wait: it stays open in state.json for a resume to finish."""
+    requirement(repo, front="approval: none\nauto_resume: off")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "quota")
+    monkeypatch.setenv("AIDEV_FAKE_QUOTA_FAILS", "99")
+    monkeypatch.setenv("AIDEV_FAKE_RESET_IN", "120")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: pytest.fail("auto_resume: off still slept"))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    out = capsys.readouterr().out
+    assert "한도 도달 —" in out and "자동 재개 예정" not in out
+    assert "--resume-slice" in out
+
+    state = state_of(repo)
+    assert state["recovery"]["stopped"]["pin"] == "auto_resume"
+    assert len(state["recovery"]["waits"]) == 1
+    # the wait itself is still open, so --resume-slice serves out the remainder
+    assert state["quota"]["waiting"] is True
+
+    # and the dead-process aids say the same thing without opening state.json
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", state["slice_id"], "--dry-run")) == 0
+    assert "이후 재개 예정" in capsys.readouterr().out
+
+
+def test_an_honest_turn_death_is_estimated_and_extended(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """건강 → 견적 → 연장 재개, and the wider budget really reaches the CLI."""
+    requirement(repo, front="approval: none\nauto_extend: aggressive")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+    out = capsys.readouterr().out
+    assert "정직한 소진 — Remaining 1건, +32턴 연장 재개" in out
+
+    calls = stage_calls(log, "implement")
+    # 80 turns over three files is a pace of 26.7; one file left, plus 20%, is 32
+    assert [turns_argv(call) for call in calls] == [80, 112]
+    assert "--resume" in calls[1]["argv"]  # the same session, given more room
+
+    extension = recovery_of(repo)["extensions"][0]
+    assert (extension["stage"], extension["from"], extension["to"]) == ("implement", 80, 112)
+    assert (extension["remaining"], extension["units"], extension["turns"]) == (1, 3, 80)
+    assert state_of(repo)["status"] == "done"
+
+
+def test_the_extension_count_is_a_pin_and_conservative_is_one(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    requirement(repo, front="approval: none")  # conservative by default
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "99")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    assert "자동 연장 상한(1회) 도달" in capsys.readouterr().out
+    assert len(stage_calls(log, "implement")) == 2  # the death, and the one extension
+    record = recovery_of(repo)
+    assert len(record["extensions"]) == 1
+    assert record["stopped"]["pin"] == "extensions"
+    assert state_of(repo)["status"] == "failed"
+
+
+def test_the_turn_cap_clips_the_extension_and_then_refuses_it(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """R4: a pace of one file per 90 turns would ask for hundreds. The cap answers."""
+    requirement(repo, front="approval: none\nmax_turns: implement=90")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine", "--turn-cap", "100") == 0
+    assert "+10턴 연장 재개" in capsys.readouterr().out
+    assert [turns_argv(call) for call in stage_calls(log, "implement")] == [90, 100]
+
+
+def test_a_stage_already_at_the_cap_is_not_extended_at_all(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    requirement(repo, front="approval: none\nmax_turns: implement=90")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--turn-cap", "80") == 1
+    assert "총 턴 상한(80) 도달" in capsys.readouterr().out
+    assert len(stage_calls(log, "implement")) == 1
+    assert recovery_of(repo)["stopped"]["pin"] == "turn-cap"
+
+
+def test_a_pathological_turn_death_buys_an_observer_and_retries_with_it(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """병리 → Observer → observation.md → 주입 재시도, all of it in one run."""
+    requirement(repo, front="approval: none\nauto_extend: aggressive\nmodel: observe=fake-observer")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+    monkeypatch.setenv("AIDEV_FAKE_SICK", "1")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+    out = capsys.readouterr().out
+    assert "병리 소진 —" in out and "Observer 소환" in out
+
+    observation = (slice_dir(repo) / "observation.md").read_text(encoding="utf-8")
+    assert "# OBSERVATION" in observation
+    state = state_of(repo)
+    assert state["stages"]["observe"]["status"] == "done"
+    assert state["recovery"]["observations"][0]["suggestion"] == "switch-approach"
+
+    # the observer saw the logs and nothing else: every reading tool is blocked
+    observer = stage_calls(log, "observe")[0]
+    blocked = observer["argv"][observer["argv"].index("--disallowedTools") + 1].split(",")
+    assert {"Read", "Grep", "Glob", "Bash", "Edit"} <= set(blocked)
+    assert observer["argv"][observer["argv"].index("--model") + 1] == "fake-observer"
+    assert "aidev/stuck.py" in observer["prompt"]  # the behaviour, not the code
+
+    retry = stage_calls(log, "implement")[1]
+    assert "AN OUTSIDE OBSERVER" in retry["prompt"]
+    assert "aidev/stuck.py 한 파일만" in retry["prompt"]
+    # a pathological session must not be handed its own conclusion back
+    assert "--resume" not in retry["argv"]
+
+
+def test_conservative_never_buys_an_observer(repo, tmp_path, claude_bin, log, monkeypatch, capsys):
+    """R3: a wrong 병리 judgement costs nothing at all in the default mode."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+    monkeypatch.setenv("AIDEV_FAKE_SICK", "1")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    assert "aggressive에서만 소환된다" in capsys.readouterr().out
+    assert stage_calls(log, "observe") == []
+    assert "observe" not in state_of(repo)["stages"]
+    assert recovery_of(repo)["stopped"]["pin"] == "observer"
+
+
+def test_an_observer_that_calls_a_human_ends_the_slice(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """The one suggestion the engine may not answer with another attempt."""
+    requirement(repo, front="approval: none\nauto_extend: aggressive")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "99")
+    monkeypatch.setenv("AIDEV_FAKE_SICK", "1")
+    monkeypatch.setenv(
+        "AIDEV_FAKE_OBSERVATION",
+        "# OBSERVATION\n## 제안\nsuggestion: call-human\nThe requirement contradicts itself.\n",
+    )
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    assert "외부 눈이 사람을 불렀다" in capsys.readouterr().out
+    assert len(stage_calls(log, "implement")) == 1  # no retry was bought
+    record = recovery_of(repo)
+    assert record["observations"][0]["suggestion"] == "call-human"
+    assert record["stopped"]["pin"] == "call-human"
+    assert "open" not in record
+
+
+def test_auto_extend_off_is_v0_6_byte_for_byte(repo, tmp_path, claude_bin, log, monkeypatch):
+    """The A/B control: a turn death fails immediately and the ledger never appears."""
+    requirement(repo, front="approval: none\nauto_extend: off")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "99")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    assert len(stage_calls(log, "implement")) == 1
+    state = state_of(repo)
+    assert "recovery" not in state
+    assert state["stages"]["implement"]["status"] == "failed"
+
+
+def test_an_extension_survives_the_process_that_made_it(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """The budget lives in state.json, so a resumed slice does not start over at 80."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "99")
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    slice_id = state_of(repo)["slice_id"]
+    capsys.readouterr()
+
+    # the pin is what stopped it, not the budget: raising the pin resumes at 112
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "0")
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id, "--auto-extend", "off")
+    ) == 0
+    assert [turns_argv(call) for call in stage_calls(log, "implement")] == [80, 112, 112]
+
+
+def test_the_summary_says_what_the_engine_did_on_its_own(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "turns")
+    monkeypatch.setenv("AIDEV_FAKE_TURN_FAILS", "1")
+    assert run_slice(repo, tmp_path, claude_bin, "--no-verify-engine") == 0
+
+    summary = pipeline.render_summary(state_of(repo), [])
+    assert "Auto      연장 1 (implement 80->112)" in summary
+    # and a slice that never needed recovering prints exactly what it used to
+    assert "Auto" not in pipeline.render_summary({"slice_id": "x", "stages": {}}, [])
+
+
+@pytest.mark.parametrize(
+    "front, fragment",
+    [
+        ("auto_extend: sometimes", "auto_extend: needs one of"),
+        ("auto_resume: maybe", "auto_resume: needs 'on' or 'off'"),
+    ],
+)
+def test_a_recovery_switch_typo_is_refused_before_anything_is_built(
+    repo, tmp_path, claude_bin, front, fragment, capsys
+):
+    requirement(repo, front="approval: none\n{0}".format(front))
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+    assert fragment in capsys.readouterr().err
+
+
+def test_the_dry_run_says_what_the_engine_may_do_on_its_own(repo, tmp_path, claude_bin, capsys):
+    requirement(repo, front="approval: none")
+    assert run_slice(repo, tmp_path, claude_bin, "--dry-run") == 0
+    assert "recovery  auto-resume on, auto-extend conservative" in capsys.readouterr().out
 
 
 def test_ordinary_failure_is_not_retried(repo, tmp_path, claude_bin, log, monkeypatch):
@@ -2813,7 +3090,10 @@ def test_an_unknown_front_matter_key_warns_and_is_ignored(
 
     out = capsys.readouterr().out
     assert "front matter key(s) ignored: modle" in out
-    assert "known: approval, setup, test_commands, max_turns, model, spec_check, briefing" in out
+    assert (
+        "known: approval, setup, test_commands, max_turns, model, spec_check, briefing, "
+        "auto_resume, auto_extend" in out
+    )
     # the measured defect itself: the unknown key must not break the known ones
     implement = invocations(log)[1]["argv"]
     assert implement[implement.index("--max-turns") + 1] == "90"
@@ -2844,7 +3124,8 @@ def test_every_known_front_matter_key_has_a_reader():
     fields = {key: "" for key in pipeline.KNOWN_FRONT_MATTER_KEYS}
     assert pipeline.unknown_front_matter_keys(fields) == []
     assert set(pipeline.KNOWN_FRONT_MATTER_KEYS) == {
-        "approval", "setup", "test_commands", "max_turns", "model", "spec_check", "briefing"
+        "approval", "setup", "test_commands", "max_turns", "model", "spec_check", "briefing",
+        "auto_resume", "auto_extend",
     }
 
 

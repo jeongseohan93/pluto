@@ -1,0 +1,77 @@
+{
+  "slice_id": "20260819-auto-recovery",
+  "status": "running:implement",
+  "branch": "slice/20260819-auto-recovery",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "655957f1ad86efa4738af7fca2756089acbb3ace",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 22,
+    "test_files": 5,
+    "budget": 160,
+    "warn": false
+  },
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260819-141303-auto-recovery-plan",
+      "attempts": 1,
+      "commit": "5ce70a8ceee013a63141ddad15bdb7ab73624e9e"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260819-142959-auto-recovery-implement",
+      "attempts": 1,
+      "commit": "2c25a8f78e0a5c5369afdd3d30f28504a0a2dad5"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-141303-auto-recovery-plan",
+      "status": "completed",
+      "turns": 67,
+      "tokens": {
+        "input": 110,
+        "cache_creation": 202883,
+        "cache_read": 6914055,
+        "output": 48493,
+        "billed_input": 7117048,
+        "peak_context": 209849
+      },
+      "cost_usd": 6.698732499999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260819-142959-auto-recovery-implement",
+      "status": "completed",
+      "turns": 164,
+      "tokens": {
+        "input": 306,
+        "cache_creation": 268617,
+        "cache_read": 29471476,
+        "output": 103177,
+        "billed_input": 29740399,
+        "peak_context": 276732
+      },
+      "cost_usd": 19.840101750000006
+    }
+  ],
+  "updated_at": "2026-08-19T15:15:31+09:00"
+}

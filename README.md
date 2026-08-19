@@ -315,6 +315,9 @@ plan 산출물이 파일 12개 이상 또는 테스트 파일 5개 이상을 지
 않고, 예산을 자기 마음대로 올리지도 않는다.** 규모는 `state.json`의 `plan_scale`에
 남는다.
 
+v0.7부터 이 예산은 **바닥이 아니라 시작점**이다. 여기 적은 숫자에서 죽되 정직하게
+죽은 단계는 엔진이 견적을 내서 스스로 올린다 → [실패와 자동 복구](#실패와-자동-복구-v07).
+
 ### 검증의 결정론화 (v0.5)
 
 실측 2026-08-16/17: slice 평균 $15에서 **검증 루프가 최대 지출원**이었다.
@@ -665,18 +668,19 @@ aidev pipeline --repo ~/jokertest --resume-epic v0-5-memory     # 실패 지점�
 `slices.md`의 각 항목은 **그 자체로 실행 가능한 requirement**다. 형식은 기존
 front matter 규약과 그대로 호환이고, 마커만 추가된다. 항목의 front matter는
 `approval:` / `setup:` / `test_commands:` / `max_turns:` / `model:` /
-`spec_check:` / `briefing:` 일곱 키를 받고, **목록 전체를 먼저 검증한다** — 4번
-항목의 오타가 1~3번이 브랜치를 만들기 전에 걸린다. (일곱 키 전부를 실제로
-검증한다. `model:`과 `spec_check:`는 여기 적혀 있으면서 정작 검사에서 빠져 있었다
-— 선언한 줄이 조용히 아무 일도 안 하는 것은 아래 미지 키와 같은 결함이라 함께
-닫았고, `briefing:`은 처음부터 같은 자리에 넣었다.)
+`spec_check:` / `briefing:` / `auto_resume:` / `auto_extend:` 아홉 키를 받고,
+**목록 전체를 먼저 검증한다** — 4번 항목의 오타가 1~3번이 브랜치를 만들기 전에
+걸린다. (아홉 키 전부를 실제로 검증한다. `model:`과 `spec_check:`는 여기 적혀
+있으면서 정작 검사에서 빠져 있었다 — 선언한 줄이 조용히 아무 일도 안 하는 것은
+아래 미지 키와 같은 결함이라 함께 닫았고, `briefing:`과 v0.7의 복구 스위치 둘은
+처음부터 같은 자리에 넣었다.)
 
 **모르는 키는 무시하되 경고한다**(v0.5). 실측 2026-08-17: `model:`이 아직 미지 키이던
 시절 조용히 버려졌고, 그 바람에 **`max_turns` 적용까지 깨졌다.** 조용한 무시가 결함이지
 무시 자체가 결함은 아니다.
 
 ```
-warning: front matter key(s) ignored: modle - known: approval, setup, test_commands, max_turns, model, spec_check, briefing
+warning: front matter key(s) ignored: modle - known: approval, setup, test_commands, max_turns, model, spec_check, briefing, auto_resume, auto_extend
 ```
 
 - **에러가 아니다.** 오타일 수도, 사람이 남긴 메모일 수도, 다음 버전이 추가할 키일 수도
@@ -803,6 +807,7 @@ run 상세는 도구의 `data/`에, slice 상태는 **대상 repo를 따라다�
 ├── failure.md       검증이 실패했을 때만 (v0.5)
 ├── diagnosis.md     대형 실패로 진단 세션을 샀을 때만 (v0.5)
 ├── progress.md      단계가 미완으로 끝났거나 턴 90%에 닿았을 때만 (v0.5)
+├── observation.md   병리 소진으로 Observer를 소환했을 때만 (v0.7)
 ├── verify/          검증 명령의 출력 전문 (attempt별 로그, v0.5)
 ├── hooks/settings.json   Write 차단 훅 (--settings로 넘어간다, v0.5)
 ├── setup.log        setup을 선언했을 때만
@@ -846,7 +851,10 @@ v0.4.2가 더한 `rollback` / `revert` / `stages.*.rewound`도 같은 이유로 
 `schema`는 여전히 **2**다. status 값은 열린 집합이라 reader는 `rolled_back` /
 `reverted`를 모르더라도 **문자열 그대로 표시하면 된다.**
 v0.5가 더한 `repairs` / `replans` / `rejections` / `progress` /
-`stages.test.verify`도 전부 optional이라 `schema`는 **2 그대로다.** 반대로 v0.5는
+`stages.test.verify`도 전부 optional이라 `schema`는 **2 그대로다.**
+v0.7이 더한 `recovery`(자동 대기·연장·관찰의 원장)도 마찬가지다 — **처음 필요해진
+순간에 만들어지므로** 자동 복구가 한 번도 걸리지 않은 slice에는 키 자체가 없고,
+옛 state.json은 그대로 읽힌다. `schema`는 여전히 **2**다. 반대로 v0.5는
 옛 state를 그대로 받는다 — `commits`도 `workspace`도 없는 v0.2 기록은 명세 검사가
 읽을 커밋 범위가 없으므로 **검사를 건너뛰고 그렇다고 알린 뒤** 계속 돈다.
 
@@ -875,19 +883,151 @@ exit code로는 성공을 판정할 수 없다. 그래서 test 단계에 마지�
 - 폴백 경로에서 줄이 아예 없으면 `unknown`으로 기록하고 요약에 표시한다. 아무 주장도
   없는 걸 실패로 단정하지는 않지만, **절대 통과로도 읽히지 않는다.**
 
-### 실패와 쿼터
+### 실패와 자동 복구 (v0.7)
 
-```text
-쿼터류 실패 → state = quota_wait → 대기 후 같은 session으로 --resume 재시도
-일반 실패   → state = failed, slice 중단 (자동 repair 루프는 이후 버전)
-```
+> 실측 2026-08-18/19: 24시간 안에 한도 사망 2회(8/18 밤, 8/19 새벽). 매번 사람이
+> 리셋 시각을 계산해 수동 resume했고, 턴 소진 사망도 매번 사람이 로그를 읽고
+> 상향을 결정해 재발사했다. **멈춤이 사람을 기다리는 것이 비용이다.**
+
+죽은 단계는 세 가지로 분류되고, 각각 다른 답을 받는다. 분류는 엔진이 `events.jsonl`
+꼬리(마지막 result 이벤트 + stderr)와 telemetry의 `result_subtype`를 **둘 다** 읽어서
+한다 — telemetry는 그 스트림의 파생물이라 서로를 검증한다.
+
+| 사인 | 판독 | 엔진의 답 |
+| --- | --- | --- |
+| **한도(usage limit)** | `QUOTA_MARKERS` + reset 시각 파싱 | 리셋+60초까지 기다렸다 같은 session으로 재개 |
+| **턴 소진** | `error_max_turns` / "maximum number of turns" | 건강하면 견적 내서 연장, 병리면 Observer |
+| **그 외 에러** | 위 둘 다 아님 | v0.6 그대로 — `failed`, 사람에게 |
+
+**자동인 것은 재개뿐이다. 새 발사는 언제나 사람이 한다** — 데몬도 cron도 watcher도
+만들지 않았다.
+
+#### 한도 → 자동 대기·재개
 
 대기 시간은 2순위다. 에러에서 reset 시각을 파싱할 수 있으면 그때까지 기다리고,
 못 읽으면 고정 간격(기본 15분)으로 재시도한다. 상한은 기본 20회다.
+여유는 **60초**다(v0.6은 30초였다 — 한도가 채 안 풀린 채 재개해 밤 하나를 더 썼다).
+
+```text
+[pipeline] 한도 도달 — 03:40 자동 재개 예정
+[pipeline]   retry 1/20 in 4h 12m (reset time from the error), resuming session abc123
+```
+
+`auto_resume: off`(또는 `--no-auto-resume`)면 **기다리지 않고** 시각과 재개 명령을
+말한 뒤 끝낸다. 이때도 대기 자체는 `state.json`에 열린 채 남으므로, 나중에
+`--resume-slice`가 **남은 대기를 마저 하고** 이어간다.
+
+프로세스가 죽어 있던 경우의 보완책은 데몬이 아니라 **다음 명령이 말해 주는 것**이다.
+
+```text
+$ aidev pipeline --repo ~/jokertest --list
+SLICE                   STATUS            STAGES
+20260819-doctor         quota_wait 03:40  plan=done implement=running
+
+$ aidev pipeline --repo ~/jokertest --resume-slice last --dry-run
+wait    03:40 이후 재개 예정 — aidev pipeline --repo ~/jokertest --resume-slice 20260819-doctor
+```
+
+#### 턴 소진 → 건강 판정 → 견적 → 연장
+
+한 세션 안에서의 수치로만 판정한다. 아래 중 **하나라도** 걸리면 병리, 아니면 건강이다.
+
+| 병리 조건 | 임계값 |
+| --- | --- |
+| 아무 파일도 만지지 않았다 | 편집 0 + 읽기 0 |
+| 같은 파일 재편집 | 한 파일 5회 이상 **그리고** 손댄 파일 2개 이하 |
+| 재독 폭주 | 한 파일 4회 이상, 또는 재독 총량 12회 이상 |
+| 같은 명령 반복 | 같은 명령 3회 이상 |
+| 도구 에러 누적 | 10회 이상 |
+
+**애매한 세션은 건강으로 읽는다.** 애매를 병리로 밀면 기본 모드에서는 그냥 죽고,
+aggressive에서는 돈만 쓴다. 판정은 요구사항이 정의한 대로 2치다.
+
+건강하면 견적을 낸다. 실측 소화 속도는 **이 세션이 실제로 쓴 턴 ÷ 이 세션이 실제로
+움직인 파일 수**다(readonly 단계는 '읽은 파일'이 단위다).
+
+```text
+연장량 = ceil(Remaining × (턴 ÷ 파일) × 1.2)      # 여유 20%
+       , 최소 20턴, 총 턴 상한(기본 300)까지만
+Remaining을 셀 수 없으면(plan.md가 아직 없다) 정액 40턴
+```
+
+`Remaining`은 `progress.md`의 `## Remaining`과 **같은 함수**에서 나온다 — 로그의
+숫자와 파일의 목록이 어긋날 수 없다.
+
+```text
+[pipeline] 정직한 소진 — Remaining 1건, +32턴 연장 재개
+```
+
+연장은 같은 session을 `--resume`으로 이어받고 예산만 넓힌다. 연장량은 원장에 남으므로
+**프로세스가 죽었다 살아나도 그 예산으로 돌아온다**(`--max-turns-stage`로 사람이 더
+높게 주면 사람 쪽이 이긴다).
+
+#### 병리 → Observer (외부 눈)
+
+병리로 판정되면 `auto_extend: aggressive`에서만, slice당 **1회**, 별도 세션을 산다.
+
+- **입력은 로그뿐이다.** telemetry가 요약한 행동(편집·재독·반복 명령·마지막 도구
+  호출), 판정 근거, `progress.md`, `failure.md`, requirement. **plan.md도 코드도
+  주지 않는다.** requirement를 주는 이유는 하나 — 그게 없으면 "scope 재검토"라는
+  선택지가 판단 불가능한 문장이 된다.
+- **기계로 막는다.** `readonly` 프로파일이 Bash/Edit/Write/Task를 막고, 그 위에
+  `Read` / `Glob` / `Grep` / `LS` / `WebFetch` / `WebSearch`까지 `--disallowedTools`로
+  막는다. "로그만 보라"가 지시가 아니라 기계가 된다.
+- 산출은 `observation.md` 하나다: 반복 중인 행동 / 막힌 지점 추정 원인 /
+  `suggestion: switch-approach | rescope | call-human`.
+- **`call-human`이면 재시도하지 않는다.** 외부 눈이 사람을 불렀는데 한 번 더 태우면
+  그 눈을 산 이유가 지워진다.
+- 그 외에는 `observation.md`를 프롬프트에 주입하고 **새 session으로** 1회 재개한다.
+  병리 세션을 그대로 물려주면 관찰이 그 세션의 머리 위에 얹히기 때문이다.
+- `model: observe=claude-sonnet-5`로 **다른 모델에게 시킬 수 있다** — 모델 믹스 문법
+  그대로이고 새 키는 없다. `max_turns: observe=30`도 같다(기본 20턴).
+
+#### 스위치와 상한
+
+| 모드 | 자동 연장 | Observer |
+| --- | --- | --- |
+| `auto_extend: off` | 0회 (턴 소진 = 즉시 failed, v0.6 동작) | 0회 |
+| `auto_extend: conservative` **(기본)** | 1회 | 0회 |
+| `auto_extend: aggressive` | 2회 | 1회 |
+
+상한에 걸리면 **새 상태를 만들지 않는다** — 기존 `failed`로 멈추고, 어느 핀이
+걸었는지와 사람이 칠 명령을 말한다.
+
+```text
+[pipeline] 자동 복구 중지 — 자동 연장 상한(1회) 도달 — 더 늘리지 않는다
+[pipeline]   사람이 판단할 차례다:  aidev pipeline --repo ~/jokertest --resume-slice 20260819-doctor
+```
+
+모든 자동 조치는 `state.json`의 `recovery`에 남는다(Ledger의 원천).
+
+```json
+"recovery": {
+  "waits":        [{"stage": "plan", "at": "...", "kind": "usage_limit", "resume_at": "...", "wait_s": 15180.0}],
+  "extensions":   [{"stage": "implement", "at": "...", "from": 80, "to": 112, "remaining": 1, "units": 3, "turns": 80, "pace": 26.67}],
+  "observations": [{"stage": "implement", "at": "...", "run_id": "...", "suggestion": "switch-approach"}],
+  "stopped":      {"at": "...", "stage": "implement", "pin": "extensions", "detail": "..."}
+}
+```
+
+요약표는 넓히지 않는다. 원장이 비어 있지 않을 때만 아래 한 줄이 붙는다.
+
+```text
+Auto      연장 1 (implement 80->112), Observer 1 (switch-approach), 한도 대기 1
+```
+
+#### 그 외 에러 — 바뀐 것이 없다
+
+```text
+일반 실패 → state = failed, slice 중단 (검증 실패의 repair 루프는 위 "검증의 결정론화" 절)
+```
+
 **쿼터 감지 조건은 잠정값이다** — 실제 한도에 걸렸을 때 events.jsonl / stderr.log에
 오는 문구를 실측한 뒤 `QUOTA_MARKERS`를 갱신한다. 오탐을 줄이려고 스트림 전체가
 아니라 **마지막 result 이벤트와 stderr만** 본다 (모델이 rate limit을 *말하는* 것과
-실제로 걸리는 것은 다르다).
+실제로 걸리는 것은 다르다). 턴 소진 오탐도 같은 값을 치른다 — 어느 출처도 턴 소진을
+말하지 않으면 '그 외 에러'로 읽고, 오탐의 비용은 세션 한 번이며 위 상한이 그걸
+1~2회로 묶는다.
 
 세션 정책은 **왜 멈췄는지**로 갈린다. 쿼터 대기는 세션이 *중단*된 것뿐이라 같은
 session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / FAIL"이라는 **결론**을
@@ -980,6 +1120,15 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 - **plan / implement는 발사 직전에 그래프 브리핑을 받는다**(v0.6). `briefing: off`
   / `--no-briefing` / `--no-graph`로 끄고, 끄면 프롬프트는 바이트 단위로 예전과
   같다. (아래 "브리핑 생성기 — 상차림" 절)
+- **자동 복구에는 상한이 셋 있다**(v0.7, 무한 과금 방지). ①자동 연장은 slice당
+  최대 2회(`aggressive`), 기본은 1회 ②어떤 연장도 **총 턴 상한**(`--turn-cap`,
+  기본 300)을 넘겨 예산을 올리지 못한다 ③Observer는 slice당 최대 1회이고
+  `aggressive`에서만 소환된다. 상한에 걸리면 새 상태를 만들지 않고 **기존
+  `failed`로 멈추고 사람을 부른다.** Observer 자신과 diagnose는 자동 복구의
+  대상이 아니다 — 관찰자를 관찰하면 루프가 된다.
+- **자동으로 한 일은 전부 `state.json`의 `recovery`에 남는다**(v0.7): 시각·사유·
+  연장량·어느 핀이 멈췄는지. 상한은 루프 변수가 아니라 **원장의 길이**로 걸리므로,
+  프로세스가 죽었다 살아나도 횟수가 이어진다. (위 "실패와 자동 복구" 절)
 
 주요 옵션:
 
@@ -1024,6 +1173,9 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--approval-timeout` | 승인 대기 포기 시간 (기본 0 = 무한 대기) |
 | `--quota-wait` | reset 시각을 못 읽을 때의 재시도 간격 (기본 900초) |
 | `--quota-max-retries` | 쿼터 재시도 상한 (기본 20) |
+| `--no-auto-resume` | 한도 대기에 앉아 있지 않는다 — 시각과 재개 명령만 말하고 끝낸다 (v0.7) |
+| `--auto-extend` | 턴 소진에 엔진이 할 수 있는 것: `off` / `conservative`(기본) / `aggressive` (v0.7) |
+| `--turn-cap` | 어떤 자동 연장도 단계 예산을 이 값 위로 못 올린다 (기본 300, v0.7) |
 | `--dry-run` | slice id / base / 브랜치 / worktree / setup / 검증 명령 / 턴 예산 / 게이트 / 경로만 출력하고 종료 (`--amend`와 함께면 돌 사이클, `--rollback` / `--revert-merge`와 함께면 되돌릴 범위와 복구 명령) |
 
 종료 코드: `0` 완주, `1` 실패, `2` 사용법·전제조건 위반, `3` 거부,
