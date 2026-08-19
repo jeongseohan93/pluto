@@ -514,7 +514,11 @@ def test_a_stage_commit_marks_the_graph_stale_without_parsing_anything(
 ):
     requirement(repo, front="approval: none")
 
-    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
+    # --no-briefing because the claim here is about the *commit hook*: the
+    # briefing is a different reader of the graph and it does build one.
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md", "--no-briefing")
+    ) == 0
 
     tree = worktree(repo, tmp_path)
     marker = tree / ".aidev" / "graph" / "dirty"
@@ -531,7 +535,11 @@ def test_the_first_query_after_a_commit_pays_for_the_refresh(
     repo, tmp_path, claude_bin, log, capsys
 ):
     requirement(repo, front="approval: none")
-    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 0
+    # Same reason: "there is no DB at all yet" is only true when nothing set a
+    # briefing, which would have built one on the way past.
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md", "--no-briefing")
+    ) == 0
     tree = worktree(repo, tmp_path)
     (tree / "widget.py").write_text(
         'def widget():\n    """One widget. Takes no arguments."""\n    return 1\n', encoding="utf-8"

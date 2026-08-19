@@ -2786,7 +2786,7 @@ def test_an_unknown_front_matter_key_warns_and_is_ignored(
 
     out = capsys.readouterr().out
     assert "front matter key(s) ignored: modle" in out
-    assert "known: approval, setup, test_commands, max_turns, model, spec_check" in out
+    assert "known: approval, setup, test_commands, max_turns, model, spec_check, briefing" in out
     # the measured defect itself: the unknown key must not break the known ones
     implement = invocations(log)[1]["argv"]
     assert implement[implement.index("--max-turns") + 1] == "90"
@@ -2817,7 +2817,7 @@ def test_every_known_front_matter_key_has_a_reader():
     fields = {key: "" for key in pipeline.KNOWN_FRONT_MATTER_KEYS}
     assert pipeline.unknown_front_matter_keys(fields) == []
     assert set(pipeline.KNOWN_FRONT_MATTER_KEYS) == {
-        "approval", "setup", "test_commands", "max_turns", "model", "spec_check"
+        "approval", "setup", "test_commands", "max_turns", "model", "spec_check", "briefing"
     }
 
 
@@ -3055,6 +3055,178 @@ def test_dry_run_prints_the_workspace_plan_and_touches_nothing(
 def test_two_commands_at_once_are_a_usage_error(repo, tmp_path, claude_bin, capsys):
     assert main(argv(repo, tmp_path, claude_bin, "--merge", "a", "--discard", "b")) == 2
     assert "cannot be combined" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------ 브리핑 (상차림)
+#
+# Measured 2026-08-15/18: plan spent 20-59 turns looking for the code it was
+# about to plan against, and implement paid $2-4 a slice re-finding it. The
+# engine sets the table before the session starts; these prove it is on the
+# table, that the switch really turns it off, and that it is not paid for twice.
+
+
+def seeded(repo):
+    """A repo with real source in it, so the graph has something to brief about.
+
+    The stub's plan names ``aidev/thing.py``; ``other.py`` is what implement is
+    about to reinvent.
+    """
+    (repo / "aidev").mkdir(exist_ok=True)
+    (repo / "aidev" / "thing.py").write_text(
+        'def thing_helper(seat):\n'
+        '    """Protect one seat at night.\n\n'
+        '    @param seat  which seat\n'
+        '    """\n'
+        "    return seat\n",
+        encoding="utf-8",
+    )
+    (repo / "aidev" / "other.py").write_text(
+        'def seat_helper(seat, night):\n'
+        '    """Find the seat a night action belongs to.\n\n'
+        '    @param seat   which seat\n'
+        '    @param night  which night\n'
+        '    """\n'
+        "    return seat\n",
+        encoding="utf-8",
+    )
+    return commit_all(repo, "seed")
+
+
+def test_the_plan_stage_is_launched_with_a_briefing(repo, tmp_path, claude_bin, log):
+    """상차림: the md is kept, the prompt carries it, and readonly still holds."""
+    requirement(
+        repo,
+        front="approval: none",
+        body="# doctor\n\n밤 페이즈에서 thing_helper 를 고쳐 의사를 보호한다.\n",
+    )
+    seeded(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    saved = slice_dir(repo) / "briefings" / "plan.md"
+    assert saved.exists()
+    text = saved.read_text(encoding="utf-8")
+    assert text.startswith("# BRIEFING  plan")
+    assert "## 1. REPO MAP" in text
+    assert "aidev/thing.py:1" in text  # a coordinate, which is the whole point
+
+    prompt = invocations(log)[0]["prompt"]
+    assert "# BRIEFING  plan" in prompt
+    assert "aidev graph show/callers/calls/summaries로 요청하라." in prompt
+    assert "파일 통읽기 전에 조회 우선." in prompt
+
+    # The graph the briefing built lives in the worktree, and the readonly proof
+    # of the plan stage compares git status before and after. It survives only
+    # because .aidev/graph/ ignores itself.
+    tree = worktree(repo, tmp_path)
+    assert (tree / ".aidev" / "graph" / "graph.db").exists()
+    assert git(tree, "status", "--porcelain", "-uall").stdout.strip() == ""
+    assert state_of(repo)["stages"]["plan"]["status"] == "done"
+
+
+def test_briefing_off_changes_the_prompt_by_not_one_byte(repo, tmp_path, claude_bin, log):
+    """The A/B control: off has to be the prompt as it was before this existed."""
+    body = "# doctor\n\n밤 페이즈 의사 보호 로직을 구현한다.\n"
+    requirement(repo, front="approval: none\nbriefing: off", body=body)
+    seeded(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    prompt = invocations(log)[0]["prompt"]
+    assert "BRIEFING" not in prompt
+    assert prompt == pipeline.build_prompt("plan", body)
+    # nothing was built, so nothing was written down either
+    assert not (slice_dir(repo) / "briefings").exists()
+    assert "briefing" not in state_of(repo)
+    assert not (worktree(repo, tmp_path) / ".aidev" / "graph" / "graph.db").exists()
+
+
+def test_an_empty_briefing_is_the_same_string_as_no_briefing_at_all():
+    """The unit under the run above: the slot renders to nothing, not to a blank line."""
+    assert pipeline.build_prompt("plan", "req") == pipeline.build_prompt("plan", "req", briefing="")
+    assert pipeline.build_prompt("implement", "req", "plan") == pipeline.build_prompt(
+        "implement", "req", "plan", briefing=""
+    )
+    # and a briefing carrying braces is an argument, never a template
+    braced = pipeline.build_prompt("implement", "req", "plan", briefing="const f = ({a}) => a")
+    assert "const f = ({a}) => a" in braced
+
+
+@pytest.mark.parametrize("switch", ["--no-briefing", "--no-graph"])
+def test_the_flags_match_the_front_matter_switch(repo, tmp_path, claude_bin, log, switch):
+    """--no-briefing turns it off; --no-graph promises the graph is untouched."""
+    requirement(repo, front="approval: none")
+    seeded(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin, switch) == 0
+
+    assert "BRIEFING" not in invocations(log)[0]["prompt"]
+    assert not (slice_dir(repo) / "briefings").exists()
+
+
+def test_the_briefing_cost_is_recorded(repo, tmp_path, claude_bin, log, capsys):
+    """상차림 비용의 가시화: state.json, runs.json and the RESULT table all say it."""
+    requirement(repo, front="approval: none")
+    seeded(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    record = state_of(repo)["briefing"]["plan"]
+    assert record["tokens"] > 0
+    assert record["sections"][0] == "repo_map"
+    assert record["reused"] is False
+    assert record["path"].endswith("plan.md")
+
+    runs = json.loads((slice_dir(repo) / "runs.json").read_text(encoding="utf-8"))["runs"]
+    plan_run = [entry for entry in runs if entry["stage"] == "plan"][0]
+    assert plan_run["briefing_tokens"] == record["tokens"]
+    # 0 by construction: no stage is granted a rule for 'aidev graph' today, so
+    # this counter reads zero until a human opens one with --allow-tool.
+    assert plan_run["graph_queries"] == 0
+
+    out = capsys.readouterr().out
+    assert "briefing: {0} tokens".format(record["tokens"]) in out
+    assert "Briefing  plan" in out and "graph queries 0" in out
+
+
+def test_implement_gets_the_scope_and_the_reuse_rule(repo, tmp_path, claude_bin, log):
+    """고해상 + 재사용 후보: what the plan names, and what already exists near it."""
+    requirement(repo, front="approval: none")
+    seeded(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    prompt = invocations(log)[1]["prompt"]
+    assert "IMPLEMENT stage" in prompt
+    assert "## 3. SCOPE" in prompt
+    assert "thing_helper(seat)" in prompt  # the plan named the file it lives in
+    assert "## 4. ALREADY EXISTS" in prompt
+    assert "seat_helper" in prompt
+    assert "기존 함수 재사용 우선. 유사 기능 신설 시 사유 명시. 통합 리팩토링은 금지." in prompt
+    # the test stage is not briefed: it runs a declared command, it does not look
+    assert "BRIEFING" not in invocations(log)[2]["prompt"]
+
+
+def test_a_retry_reuses_the_briefing_it_already_paid_for(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """Same commit, same plan, same table - a quota retry does not buy it twice."""
+    requirement(repo, front="approval: none")
+    seeded(repo)
+    monkeypatch.setenv("AIDEV_FAKE_MODE", "quota")
+    monkeypatch.setenv("AIDEV_FAKE_QUOTA_FAILS", "1")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: None)
+
+    assert run_slice(repo, tmp_path, claude_bin, "--quota-wait", "1") == 0
+
+    assert state_of(repo)["stages"]["plan"]["attempts"] == 2
+    out = capsys.readouterr().out
+    assert out.count("briefing: ") >= 3  # plan, the retry, implement
+    assert "(reused)" in out
+    # both launches of plan were handed the same table
+    assert invocations(log)[0]["prompt"].split("INSTRUCTIONS")[0] == (
+        invocations(log)[1]["prompt"].split("INSTRUCTIONS")[0]
+    )
 
 
 # --------------------------------------------------------------- unit checks

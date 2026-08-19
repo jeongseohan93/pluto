@@ -473,6 +473,7 @@ def test_a_bad_front_matter_line_names_the_item(tmp_path):
         ("model: planz=claude-opus-5", "unknown stage 'planz'"),
         ("model: implement=", "no model"),
         ("spec_check: maybe", "needs 'on' or 'off'"),
+        ("briefing: maybe", "needs 'on' or 'off'"),
     ],
 )
 def test_a_listed_slice_with_a_bad_new_key_is_refused_before_anything_runs(

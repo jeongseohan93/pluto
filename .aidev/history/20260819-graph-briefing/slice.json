@@ -1,0 +1,77 @@
+{
+  "slice_id": "20260819-graph-briefing",
+  "status": "running:implement",
+  "branch": "slice/20260819-graph-briefing",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "01a06768ae653351b9ce562e3eb3720eeee25d27",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 19,
+    "test_files": 5,
+    "budget": 160,
+    "warn": false
+  },
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260819-123353-graph-briefing-plan",
+      "attempts": 1,
+      "commit": "ce7ccfd1be55a31653757650a94c9e77f8c2441b"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260819-124618-graph-briefing-implement",
+      "attempts": 1,
+      "commit": "1e22b3a7e586173a723ae2afe12cc4be17880e63"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-123353-graph-briefing-plan",
+      "status": "completed",
+      "turns": 51,
+      "tokens": {
+        "input": 80,
+        "cache_creation": 204946,
+        "cache_read": 5353831,
+        "output": 41289,
+        "billed_input": 5558857,
+        "peak_context": 204948
+      },
+      "cost_usd": 5.7590005
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260819-124618-graph-briefing-implement",
+      "status": "completed",
+      "turns": 169,
+      "tokens": {
+        "input": 304,
+        "cache_creation": 246742,
+        "cache_read": 27443430,
+        "output": 102468,
+        "billed_input": 27690476,
+        "peak_context": 254857
+      },
+      "cost_usd": 18.752354999999998
+    }
+  ],
+  "updated_at": "2026-08-19T13:21:18+09:00"
+}

@@ -384,6 +384,108 @@ class GraphDB:
             parameters.append(int(limit))
         return list(self.conn.execute(sql, parameters))
 
+    # --- v0.6 2단계: what a briefing asks before a session is launched. Four
+    # questions the four query verbs could not answer, kept here because SQL
+    # lives in this file and nowhere else.
+
+    def directory_counts(self, depth: int = 1) -> List[Dict[str, Any]]:
+        """Files and functions per directory - the whole repository, at a distance.
+
+        The rollup is done here rather than in SQL because ``depth`` is a path
+        operation and SQLite has no split.
+
+        @param depth  how many path segments a directory name keeps
+        @flow  every parsed file -> its directory at that depth -> add it up -> sorted
+        주요 내부 변수: totals(디렉터리 -> 파일 수/함수 수)
+        """
+        totals: Dict[str, List[int]] = {}
+        for row in self.conn.execute("SELECT path, funcs FROM files WHERE parsed = 1"):
+            parts = str(row["path"]).split("/")
+            name = "/".join(parts[: max(1, depth)]) + "/" if len(parts) > depth else "(root)"
+            entry = totals.setdefault(name, [0, 0])
+            entry[0] += 1
+            entry[1] += int(row["funcs"] or 0)
+        return [
+            {"directory": name, "files": counts[0], "functions": counts[1]}
+            for name, counts in sorted(totals.items(), key=lambda item: (-item[1][1], item[0]))
+        ]
+
+    def entry_points(self, limit: int = 12) -> List[sqlite3.Row]:
+        """The non-test functions the most call sites resolve to - the repo's front doors.
+
+        @param limit  how many at most
+        """
+        return list(
+            self.conn.execute(
+                """SELECT t.name AS name, t.qualname AS qualname, t.path AS path,
+                          t.lineno AS lineno, t.summary AS summary, COUNT(*) AS callers
+                   FROM calls c JOIN functions t ON t.id = c.resolved_id
+                   WHERE t.is_test = 0
+                   GROUP BY t.id ORDER BY callers DESC, t.path, t.lineno LIMIT ?""",
+                (int(limit),),
+            )
+        )
+
+    def by_path(self, paths: Sequence[str]) -> List[sqlite3.Row]:
+        """Every function defined in these files, in coordinate order.
+
+        @param paths  repository-relative paths, '/' separated
+        @flow  nothing asked -> [] ; otherwise one IN query on the path index
+        """
+        paths = [str(path) for path in paths]
+        if not paths:
+            return []
+        marks = ",".join("?" * len(paths))
+        return list(
+            self.conn.execute(
+                "SELECT * FROM functions WHERE path IN ({0}) ORDER BY path, lineno".format(marks),
+                paths,
+            )
+        )
+
+    def search(self, tokens: Sequence[str], limit: int = 60) -> List[Dict[str, Any]]:
+        """Non-test functions whose name or summary contains any of these words.
+
+        Plain substring matching, one query per word, counted up in Python. There
+        is no embedding and no ranking model here on purpose: a briefing that
+        cannot be explained by looking at the words is a briefing nobody can
+        debug. Each row comes back with how many words hit it (``hits``), how
+        many hit its *name* rather than its summary (``name_hits``), and whether
+        one of them was the name exactly (``exact``).
+
+        @param tokens  the words to look for, already lowercased
+        @param limit   how many rows one word may contribute
+        @flow  per token: LIKE on name/qualname/summary -> merge by id, adding up the hits
+        주요 내부 변수: found(함수 id -> 주석 붙은 행)
+        """
+        found: Dict[int, Dict[str, Any]] = {}
+        for token in [str(t).strip().lower() for t in tokens]:
+            if not token:
+                continue
+            like = "%{0}%".format(token)
+            rows = self.conn.execute(
+                """SELECT * FROM functions
+                   WHERE is_test = 0 AND (
+                       LOWER(name) LIKE ? OR LOWER(qualname) LIKE ? OR LOWER(summary) LIKE ?
+                   )
+                   ORDER BY path, lineno LIMIT ?""",
+                (like, like, like, int(limit)),
+            )
+            for row in rows:
+                entry = found.get(row["id"])
+                if entry is None:
+                    entry = dict(row)
+                    entry.update({"hits": 0, "name_hits": 0, "exact": False})
+                    found[row["id"]] = entry
+                entry["hits"] += 1
+                name = str(row["name"] or "").lower()
+                qualname = str(row["qualname"] or "").lower()
+                if token in name or token in qualname:
+                    entry["name_hits"] += 1
+                if token == name:
+                    entry["exact"] = True
+        return list(found.values())
+
     def failures(self) -> List[sqlite3.Row]:
         """The files that could not be parsed, with the reason each gave. Takes no arguments."""
         return list(

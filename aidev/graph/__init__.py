@@ -33,7 +33,7 @@ from .build import (
     update_repo,
 )
 from .commands import add_parser
-from .db import GraphDB
+from .db import GraphDB, open_db
 from .model import CORE_TAGS, ParsedCall, ParsedFile, ParsedFunction, SpecTag, parse_spec
 from .jsparse import blank_strings, parse_js
 from .pyparse import parse_python
@@ -55,6 +55,7 @@ __all__ = [
     "graph_dir",
     "is_dirty",
     "mark_dirty",
+    "open_db",
     "parse_js",
     "parse_python",
     "parse_spec",
