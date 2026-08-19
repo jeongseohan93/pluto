@@ -25,4 +25,7 @@ packages = ["aidev"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# No addopts. Measured 2026-08-19: "-q" here combined with the declared
+# "python -m pytest -q" into an effective -qq, and pytest prints no summary
+# line at that verbosity - so verify had no count to read and reported 0 for a
+# suite that was entirely green. Quiet is the invoking command's decision.

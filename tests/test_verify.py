@@ -69,6 +69,15 @@ def test_output_nobody_can_read_says_so_rather_than_guessing():
     assert counts == {}
 
 
+def test_a_count_nobody_read_is_shown_as_n_a_and_never_as_zero():
+    """Measured 2026-08-19: 470 green tests reported as '0 passed'."""
+    assert verify.count_text(None) == "n/a"
+    assert verify.count_text(0) == "0"  # really none is still a number
+    assert verify.count_text(470) == "470"
+    assert verify.count_note(None) == "test count n/a"
+    assert verify.count_note(470) == "470 passed"
+
+
 def test_summarize_for_agent_is_a_diet():
     """The measured waste: 233 test names into the context after every edit."""
     noisy = PYTEST_OUTPUT + "\n".join(
@@ -153,6 +162,31 @@ def test_a_command_that_is_not_there_is_not_a_pass(tmp_path):
     assert result.commands[0].exit_code is None
     assert "not found on PATH" in result.commands[0].output
     assert verify.worst_exit_code(result) != 0
+
+
+def test_a_silent_pass_reports_no_count_rather_than_zero(tmp_path):
+    """A runner that prints nothing has not told us there were no tests."""
+    silent = script(tmp_path, "silent.py", "pass\n")
+
+    result = verify.run_commands([silent], tmp_path)
+
+    assert result.ok is True
+    assert (result.passed, result.failed, result.skipped) == (None, None, None)
+
+    summary = verify.summarize_for_agent(result)
+    assert "passed n/a" in summary
+    assert "passed 0" not in summary
+
+
+def test_a_count_that_was_read_is_still_added_up(tmp_path):
+    """The counts are only unknown when nothing said them; two commands still sum."""
+    first = script(tmp_path, "one.py", "print('3 passed, 1 skipped')\n")
+    second = script(tmp_path, "two.py", "print('4 passed')\n")
+
+    result = verify.run_commands([first, second], tmp_path)
+
+    assert (result.passed, result.skipped) == (7, 1)
+    assert result.failed is None  # neither output mentioned a failure
 
 
 def test_the_full_output_goes_to_a_log_and_not_into_the_summary(tmp_path):
@@ -351,6 +385,28 @@ def test_the_summary_shows_the_engine_run(repo, tmp_path, claude_bin, log, capsy
     assert "Verify" in out and "exit 0" in out
     # the engine's row costs nothing, and says so rather than being blank
     assert "$0.0000" in out
+
+
+def test_the_summary_shows_the_real_test_count(repo, tmp_path, claude_bin, log, capsys):
+    """Done Criteria: 계기판이 실제 개수를 적는다 (fake 러너로 검증)."""
+    command = verify_script(tmp_path, "print('470 passed in 161.90s')\n")
+    assert run(repo, tmp_path, claude_bin, command) == 0
+
+    out = capsys.readouterr().out
+    assert "(470 passed)" in out
+    assert "(0 passed)" not in out  # the 2026-08-19 misreport
+    assert state_of(repo)["stages"]["test"]["verify"]["attempts"][0]["passed"] == 470
+
+
+def test_a_pass_with_no_countable_output_says_n_a(repo, tmp_path, claude_bin, log, capsys):
+    """The other half: no number to read is 'n/a', never an invented zero."""
+    command = verify_script(tmp_path, "pass\n")
+    assert run(repo, tmp_path, claude_bin, command) == 0
+
+    out = capsys.readouterr().out
+    assert "(test count n/a)" in out
+    assert "(0 passed)" not in out
+    assert state_of(repo)["stages"]["test"]["verify"]["attempts"][0]["passed"] is None
 
 
 def test_no_test_commands_means_the_agent_stage_as_before(repo, tmp_path, claude_bin, log):

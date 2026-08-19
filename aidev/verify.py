@@ -99,14 +99,20 @@ class CommandResult:
 
 @dataclass
 class VerifyResult:
-    """Everything one verification attempt produced, in one value."""
+    """Everything one verification attempt produced, in one value.
+
+    The three counts are ``None`` until a runner's output says otherwise: a
+    suite that printed no summary line is unknown, not zero. Measured
+    2026-08-19, a whole passing suite was reported as ``0 passed`` because the
+    number was invented here rather than read.
+    """
 
     ok: bool = True
     commands: List[CommandResult] = field(default_factory=list)
     failures: List[FailedTest] = field(default_factory=list)
-    passed: int = 0
-    failed: int = 0
-    skipped: int = 0
+    passed: Optional[int] = None
+    failed: Optional[int] = None
+    skipped: Optional[int] = None
     parsed: bool = False
     spec_violations: List[Any] = field(default_factory=list)
 
@@ -116,7 +122,11 @@ class VerifyResult:
         return self.ok and not self.spec_violations
 
     def failure_count(self) -> int:
-        """How big the failure is, for the diagnosis grade. Spec violations count too."""
+        """How big the failure is, for the diagnosis grade. Spec violations count too.
+
+        An unread count (``None``) falls through to the listed failures, exactly
+        as a zero one did - which is why this body did not have to change.
+        """
         counted = self.failed or len(self.failures)
         return counted + len(self.spec_violations)
 
@@ -131,7 +141,11 @@ class VerifyResult:
         return None
 
     def to_dict(self) -> Dict[str, Any]:
-        """What state.json keeps of an attempt: counts in full, failures capped, violations as text."""
+        """What state.json keeps of an attempt: counts in full, failures capped, violations as text.
+
+        A count nobody could read is stored as ``null``, so a reader can tell
+        "the output never said" from "it really was none".
+        """
         return {
             "ok": self.ok,
             "commands": [result.to_dict() for result in self.commands],
@@ -173,6 +187,8 @@ def run_commands(
 
     Stops at the first failing command: a project that declares ``lint`` before
     ``test`` should not pay for the whole suite to learn what lint already said.
+    A count the output never mentioned stays ``None`` rather than becoming 0 -
+    ``_add`` is what keeps "unknown" from being reported as "none".
 
     @param commands  the declared commands, each one plain command with no shell
     @param cwd       where they run - the worktree, when the slice is isolated
@@ -193,9 +209,9 @@ def run_commands(
             )
         result.commands.append(single)
         failures, counts, parsed = parse_output(single.output)
-        result.passed += counts.get("passed", 0)
-        result.failed += counts.get("failed", 0) + counts.get("error", 0)
-        result.skipped += counts.get("skipped", 0)
+        result.passed = _add(result.passed, counts.get("passed"))
+        result.failed = _add(result.failed, _sum_present(counts, "failed", "error"))
+        result.skipped = _add(result.skipped, counts.get("skipped"))
         if failures:
             result.failures.extend(failures)
         result.parsed = result.parsed or parsed
@@ -203,6 +219,32 @@ def run_commands(
             result.ok = False
             break  # the rest would only cost time; this one already decided it
     return result
+
+
+def _add(total: Optional[int], seen: Optional[int]) -> Optional[int]:
+    """Add a count one command reported to the running total, keeping "never said" as ``None``.
+
+    @param total  what the earlier commands added up to, or None if none said
+    @param seen   what this command's output said, or None if it said nothing
+    @flow  nothing seen -> the total as it was ; else add, treating None as 0
+    """
+    if seen is None:
+        return total
+    return int(seen) + (total or 0)
+
+
+def _sum_present(counts: Dict[str, int], *keys: str) -> Optional[int]:
+    """The keys this output actually carried, added up - ``None`` when it carried none of them.
+
+    @param counts  what ``parse_output`` read out of one command
+    @param *keys   the count names that belong together, e.g. failed and error
+    @flow  each key present -> add ; nothing present -> None
+    """
+    total: Optional[int] = None
+    for key in keys:
+        if key in counts:
+            total = int(counts[key]) + (total or 0)
+    return total
 
 
 def _run_one(
@@ -357,12 +399,34 @@ def traceback_summary(text: str, limit: int = TRACEBACK_LINES) -> str:
 # ------------------------------------------------------------------- rendering
 
 
+def count_text(value: Optional[int]) -> str:
+    """A count as it should be shown: the number, or ``n/a`` when nothing read one.
+
+    Measured 2026-08-19: a suite of 470 passing tests was reported as
+    ``0 passed`` because a missing summary line was rendered as a zero. A
+    dashboard that invents a number is worse than one that admits it has none.
+
+    @param value  the count, or None when the runner's output never said
+    """
+    return "n/a" if value is None else str(value)
+
+
+def count_note(passed: Optional[int]) -> str:
+    """The pass count as a phrase for the end of a line: '470 passed' or 'test count n/a'.
+
+    @param passed  how many tests passed, or None when the output never said
+    """
+    return "test count n/a" if passed is None else "{0} passed".format(passed)
+
+
 def summarize_for_agent(result: VerifyResult) -> str:
     """The diet: failures with a location, successes as a number, log as a path.
 
     Measured 2026-08-16/17: implement re-ran the whole suite after every edit and
     the raw output - 233 test names - went into the session's context each time.
-    This is what the ``aidev verify`` wrapper prints instead.
+    This is what the ``aidev verify`` wrapper prints instead. A count nobody
+    could read prints as ``n/a``; failed and skipped stay silent when they are
+    ``None``, exactly as they did when they were zero.
 
     @param result  what ``run_commands`` produced
     """
@@ -375,7 +439,7 @@ def summarize_for_agent(result: VerifyResult) -> str:
                 command.duration_s,
             )
         )
-    counted = "passed {0}".format(result.passed)
+    counted = "passed {0}".format(count_text(result.passed))
     if result.failed:
         counted += "   failed {0}".format(result.failed)
     if result.skipped:
@@ -431,7 +495,8 @@ def render_failure_md(
 
     The whole point of writing this to a file is that the session that produced
     the failure is gone by the time anyone reads it. Everything a retry needs has
-    to be in here, and nothing that only mattered inside that session.
+    to be in here, and nothing that only mattered inside that session. The
+    counts are printed as the runner gave them - ``n/a`` where it gave none.
 
     @param result        the failed verification attempt
     @param slice_id      which slice this belongs to
@@ -497,7 +562,7 @@ def render_failure_md(
         "",
         "## Counts",
         "passed {0}   failed {1}   skipped {2}".format(
-            result.passed, result.failed, result.skipped
+            count_text(result.passed), count_text(result.failed), count_text(result.skipped)
         ),
     ]
 

@@ -1,6 +1,6 @@
 ---
 approval: plan
-max_turns: implement=160
+max_turns: implement=100
 test_commands: python -m pytest -q
 ---
 # 소형 수리 3건 — 계기판 오보·추적 범위·watch 잔가시

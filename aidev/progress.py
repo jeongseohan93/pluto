@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from . import storage
+
 # The fraction of a stage's turn budget at which a snapshot is taken. Late
 # enough that the work is worth recording, early enough to still have turns.
 PROGRESS_TURN_RATIO = 0.9
@@ -42,10 +44,16 @@ def should_snapshot(turn: int, budget: int, already: bool = False) -> bool:
     return int(turn) >= max(1, int(math.ceil(budget * PROGRESS_TURN_RATIO)))
 
 
-def touched_paths(telemetry: Optional[Dict[str, Any]]) -> List[str]:
+def touched_paths(telemetry: Optional[Dict[str, Any]], roots: Sequence[Any] = ()) -> List[str]:
     """Files this stage wrote or edited, in the order telemetry first saw them.
 
+    A session that edits something outside the work it was given - its own
+    memory file under ``~/.claude``, measured 2026-08-19 - did not do that as
+    part of this stage, so ``roots`` keeps those out of "Done".
+
     @param telemetry  a telemetry snapshot or its stored dict
+    @param roots      directories the work belongs in; empty means anywhere
+    @flow  edit/write accesses -> inside a root? -> first sighting only
     """
     paths: List[str] = []
     observed = (telemetry or {}).get("observed") or {}
@@ -53,8 +61,11 @@ def touched_paths(telemetry: Optional[Dict[str, Any]]) -> List[str]:
         if not isinstance(access, dict) or access.get("operation") not in ("edit", "write"):
             continue
         path = access.get("path")
-        if isinstance(path, str) and path and path not in paths:
-            paths.append(path)
+        if not isinstance(path, str) or not path or path in paths:
+            continue
+        if roots and not any(storage.path_inside(path, root) for root in roots):
+            continue
+        paths.append(path)
     return paths
 
 
@@ -102,6 +113,7 @@ def render(
     turn: int = 0,
     budget: int = 0,
     repo: str = "",
+    roots: Sequence[Any] = (),
 ) -> str:
     """The whole file: what was done, what is left, what the session last said.
 
@@ -115,10 +127,11 @@ def render(
     @param turn        turns used at the moment of writing
     @param budget      this stage's turn budget
     @param repo        the user's repository, for the resume command
+    @param roots       directories "done" is limited to; empty means anywhere
     @flow  header -> Done (files, commands) -> Remaining -> Last words -> Resume
     주요 내부 변수: done(편집된 파일), lines(누적 출력)
     """
-    done = touched_paths(telemetry)
+    done = touched_paths(telemetry, roots)
     commands = ran_commands(telemetry)
     lines = [
         "# PROGRESS - {0} · {1}".format(slice_id or "(slice)", stage),
