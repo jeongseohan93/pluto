@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260819-auto-recovery",
+  "status": "pending",
+  "branch": "slice/20260819-auto-recovery",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "655957f1ad86efa4738af7fca2756089acbb3ace",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-19T14:13:02+09:00"
+}
