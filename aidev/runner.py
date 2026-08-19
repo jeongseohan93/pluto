@@ -229,6 +229,12 @@ def execute(
 
 
 def _write_prompt(process: "subprocess.Popen[str]", prompt: str) -> None:
+    """Hands the child its prompt and closes stdin - headless ``claude`` waits for EOF to begin.
+
+    @param process  the spawned CLI, which may have been started without a stdin pipe
+    @param prompt   the whole prompt text, written in one go
+    @flow  no stdin -> return ; write then close ; child already gone -> swallow the broken pipe
+    """
     if process.stdin is None:
         return
     try:
@@ -239,6 +245,12 @@ def _write_prompt(process: "subprocess.Popen[str]", prompt: str) -> None:
 
 
 def _drain_stderr(process: "subprocess.Popen[str]", store: RunStore) -> None:
+    """Keeps the stderr pipe empty from its own thread; a full pipe would stall the stdout loop.
+
+    @param process  the spawned CLI, which may have been started without a stderr pipe
+    @param store    where each line lands, one stderr file per run
+    @flow  no stderr -> return ; line -> store ; pipe closed under us -> stop quietly, close either way
+    """
     if process.stderr is None:
         return
     try:
@@ -254,6 +266,11 @@ def _drain_stderr(process: "subprocess.Popen[str]", store: RunStore) -> None:
 
 
 def _terminate(process: "subprocess.Popen[str]") -> None:
+    """Ends the child after a Ctrl-C, escalating rather than leaving an orphan holding the repo.
+
+    @param process  the spawned CLI, in any state including already exited
+    @flow  terminate, wait 5s -> still alive -> kill ; already reaped -> swallow the OSError
+    """
     try:
         process.terminate()
         process.wait(timeout=5)

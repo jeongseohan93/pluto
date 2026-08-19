@@ -52,6 +52,7 @@ class GitError(RuntimeError):
 
 
 def git_available() -> bool:
+    """Asked before anything git-shaped is attempted, so a machine without git degrades quietly."""
     return shutil.which("git") is not None
 
 
@@ -127,6 +128,11 @@ def git(repo: Path, *args: Any, **kwargs: Any) -> str:
 
 
 def is_git_repo(path: Path) -> bool:
+    """Whether git will work here at all - a plain directory answers False rather than raising.
+
+    @param path  the directory to test; it may not exist
+    @flow  not a dir, or no git -> False ; rev-parse --git-dir succeeds -> True ; GitError -> False
+    """
     if not Path(path).is_dir() or not git_available():
         return False
     try:
@@ -203,12 +209,25 @@ def show_file(repo: Path, rev: str, path: str) -> Optional[str]:
 
 
 def branch_exists(repo: Path, name: str) -> bool:
+    """Asked before a slice branch is created, so a resumed slice reuses its branch instead of dying.
+
+    Only local heads count - a remote-tracking name of the same spelling answers False.
+
+    @param repo  the repository or worktree to ask
+    @param name  a branch name without the ``refs/heads/`` prefix
+    """
     return run(
         repo, ["show-ref", "--verify", "--quiet", "refs/heads/{0}".format(name)], check=False
     ).returncode == 0
 
 
 def head_commit(repo: Path) -> Optional[str]:
+    """The commit a stage started from, recorded so a rollback has somewhere to go back to.
+
+    ``None`` on an empty repository - there is no first commit yet.
+
+    @param repo  the repository or worktree to ask
+    """
     return resolve_commit(repo, "HEAD")
 
 
@@ -259,6 +278,15 @@ def list_files(repo: Path) -> Optional[List[str]]:
 
 
 def is_clean(repo: Path, tracked_only: bool = False) -> bool:
+    """The gate a stage passes before it may commit: nothing of anyone else's is in the way.
+
+    A directory git cannot answer for counts as clean - the pipeline is allowed
+    to run outside a repository, and refusing there would help nobody.
+
+    @param repo          the repository or worktree to inspect
+    @param tracked_only  ignore untracked files, for the checks that only care about edits
+    @flow  no porcelain -> True ; any line, ``??`` skipped when tracked_only -> False ; else True
+    """
     status = porcelain(repo)
     if status is None:
         return True
@@ -284,6 +312,7 @@ class WorktreeEntry:
 
     @property
     def stale(self) -> bool:
+        """Git still lists it but it cannot be worked in - reuse would fail, so callers make a new one."""
         return bool(self.prunable) or self.locked
 
 
@@ -333,6 +362,12 @@ def list_worktrees(repo: Path) -> List[WorktreeEntry]:
 
 
 def find_worktree(repo: Path, path: Path) -> Optional[WorktreeEntry]:
+    """Whether git already has this directory registered, matched by real path rather than spelling.
+
+    @param repo  the repository whose registrations to search
+    @param path  the directory in question, absolute or not, symlinked or not
+    @flow  every registered worktree -> same path -> that entry ; no match -> None
+    """
     for entry in list_worktrees(repo):
         if _same_path(entry.path, path):
             return entry
@@ -348,6 +383,16 @@ def stale_worktrees(repo: Path) -> List[WorktreeEntry]:
 
 
 def worktree_add(repo: Path, path: Path, branch: str, start_commit: str) -> None:
+    """Check a slice out somewhere of its own, on a branch of its own, made here in one step.
+
+    Raises ``GitError`` rather than reporting - a workspace that cannot be made
+    is not something the caller can carry on past.
+
+    @param repo          the repository to register the worktree with
+    @param path          where to put it; the parent is created if it is missing
+    @param branch        the branch to create, which must not exist yet
+    @param start_commit  what that branch starts from
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     git(repo, "worktree", "add", "-b", branch, str(path), start_commit)
 
@@ -546,6 +591,10 @@ def revert_commit(repo: Path, commit: str, mainline: int = 1) -> MergeResult:
 
 
 def default_worktree_root(repo: Path) -> Path:
+    """Slice worktrees live beside the repository, not inside it - inside, they would index themselves.
+
+    @param repo  the repository the worktrees belong to
+    """
     repo = Path(repo)
     return repo.parent / "{0}{1}".format(repo.name, DEFAULT_ROOT_SUFFIX)
 
@@ -576,6 +625,7 @@ class Workspace:
     created_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        """How state.json remembers the worktree, so a resume can find it without asking git."""
         return {
             "path": str(self.path),
             "branch": self.branch,
@@ -702,6 +752,13 @@ def blocking_reasons(repo: Path, plan: WorkspacePlan) -> List[str]:
 
 
 def create(repo: Path, plan: WorkspacePlan) -> Workspace:
+    """Turn the plan into the thing itself, stamping the moment it came into being.
+
+    ``blocking_reasons`` is the caller's job first: this one does not look, it does.
+
+    @param repo  the repository to register the worktree with
+    @param plan  what ``plan_workspace`` decided, taken as given
+    """
     worktree_add(repo, plan.path, plan.branch, plan.base_commit)
     return Workspace(
         path=Path(plan.path),

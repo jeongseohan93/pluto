@@ -157,6 +157,17 @@ def build_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------- commands
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """One headless session end to end: everything it produced survives in the run dir.
+
+    The order at the close is deliberate - telemetry.json is on disk before the
+    final live.json, so a watcher that sees a terminal status can always read it.
+
+    @param args  parsed arguments: --repo, --prompt, --phase, --dry-run, the runner's knobs
+    @flow  repo/prompt checks -> RunConfig -> dry-run? print and stop
+           : execute, streaming each event to the live view and live.json
+           -> finish -> telemetry + run.json -> sqlite -> final report
+    주요 내부 변수: cfg(런 설정), store(run dir 기록), telemetry(진행 상태), result(StageRun)
+    """
     repo = args.repo.expanduser().resolve()
     if not repo.is_dir():
         print("error: --repo not found: {0}".format(repo), file=sys.stderr)
@@ -290,6 +301,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    """Re-render a finished run from what it left on disk - nothing is recomputed.
+
+    @param args  parsed arguments: run_id (a prefix is enough), --json, --data-dir
+    @flow  resolve the run dir -> no telemetry.json -> exit 2 ; --json -> raw dump : rendered report
+    """
     runs_root = _data_dir(args) / "runs"
     run_dir = resolve_run_dir(runs_root, args.run_id)
     if run_dir is None:
@@ -417,6 +433,11 @@ def resolve_watch_target(
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    """Recent runs, from the index when there is one and from the directories when there is not.
+
+    @param args  parsed arguments: --limit, --data-dir
+    @flow  aidev.db present -> rendered table ; absent -> the last N run dir names ; none -> say so
+    """
     data_dir = _data_dir(args)
     db_path = data_dir / "aidev.db"
     if db_path.exists():
@@ -432,6 +453,11 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
+    """Where the time and tokens went, by phase. Needs the index - dirs alone cannot answer this.
+
+    @param args  parsed arguments: --limit (how many recent runs feed the totals), --data-dir
+    @flow  no aidev.db -> say there are no runs ; else phase totals over the last N runs
+    """
     db_path = _data_dir(args) / "aidev.db"
     if not db_path.exists():
         print("(no runs yet)")
@@ -473,6 +499,13 @@ def _run_meta(cfg: runner.RunConfig, telemetry: Telemetry, command: List[str]) -
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """The one entry point every ``aidev`` command arrives through; returns the process exit code.
+
+    Ctrl-C is caught here so an interrupt reads as a line and 130, never as a traceback.
+
+    @param argv  the arguments to parse; ``None`` means take them from the command line
+    @flow  configure output -> parse -> no subcommand? help and 1 : dispatch ; Ctrl-C -> 130
+    """
     reporter.configure_output(sys.stdout)
     parser = build_parser()
     args = parser.parse_args(argv)

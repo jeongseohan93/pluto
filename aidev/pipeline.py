@@ -702,6 +702,16 @@ _MIGRATION_NAME_RE = re.compile(r"^(v\d+__|\d{3,}[_-])", re.IGNORECASE)
 
 
 def looks_like_migration(path: str) -> bool:
+    """Judge one path by name alone, since a rollback has no database to ask.
+
+    A false positive costs a warning nobody needed; a false negative costs data.
+    The directory segments are checked without the file's own name, so a file
+    merely called ``migrate.py`` does not qualify on that alone.
+
+    @param path  a repository-relative path, in either slash style
+    @flow  a migrations-ish directory -> yes ; alembic/versions -> yes ; else a numbered .sql
+    주요 내부 변수: segments(디렉터리들 + 파일명), name(마지막 조각)
+    """
     normalised = str(path).replace("\\", "/").lower()
     segments = normalised.split("/")
     if any(segment in MIGRATION_SEGMENTS for segment in segments[:-1]):
@@ -713,6 +723,10 @@ def looks_like_migration(path: str) -> bool:
 
 
 def migration_paths(paths: Sequence[str]) -> List[str]:
+    """Keep the ones a rollback cannot undo, in the order they were given.
+
+    @param paths  every path the rollback range touches
+    """
     return [path for path in paths if looks_like_migration(path)]
 
 
@@ -865,6 +879,10 @@ def approval_conditions(state: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def slices_root(repo: Path) -> Path:
+    """Every slice's home, inside the target repo - the record travels with the code it describes.
+
+    @param repo  the repository being worked on, not the aidev data directory
+    """
     return Path(repo) / AIDEV_DIRNAME / "slices"
 
 
@@ -890,37 +908,49 @@ class SliceRecord:
 
     @property
     def dir(self) -> Path:
+        """Everything about this slice lives under here; every other path is built from it."""
         return Path(self.root) / self.slice_id
 
     @property
     def requirement_path(self) -> Path:
+        """The human's own words, copied in at the start and never rewritten by a stage."""
         return self.dir / "requirement.md"
 
     @property
     def plan_path(self) -> Path:
+        """The plan stage's answer - the one file implement is handed, so it is always the current one."""
         return self.dir / "plan.md"
 
     @property
     def state_path(self) -> Path:
+        """The slice's whole progress. Deleting it is what makes a slice unresumable."""
         return self.dir / STATE_FILENAME
 
     @property
     def runs_path(self) -> Path:
+        """The ledger of every session this slice ever spent, kept apart from state so it only grows."""
         return self.dir / "runs.json"
 
     @property
     def rollbacks_path(self) -> Path:
+        """What was undone and from where, so a repeated 번복 can be seen for what it is."""
         return self.dir / ROLLBACKS_FILENAME
 
     @property
     def approvals_dir(self) -> Path:
+        """One file per gate. A file existing here is how a stage learns it may proceed."""
         return self.dir / "approvals"
 
     @property
     def amends_dir(self) -> Path:
+        """Where mid-flight corrections to the requirement are kept, in the order they arrived."""
         return self.dir / "amends"
 
     def amend_path(self, number: int) -> Path:
+        """Where the Nth amendment is kept; zero-padded so the directory reads in order.
+
+        @param number  which amendment, counting from 1
+        """
         return self.amends_dir / "{0:03d}.md".format(number)
 
     # --- v0.5: what a failure, a diagnosis and a dying stage leave behind. Each
@@ -979,25 +1009,48 @@ class SliceRecord:
     kind = "slice"
 
     def approval_path(self, stage: str) -> Path:
+        """The file whose contents a human edits to open one gate.
+
+        @param stage  the gated stage's name
+        """
         return self.approvals_dir / "{0}.md".format(stage)
 
     def ensure(self) -> "SliceRecord":
+        """Make the directories a slice cannot be written into without, and hand the record back.
+
+        Creating ``approvals`` creates ``dir`` with it, which is why one mkdir is enough.
+        """
         self.approvals_dir.mkdir(parents=True, exist_ok=True)
         return self
 
     def read_state(self) -> Optional[Dict[str, Any]]:
+        """The slice as last published, or ``None`` when there is nothing readable there yet."""
         return read_json_tolerant(self.state_path)
 
     def write_state(self, state: Dict[str, Any]) -> None:
+        """Publish progress. Until this returns, a resume or a ``--list`` cannot see what changed.
+
+        @param state  the whole state dict, which gets its ``updated_at`` stamped on the way out
+        """
         write_state_atomic(self.state_path, state)
 
     def read_plan(self) -> str:
+        """The plan as text, empty when there is none - callers branch on emptiness, not on errors.
+
+        @flow  read plan.md -> text ; OSError -> ""
+        """
         try:
             return self.plan_path.read_text(encoding="utf-8")
         except OSError:
             return ""
 
     def write_plan(self, text: str) -> None:
+        """Install a plan as the current one, normalised to a single trailing newline.
+
+        Archiving the plan this replaces is the caller's job, not this one's.
+
+        @param text  the plan as the stage wrote it
+        """
         write_text_atomic(self.plan_path, text.rstrip() + "\n")
 
     def read_plan_archive(self, relative: str) -> str:
@@ -1013,6 +1066,13 @@ class SliceRecord:
             return ""
 
     def append_run(self, entry: Dict[str, Any]) -> None:
+        """Add one session to the ledger, rebuilding the file rather than trusting what is there.
+
+        A corrupt or missing runs.json costs the history, never the new entry.
+
+        @param entry  one run's record, as ``record_run`` shaped it
+        @flow  read what exists -> not a list -> start fresh -> append -> write the whole file back
+        """
         data = read_json_tolerant(self.runs_path) or {}
         runs = data.get("runs")
         if not isinstance(runs, list):
@@ -1021,6 +1081,10 @@ class SliceRecord:
         write_json_atomic(self.runs_path, {"slice_id": self.slice_id, "runs": runs})
 
     def runs(self) -> List[Dict[str, Any]]:
+        """Every session this slice spent, oldest first. Anything that is not a dict is dropped.
+
+        @flow  no file or no list -> [] ; otherwise the dict entries only
+        """
         data = read_json_tolerant(self.runs_path) or {}
         runs = data.get("runs")
         return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
@@ -1037,12 +1101,21 @@ class SliceRecord:
         )
 
     def rollbacks(self) -> List[Dict[str, Any]]:
+        """Every 번복 this slice has suffered, oldest first, read exactly like ``runs``.
+
+        @flow  no file or no list -> [] ; otherwise the dict entries only
+        """
         data = read_json_tolerant(self.rollbacks_path) or {}
         entries = data.get("rollbacks")
         return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
 
 def now_iso() -> str:
+    """The one timestamp shape every record in this tool carries: local, offset-bearing, to the second.
+
+    Local rather than UTC because a human reads these next to their own clock;
+    the offset is what keeps them comparable across machines anyway.
+    """
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
@@ -1144,6 +1217,19 @@ def new_state(
     stages: Sequence[str] = STAGES,
     epic: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """A slice's state.json at birth, with every stage already listed as pending.
+
+    Listing the stages up front is what lets ``--list`` and a resume describe a
+    slice nobody has run yet. ``epic`` is only added when there is one, so an
+    older reader never meets a key it has to understand.
+
+    @param slice_id  the id this record is filed under
+    @param repo      the repository being worked on, stored as text
+    @param gates     which stages stop for a human
+    @param stages    the stage order this slice runs, defaulting to the standard one
+    @param epic      which epic queued this slice and where in its list, when an epic did
+    @flow  build the pending record -> epic given -> attach a copy of it
+    """
     state = {
         "schema": STATE_SCHEMA,
         "slice_id": slice_id,
@@ -1167,6 +1253,15 @@ def new_state(
 
 
 def stage_entry(state: Dict[str, Any], stage: str) -> Dict[str, Any]:
+    """One stage's slot in state.json, made on first ask so no caller has to check for it.
+
+    The dict handed back is the live one inside ``state``: writing to it is
+    writing to the state, and only ``write_state`` puts that on disk.
+
+    @param state  the slice's state, mutated in place
+    @param stage  which stage's entry is wanted
+    @flow  stages dict (created when absent) -> entry ; not a dict -> replace with a pending one
+    """
     stages = state.setdefault("stages", {})
     entry = stages.get(stage)
     if not isinstance(entry, dict):
@@ -1335,6 +1430,13 @@ def dirty_reason(repo: Path, quiet: bool = False) -> Optional[str]:
 
 
 def ensure_clean_repo(repo: Path) -> None:
+    """The v0.2 gate: refuse to start on top of someone's uncommitted work, with the reason.
+
+    Raises rather than returning a verdict - there is nothing sensible for a
+    caller to do but stop, and the message is already the explanation.
+
+    @param repo  the repository the pipeline is about to work in
+    """
     reason = dirty_reason(repo)
     if reason is not None:
         raise PipelineError(reason)
@@ -1384,6 +1486,16 @@ _MAX_RESET_AHEAD_S = 24 * 3600.0
 
 
 def tail_text(path: Path, limit: int = 65536) -> str:
+    """The end of a file, read without loading the rest - a run's log can be hundreds of megabytes.
+
+    Bytes, not lines, so the cost is bounded whatever the file contains; the cut
+    may land mid-character, which is why decoding replaces rather than raises.
+    An unreadable file is "" - every caller here treats absence as no news.
+
+    @param path   the file to look at the end of
+    @param limit  how many bytes back from the end to take
+    @flow  seek to the end -> back by limit (or to 0) -> read and decode ; OSError -> ""
+    """
     try:
         with open(str(path), "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -1421,6 +1533,13 @@ def failure_text(run_dir: Path) -> str:
 
 
 def looks_like_quota(text: str) -> bool:
+    """Tell a limit apart from a real failure, so the stage waits instead of burning its attempts.
+
+    Substring matching over provisional markers: it is guessing, and the cost of
+    a wrong guess is a wait rather than a lost slice.
+
+    @param text  whatever the run left behind - the result event, or stderr
+    """
     lowered = text.lower()
     return any(marker in lowered for marker in QUOTA_MARKERS)
 
@@ -2028,6 +2147,7 @@ class StageRun:
 
     @property
     def ok(self) -> bool:
+        """Only ``completed`` counts - a stage that hit its turn limit or a quota wall did not pass."""
         return self.status == "completed"
 
 
@@ -2044,6 +2164,15 @@ class _TextCapture:
         self._seen: set = set()
 
     def feed(self, event: Dict[str, Any]) -> None:
+        """Take one streamed event and keep only the prose. Called for every event of a run.
+
+        A resumed message arrives twice; the message key is what stops the plan
+        from containing the same paragraph two times.
+
+        @param event  one parsed line of the stream, of any type
+        @flow  assistant -> already seen? drop : keep each non-empty text block
+               ; result -> remember it as the final answer ; anything else -> ignored
+        """
         kind = event.get("type")
         if kind == "assistant":
             key = ev.message_key(event)
@@ -2064,6 +2193,7 @@ class _TextCapture:
                 self.final = text
 
     def text(self) -> str:
+        """What the stage said, as the file it is about to become - this is where plan.md comes from."""
         # The result event carries the final answer; the streamed chunks are the
         # fallback for a run that ended without one.
         return (self.final or "\n\n".join(self.chunks)).strip()
@@ -2422,6 +2552,15 @@ def run_stage(
 
 
 def record_run(rec: SliceRecord, run: StageRun) -> None:
+    """Write one session into runs.json - what it cost and what it said, flattened out of telemetry.
+
+    Every attempt is recorded, including the ones that failed or hit a limit:
+    the bill is the sum of the tries, not of the successes. The text is clipped
+    at 2000 characters so a chatty stage cannot make the ledger unreadable.
+
+    @param rec  the slice whose ledger this is
+    @param run  the finished stage run, with its telemetry attached
+    """
     exact = run.telemetry.get("exact") or {}
     rec.append_run(
         {
@@ -2653,6 +2792,11 @@ def write_hook_settings(cfg: PipelineConfig, rec: Any) -> Optional[Path]:
 
 
 def history_dir(cfg: PipelineConfig, slice_id: str) -> Path:
+    """Where a slice's record is projected for the commit - under ``cwd``, so it lands in the worktree.
+
+    @param cfg       the slice's configuration, whose ``cwd`` is the worktree when isolated
+    @param slice_id  which slice the projection belongs to
+    """
     return Path(cfg.cwd) / AIDEV_DIRNAME / HISTORY_DIR / slice_id
 
 
@@ -3121,11 +3265,29 @@ def note_stage_failure(state: Dict[str, Any], stage: str) -> None:
 
 
 def set_status(rec: SliceRecord, state: Dict[str, Any], status: str) -> None:
+    """Change the slice's status and publish it in the same breath.
+
+    The write is the point: a status that only ever reached memory is invisible
+    to ``--list`` and to the resume that has to pick this slice back up.
+
+    @param rec     the slice whose state.json is rewritten
+    @param state   the state dict, mutated in place
+    @param status  the new status
+    """
     state["status"] = status
     rec.write_state(state)
 
 
 def fail_slice(rec: SliceRecord, state: Dict[str, Any], reason: str) -> int:
+    """End the slice as failed: record why, publish it, say it, and hand back the exit code.
+
+    Returning the code rather than raising is what lets callers write
+    ``return fail_slice(...)`` at every point a stage can give up.
+
+    @param rec     the slice being failed
+    @param state   the state dict, which keeps the reason
+    @param reason  one line a human can act on
+    """
     state["reason"] = reason
     set_status(rec, state, STATUS_FAILED)
     say("FAILED - {0}".format(reason))
@@ -3451,6 +3613,13 @@ def run_pipeline(
 
 
 def say(message: str) -> None:
+    """The pipeline's own voice, marked off from anything a stage prints and never buffered.
+
+    Flushing every line is what keeps the transcript in order when a child
+    process is writing to the same terminal.
+
+    @param message  one line, already formatted
+    """
     print("[pipeline] {0}".format(message), flush=True)
 
 
@@ -3470,6 +3639,17 @@ def _comment_lines(text: str) -> str:
 def banner(
     stage: str, slice_id: str, attempt: int, resumed: bool = False, fresh: bool = False
 ) -> None:
+    """Mark where a stage begins in a long transcript, and say what kind of attempt this is.
+
+    Deliberately not ``say``: this is a heading, so it carries no prefix.
+
+    @param stage     the stage about to run
+    @param slice_id  which slice it belongs to
+    @param attempt   which try this is, counting from 1
+    @param resumed   the session was continued rather than started
+    @param fresh     the session was deliberately started over
+    @flow  first attempt -> plain heading ; later -> add the count and how the session was got
+    """
     label = "{0}  {1}".format(stage.upper(), slice_id)
     if attempt > 1:
         note = ", resumed session" if resumed else (", new session" if fresh else "")
@@ -3914,6 +4094,14 @@ def add_parser(sub: Any) -> Any:
 
 
 def cmd_pipeline(args: Any) -> int:
+    """The subcommand's outer edge: everything below may raise, and nothing above sees a traceback.
+
+    ``PipelineError`` carries its own exit code, so a refusal and a failure are
+    told apart by the shell without either being printed twice.
+
+    @param args  the parsed arguments
+    @flow  dispatch -> PipelineError -> its message on stderr and its own code
+    """
     try:
         return _dispatch(args)
     except PipelineError as exc:
@@ -4091,6 +4279,16 @@ def _config(
 
 
 def resolve_requirement(path: Path, repo: Path, flag: str = "--requirement") -> Path:
+    """Find the file the human meant, whether they typed it from their shell or from the repo.
+
+    A relative path is tried against the current directory before the repo, so
+    the spelling that works in the terminal keeps working.
+
+    @param path  what was typed, absolute or relative
+    @param repo  the repository, tried as the second base for a relative path
+    @param flag  the flag's name, so the refusal quotes what the human actually wrote
+    @flow  as given -> cwd-relative -> repo-relative ; first file wins ; none -> PipelineError
+    """
     candidates = [path.expanduser()]
     if not path.is_absolute():
         candidates.append((Path.cwd() / path).resolve())
@@ -4362,6 +4560,17 @@ def _rollback_workspace(repo: Path, ws: workspace.Workspace) -> None:
 
 
 def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
+    """``--resume-slice``: locate the slice first, then either describe it or carry it on.
+
+    ``--dry-run`` is the whole reason this is not just ``continue_slice``: it
+    answers "where is this slice" without starting a session for the answer.
+
+    @param args        the parsed arguments, carrying the slice id and --dry-run
+    @param repo        the user's repository
+    @param data_dir    where runs are stored
+    @param repo_given  whether --repo was named, so an empty answer can say which repo it looked in
+    @flow  find the slice -> dry-run? print status, worktree and stages : continue_slice
+    """
     rec = find_slice(repo, args.resume_slice, repo_given, data_dir)
     if args.dry_run:
         state = rec.read_state()
@@ -5449,6 +5658,17 @@ def find_slice(
 
 
 def list_slices(repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None) -> int:
+    """``--list``: every slice in this repo and where each one stopped, read only from disk.
+
+    A slice whose state.json will not parse is still listed, as ``(unreadable)``
+    - the point of the table is that nothing silently disappears from it.
+
+    @param repo        the repository whose slices are listed
+    @param repo_given  whether --repo was named; an empty list says which repo it looked in
+    @param data_dir    where recently used repos are remembered, for that same hint
+    @flow  no slices -> the hint and stop ; else a header and one row per slice, stages spelled out
+    주요 내부 변수: records(디스크에 있는 슬라이스들), detail(스테이지=상태 나열)
+    """
     records = _existing_slices(slices_root(repo))
     if not records:
         print(

@@ -62,6 +62,8 @@ class Violation:
         )
 
     def to_dict(self) -> Dict[str, object]:
+        """The JSON shape a violation travels in, so a stage result can carry it to a reader
+        who never saw the terminal."""
         return {
             "file": self.file,
             "line": self.line,
