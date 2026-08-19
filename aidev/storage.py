@@ -129,6 +129,10 @@ RECENT_REPOS_LIMIT = 10
 
 
 def recent_repos_path(data_dir: Path) -> Path:
+    """The one file both the writer and the reader of the candidate list agree on.
+
+    @param data_dir  the aidev data directory, which need not exist yet
+    """
     return Path(data_dir) / RECENT_REPOS_FILENAME
 
 
@@ -184,11 +188,22 @@ def recent_repos(data_dir: Path, limit: int = 5) -> List[str]:
 
 
 def slugify(value: str) -> str:
+    """Make text safe to be a directory name on any platform, and short enough to read in a list.
+
+    Never empty: a value with nothing alphanumeric in it still has to name a directory.
+
+    @param value  arbitrary text, typically a task name
+    """
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
     return slug[:40] or "run"
 
 
 def make_run_id(task: str, now: Optional[datetime] = None) -> str:
+    """The name a run is filed and sorted under - timestamp first, so ``ls`` is chronological.
+
+    @param task  what the run is called, used as the readable half
+    @param now   the moment to stamp it with; ``None`` means now, and tests pass their own
+    """
     stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
     return "{0}-{1}".format(stamp, slugify(task))
 
@@ -207,35 +222,46 @@ class RunStore:
     # paths
     @property
     def events_path(self) -> Path:
+        """The unparsed stream, kept so a run can be re-read after telemetry has moved on."""
         return self.dir / "events.jsonl"
 
     @property
     def stderr_path(self) -> Path:
+        """Where the child's complaints go - the only record of a crash that printed nothing else."""
         return self.dir / "stderr.log"
 
     @property
     def prompt_path(self) -> Path:
+        """The prompt as it was actually sent, so a surprising result can be read back against it."""
         return self.dir / "prompt.md"
 
     @property
     def run_json_path(self) -> Path:
+        """The invocation itself - argv, config, version - written before the run and again after."""
         return self.dir / "run.json"
 
     @property
     def telemetry_path(self) -> Path:
+        """The finished totals. Its existence is what makes a run reportable."""
         return self.dir / "telemetry.json"
 
     @property
     def live_path(self) -> Path:
+        """The file a watcher polls. Only the running process writes it."""
         return self.dir / LIVE_FILENAME
 
     # lifecycle
     def open(self) -> "RunStore":
+        """Take the two append handles this run writes through; safe to call again after close."""
         self._events = self.events_path.open("a", encoding="utf-8", newline="\n")
         self._stderr = self.stderr_path.open("a", encoding="utf-8", newline="\n")
         return self
 
     def close(self) -> None:
+        """Flush and let go of both handles, forgiving every failure - the run is already over.
+
+        @flow  each handle -> flush and close, swallowing OSError/ValueError -> forget it
+        """
         for handle in (self._events, self._stderr):
             if handle is not None:
                 try:
@@ -261,18 +287,35 @@ class RunStore:
         self._events.flush()
 
     def write_stderr(self, line: str) -> None:
+        """One stderr line, flushed at once - a crash must not take the buffer with it.
+
+        @param line  the line, with or without its newline
+        @flow  handles closed -> reopen ; append and flush
+        """
         if self._stderr is None:
             self.open()
         self._stderr.write(line.rstrip("\r\n") + "\n")
         self._stderr.flush()
 
     def write_prompt(self, text: str) -> None:
+        """Keep what was sent, before it is sent - a run that dies at once is still explainable.
+
+        @param text  the whole prompt
+        """
         self.prompt_path.write_text(text, encoding="utf-8")
 
     def write_run_json(self, meta: Dict[str, Any]) -> None:
+        """Publish the invocation record; called twice, the second time overwriting the first.
+
+        @param meta  the run metadata as ``_run_meta`` assembled it
+        """
         _write_json(self.run_json_path, meta)
 
     def write_telemetry(self, data: Dict[str, Any]) -> None:
+        """Publish the run's totals. A watcher treats this file's appearance as the run being over.
+
+        @param data  the whole telemetry record
+        """
         _write_json(self.telemetry_path, data)
 
     def write_live(
@@ -304,9 +347,14 @@ class RunStore:
         return True
 
     def read_telemetry(self) -> Dict[str, Any]:
+        """Read back what this run wrote. Raises if it never finished - the caller must look first."""
         return json.loads(self.telemetry_path.read_text(encoding="utf-8"))
 
     def iter_raw_events(self) -> Iterable[str]:
+        """Replay the stream a line at a time, so a long run is never held in memory whole.
+
+        @flow  no events file -> empty ; otherwise yield each line, decoding errors replaced
+        """
         if not self.events_path.exists():
             return []
         with self.events_path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -368,10 +416,21 @@ def read_json_tolerant(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def read_live(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """A watcher's view of a run in flight, by directory rather than by owning the store.
+
+    ``None`` means "nothing readable this tick", not "no such run" - it is polled
+    while the runner is replacing the file.
+
+    @param run_dir  a ``data/runs/<run-id>/`` directory
+    """
     return read_json_tolerant(Path(run_dir) / LIVE_FILENAME)
 
 
 def read_telemetry(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """The finished totals of someone else's run; ``None`` while it is still going.
+
+    @param run_dir  a ``data/runs/<run-id>/`` directory
+    """
     return read_json_tolerant(Path(run_dir) / "telemetry.json")
 
 
@@ -561,6 +620,7 @@ class Database:
             )
 
     def close(self) -> None:
+        """Hand the sqlite handle back. Every write is already committed by ``with self.conn``."""
         self.conn.close()
 
     def __enter__(self) -> "Database":
@@ -570,6 +630,15 @@ class Database:
         self.close()
 
     def save_run(self, telemetry: Dict[str, Any]) -> None:
+        """Index one finished run, replacing any earlier copy of it - saving twice is not doubling.
+
+        The four deletes and every insert share one transaction, so a run is
+        never half-indexed: a crash mid-write leaves the previous copy intact.
+
+        @param telemetry  the run's whole telemetry dict; only ``run_id`` is required
+        @flow  one transaction: delete the old rows -> runs -> tool_calls -> file_accesses -> phases
+        주요 내부 변수: exact(응답이 보고한 값), observed(관측한 도구 호출), estimated(추정치)
+        """
         run_id = telemetry["run_id"]
         exact = telemetry.get("exact", {})
         observed = telemetry.get("observed", {})
@@ -662,12 +731,22 @@ class Database:
             )
 
     def recent_runs(self, limit: int = 20) -> List[sqlite3.Row]:
+        """Newest first, whole rows - the caller renders, so nothing is selected away here.
+
+        The id breaks ties: two runs started in the same second still order stably.
+
+        @param limit  how many rows at most
+        """
         cur = self.conn.execute(
             "SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
         )
         return cur.fetchall()
 
     def phase_totals(self, limit: int = 20) -> List[sqlite3.Row]:
+        """Cost and tokens grouped by phase, over the N most recent runs rather than all of history.
+
+        @param limit  how many recent runs feed the totals, biggest phase first
+        """
         cur = self.conn.execute(
             """SELECT p.phase                AS phase,
                       COUNT(*)               AS runs,
@@ -685,6 +764,12 @@ class Database:
 
 
 def list_run_dirs(runs_root: Path) -> List[Path]:
+    """Every run on disk, oldest last - the answer when there is no index, or none yet.
+
+    Sorting by name is sorting by time, because a run id starts with its timestamp.
+
+    @param runs_root  the ``data/runs`` directory, which may not exist
+    """
     root = Path(runs_root)
     if not root.exists():
         return []

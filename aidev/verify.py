@@ -68,6 +68,7 @@ class FailedTest:
         return self.file or self.name
 
     def to_dict(self) -> Dict[str, Any]:
+        """The whole failure as JSON - message included, since this is what a report renders from."""
         return {"name": self.name, "file": self.file, "line": self.line, "message": self.message}
 
 
@@ -83,9 +84,11 @@ class CommandResult:
 
     @property
     def ok(self) -> bool:
+        """Only exit 0 passes - a command that never ran carries ``None`` and is not a pass."""
         return self.exit_code == 0
 
     def to_dict(self) -> Dict[str, Any]:
+        """The JSON form, deliberately without ``output`` - state.json points at the log instead."""
         return {
             "command": self.command,
             "exit_code": self.exit_code,
@@ -118,12 +121,17 @@ class VerifyResult:
         return counted + len(self.spec_violations)
 
     def first_failing(self) -> Optional[CommandResult]:
+        """The command that stopped the run, in declared order - the one a failure report quotes.
+
+        @flow  commands in order -> first not ok ; none failed -> None
+        """
         for result in self.commands:
             if not result.ok:
                 return result
         return None
 
     def to_dict(self) -> Dict[str, Any]:
+        """What state.json keeps of an attempt: counts in full, failures capped, violations as text."""
         return {
             "ok": self.ok,
             "commands": [result.to_dict() for result in self.commands],
