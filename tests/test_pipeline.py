@@ -2517,6 +2517,33 @@ def test_progress_renders_what_was_done_and_what_is_left():
     assert "aidev pipeline --repo /w/jokertest --resume-slice 20260817-x" in text
 
 
+def test_progress_leaves_out_paths_outside_the_workspace(tmp_path):
+    """A session's own memory file under ~/.claude is not what this stage did."""
+    worktree = tmp_path / "wt"
+    outside = tmp_path / "home" / ".claude" / "projects" / "p" / "memory" / "MEMORY.md"
+    telemetry = {
+        "observed": {
+            "file_accesses": [
+                {"operation": "edit", "path": str(worktree / "aidev" / "verify.py")},
+                {"operation": "edit", "path": str(outside)},
+                {"operation": "write", "path": "aidev/specs.py"},  # relative: the worktree
+            ],
+            "calls": [],
+        }
+    }
+    text = progress.render(
+        slice_id="20260819-x",
+        stage="implement",
+        attempt=1,
+        telemetry=telemetry,
+        roots=[worktree],
+        repo=str(worktree),
+    )
+    assert "MEMORY.md" not in text
+    assert "- edited {0}".format(worktree / "aidev" / "verify.py") in text
+    assert "- edited aidev/specs.py" in text  # relative paths belong to the worktree
+
+
 # --------------------------------------------------------------------- --replan
 #
 # 차분 재계획. Resuming a rejected slice deliberately re-reads the same approval
@@ -3235,6 +3262,68 @@ def test_a_retry_reuses_the_briefing_it_already_paid_for(
 def test_stages_are_real_telemetry_phases():
     assert set(pipeline.STAGES) <= set(PHASES)
     assert set(pipeline.STAGE_POLICY) == set(pipeline.STAGES)
+
+
+def test_changed_files_leaves_out_paths_outside_the_workspace(tmp_path):
+    """Done Criteria: 워크트리 밖 경로는 '이 슬라이스가 바꾼 파일'이 아니다.
+
+    Measured 2026-08-19: ~/.claude/.../MEMORY.md, written by the session itself,
+    was listed twice among the files the slice changed.
+    """
+    worktree = tmp_path / "wt"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "home" / ".claude" / "projects" / "p" / "memory" / "MEMORY.md"
+    run_dir = tmp_path / "data" / "runs" / "20260819-implement"
+    run_dir.mkdir(parents=True)
+    (run_dir / "telemetry.json").write_text(
+        json.dumps(
+            {
+                "observed": {
+                    "file_accesses": [
+                        {"operation": "edit", "path": str(worktree / "aidev" / "verify.py")},
+                        {"operation": "write", "path": str(outside)},
+                        {"operation": "edit", "path": "aidev/pipeline.py"},
+                        {"operation": "read", "path": str(worktree / "aidev" / "cli.py")},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        "slice_id": "20260819-x",
+        "status": "done",
+        "repo": str(repo),
+        "workspace": {"path": str(worktree), "branch": "slice/20260819-x"},
+        "stages": {"implement": {"status": "done"}},
+    }
+    runs = [{"stage": "implement", "run_dir": str(run_dir)}]
+
+    text = pipeline.render_summary(state, runs)
+
+    assert "MEMORY.md" not in text
+    assert "Changed files (2)" in text
+    assert str(worktree / "aidev" / "verify.py") in text
+    assert "aidev/pipeline.py" in text  # relative: recorded against the worktree
+    assert "(+1 outside the workspace, not listed)" in text
+
+
+def test_changed_files_without_a_recorded_workspace_lists_everything(tmp_path):
+    """No boundary to judge by is no reason to drop a path."""
+    run_dir = tmp_path / "data" / "runs" / "20260819-implement"
+    run_dir.mkdir(parents=True)
+    (run_dir / "telemetry.json").write_text(
+        json.dumps(
+            {"observed": {"file_accesses": [{"operation": "edit", "path": "/elsewhere/x.py"}]}}
+        ),
+        encoding="utf-8",
+    )
+    state = {"slice_id": "20260819-x", "status": "done", "stages": {"implement": {}}}
+
+    text = pipeline.render_summary(state, [{"stage": "implement", "run_dir": str(run_dir)}])
+
+    assert "/elsewhere/x.py" in text
+    assert "outside the workspace" not in text
 
 
 @pytest.mark.parametrize(

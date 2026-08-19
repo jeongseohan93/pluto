@@ -68,6 +68,7 @@ from .storage import (
     RunStore,
     default_data_dir,
     make_run_id,
+    path_inside,
     read_json_tolerant,
     recent_repos,
     remember_repo,
@@ -2876,7 +2877,10 @@ def write_progress(
 ) -> Optional[Path]:
     """Write progress.md for a stage that is about to run out, or already has.
 
-    @param cfg        the slice's configuration, for the repo path in the resume line
+    The 'Done' list is limited to the worktree and the repo: a file the session
+    edited in the home directory is not what this stage was doing.
+
+    @param cfg        the slice's configuration, for the repo path and the write scope
     @param rec        the record whose directory the file lands in
     @param stage      the stage being recorded
     @param attempt    which attempt of it
@@ -2906,6 +2910,7 @@ def write_progress(
                 turn=turn,
                 budget=budget,
                 repo=str(cfg.repo),
+                roots=(cfg.cwd, cfg.repo),
             ),
         )
     except OSError as exc:
@@ -3364,6 +3369,8 @@ def run_verify(
     buys a diagnosis, and sends implement back in with both documents. Past the
     repair limit those documents are the deliverable - a human reads them.
 
+    The pass line quotes the count the runner printed, or says it printed none.
+
     @param cfg          the slice's configuration - commands, limits, timeouts
     @param rec          the record failure.md, diagnosis.md and the logs land in
     @param state        state.json, updated in place
@@ -3390,7 +3397,7 @@ def run_verify(
         for command in result.commands:
             say("  {0}  exit {1}".format(command.command, command.exit_code))
         if result.clean:
-            say("verify passed ({0} test(s), no session spent)".format(result.passed))
+            say("verify passed ({0}, no session spent)".format(verify.count_note(result.passed)))
             return None
 
         head = workspace.head_commit(cfg.cwd) or ""
@@ -3879,6 +3886,11 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     v0.6's briefing cost arrives as one line underneath it, and only when there
     was a briefing at all.
 
+    "Changed files" is what this slice changed, so a path outside the worktree
+    and the repo is counted on its own line instead of being listed as the
+    slice's work - measured 2026-08-19, a session's own ``~/.claude`` memory
+    file was showing up there.
+
     @param state  state.json, which names the stages and what they decided
     @param runs   the stored runs, where the tokens and the cost come from
     """
@@ -3938,14 +3950,18 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
         )
     )
 
-    changed = changed_files(runs)
-    if changed:
+    changed, outside = split_by_root(changed_files(runs), slice_roots(state))
+    if changed or outside:
         lines.append("")
         lines.append("Changed files ({0})".format(len(changed)))
         for path in changed[:15]:
             lines.append("  {0}".format(path))
         if len(changed) > 15:
             lines.append("  ... {0} more".format(len(changed) - 15))
+    if outside:
+        # Not listed as this slice's work, but not hidden either: a session that
+        # wrote to the home directory did do that, and the count still says so.
+        lines.append("  (+{0} outside the workspace, not listed)".format(len(outside)))
 
     lines.append("")
     lines.append("Status    {0}".format(state.get("status", "?")))
@@ -4000,6 +4016,10 @@ def _briefing_lines(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> Li
 def _verify_lines(state: Dict[str, Any], note: str, verdict: Any) -> List[str]:
     """The Tests line, plus what the engine actually ran when it was the engine.
 
+    The Verify line carries the count the runner printed. When it printed none
+    it says so: measured 2026-08-19, a green suite of 470 was shown as
+    ``0 passed`` because the missing number defaulted to zero here.
+
     @param state    state.json
     @param note     the marker the verdict earns, e.g. '<- tests failed'
     @param verdict  pass / fail / unknown
@@ -4012,8 +4032,10 @@ def _verify_lines(state: Dict[str, Any], note: str, verdict: Any) -> List[str]:
     last = attempts[-1] if attempts else {}
     for command in last.get("commands") or []:
         lines.append(
-            "Verify    {0}  exit {1}  ({2} passed)".format(
-                command.get("command", "?"), command.get("exit_code"), last.get("passed", 0)
+            "Verify    {0}  exit {1}  ({2})".format(
+                command.get("command", "?"),
+                command.get("exit_code"),
+                verify.count_note(last.get("passed")),
             )
         )
     for violation in (last.get("spec_violations") or [])[:5]:
@@ -4098,6 +4120,47 @@ def _workspace_lines(state: Dict[str, Any]) -> List[str]:
 def _clip(text: str, limit: int) -> str:
     mark = reporter.glyph("ellipsis")
     return text if len(text) <= limit else text[: max(0, limit - len(mark))] + mark
+
+
+def slice_roots(state: Dict[str, Any]) -> List[str]:
+    """Where this slice was allowed to write: its worktree, and the repository itself.
+
+    Both, because a slice without isolation works in the repo directly, and even
+    an isolated one keeps its record under ``.aidev/slices/`` inside the repo.
+
+    @param state  state.json, which remembers the workspace and the repo
+    @flow  workspace.path if recorded -> repo if recorded -> that list
+    주요 내부 변수: roots(수집된 경계)
+    """
+    roots: List[str] = []
+    ws = state.get("workspace")
+    if isinstance(ws, dict) and isinstance(ws.get("path"), str) and ws["path"]:
+        roots.append(ws["path"])
+    repo = state.get("repo")
+    if isinstance(repo, str) and repo:
+        roots.append(repo)
+    return roots
+
+
+def split_by_root(paths: Sequence[str], roots: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Split paths into the ones inside any of the roots and the ones outside them.
+
+    Measured 2026-08-19: a session edited its own memory file under ``~/.claude``
+    and the summary listed it as a file this slice changed. It is not - the
+    slice's work is what landed in the worktree.
+
+    @param paths  the paths to sort, as telemetry recorded them
+    @param roots  the directories that count as inside; empty means everything does
+    @flow  no roots -> everything inside ; else per path: inside any root? inside : outside
+    주요 내부 변수: inside(경계 안), outside(경계 밖)
+    """
+    if not roots:
+        return list(paths), []
+    inside: List[str] = []
+    outside: List[str] = []
+    for path in paths:
+        (inside if any(path_inside(path, root) for root in roots) else outside).append(path)
+    return inside, outside
 
 
 def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:

@@ -557,6 +557,34 @@ def in_repo_scope(
     return False
 
 
+def path_inside(path: Any, root: Any) -> bool:
+    """Is this path ``root`` itself or something under it?
+
+    A relative path was recorded against the session's working directory, which
+    is the root in question, so it is always inside. An absolute one is compared
+    the way ``in_repo_scope`` compares: resolved and normcased, so macOS's
+    ``/var`` and ``/private/var`` are the same place. A root nobody supplied
+    cannot exclude anything - not knowing is not a reason to drop a path.
+
+    @param path  the path in question, absolute or relative
+    @param root  the directory it must be inside
+    @flow  no root -> True ; relative path -> True ; else resolved prefix compare
+    주요 내부 변수: target(비교 가능한 형태의 경로), base(비교 가능한 형태의 root)
+    """
+    base = _normalised(root)
+    if base is None:
+        return True
+    text = str(path or "")
+    if not text:
+        return False
+    if not os.path.isabs(text):
+        return True
+    target = _normalised(text)
+    if target is None:
+        return False
+    return target == base or target.startswith(base + os.sep)
+
+
 def runs_for_repo(
     runs_root: Path, repo: Optional[Path] = None, worktree_root: Optional[Path] = None
 ) -> List[Path]:

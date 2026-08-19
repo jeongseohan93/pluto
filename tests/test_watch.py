@@ -399,6 +399,80 @@ def test_ctrl_c_stops_only_the_watcher(tmp_path, monkeypatch, capsys):
     assert sorted(p.name for p in run_dir.iterdir()) == ["live.json"]
 
 
+def test_watch_follows_the_run_that_starts_after_this_one(tmp_path, monkeypatch, capsys):
+    """A slice is many runs. Watching 'last' must follow the pipeline, not one stage."""
+    data_dir = tmp_path / "data"
+    runs = data_dir / "runs"
+    first = runs / "20260819-100000-a"
+    second = runs / "20260819-100100-b"
+    write_live(first, status="completed", usage_state="final")
+
+    steps = {"n": 0}
+
+    def fake_sleep(_seconds):
+        steps["n"] += 1
+        if steps["n"] == 1:
+            write_live(second, status="running")  # the next stage starts, a beat later
+        else:
+            write_live(second, status="completed", usage_state="final")
+
+    monkeypatch.setattr(cli, "_sleep", fake_sleep)
+    monkeypatch.setattr(cli, "read_telemetry", lambda _d: None)
+
+    assert main(["--data-dir", str(data_dir), "watch"]) == 0
+
+    out = capsys.readouterr().out
+    assert "AI DEV WATCH   20260819-100000-a" in out
+    assert "AI DEV WATCH   20260819-100100-b" in out  # it handed over
+    assert out.rindex("20260819-100100-b") > out.rindex("20260819-100000-a")
+
+
+def test_a_finished_run_with_no_successor_still_ends(tmp_path, monkeypatch, capsys):
+    """The handoff is a few polls, not a new way to hang."""
+    data_dir = tmp_path / "data"
+    write_live(data_dir / "runs" / "20260819-100000-a", status="completed", usage_state="final")
+    slept = []
+    monkeypatch.setattr(cli, "_sleep", lambda seconds: slept.append(seconds) or None)
+    monkeypatch.setattr(cli, "read_telemetry", lambda _d: None)
+
+    assert main(["--data-dir", str(data_dir), "watch"]) == 0
+    assert len(slept) == cli.HANDOFF_POLLS - 1  # bounded, and then it reports
+    assert "run finished (completed)" in capsys.readouterr().out
+
+
+def test_an_explicit_run_id_is_never_handed_over(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    runs = data_dir / "runs"
+    write_live(runs / "20260819-100000-a", status="completed", usage_state="final")
+    write_live(runs / "20260819-100100-b", status="running")
+
+    def never(_seconds):
+        raise AssertionError("the run the user named is the run to watch")
+
+    monkeypatch.setattr(cli, "_sleep", never)
+    monkeypatch.setattr(cli, "read_telemetry", lambda _d: None)
+
+    assert main(["--data-dir", str(data_dir), "watch", "20260819-100000-a"]) == 0
+    assert "20260819-100100-b" not in capsys.readouterr().out
+
+
+def test_next_run_only_offers_a_newer_live_run(tmp_path):
+    runs = tmp_path / "runs"
+    current = runs / "20260819-100000-a"
+    write_live(current, status="running")
+    assert cli.next_run(runs, current) is None  # itself is not its successor
+
+    write_live(runs / "20260818-090000-old", status="running")
+    assert cli.next_run(runs, current) is None  # older, however alive it looks
+
+    write_live(runs / "20260819-110000-c", status="running", updated_at=time.time() - 2 * 24 * 3600)
+    assert cli.next_run(runs, current) is None  # newer, but nobody is updating it
+
+    successor = runs / "20260819-120000-d"
+    write_live(successor, status="running")
+    assert cli.next_run(runs, current) == successor
+
+
 def test_watch_interval_is_clamped(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     run_dir = data_dir / "runs" / "run-1"

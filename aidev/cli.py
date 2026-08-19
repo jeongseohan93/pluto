@@ -39,6 +39,15 @@ from .telemetry import PHASES, Telemetry
 # Indirection so tests can drive the watch loop without real time passing.
 _sleep = time.sleep
 
+# The run ids that mean "whatever is newest", as opposed to a run the user named.
+# Both the target choice and the handoff read this, so they cannot drift apart.
+FOLLOW_LATEST = (None, "", "last", "latest", "-")
+
+# How many polls a finished run is given to be replaced by its successor. Counted
+# in polls rather than seconds because the tests stub out the sleeping; at the
+# clamped interval it is two to three seconds.
+HANDOFF_POLLS = 6
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Every parser in one place, watch's --repo and graph's verbs included. Takes no arguments."""
@@ -327,13 +336,20 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read-only follower. Never computes telemetry, never touches the runner.
 
+    Without a named run it follows the pipeline rather than one run of it: when
+    the run it is on finishes, it waits a moment for the next one and switches
+    to it. Measured 2026-08-19, a watcher started right after a resume attached
+    to the run that had just ended and printed its report a beat before the new
+    run appeared - and every attempt retry ended the watch the same way.
+
     @param args  parsed arguments: run_id, --repo, --interval, --once
-    @flow  pick a target -> frame -> finished? stop : stale? report and stop : poll
-    주요 내부 변수: payload(마지막으로 성공한 live.json), interval(폴링 간격)
+    @flow  pick a target -> frame -> finished/stale? -> named run or --once? report : hand off -> repeat
+    주요 내부 변수: payload(마지막으로 성공한 live.json), follow(최신 run 추종 여부)
     """
     runs_root = _data_dir(args) / "runs"
     repo = getattr(args, "repo", None)
-    run_dir = resolve_watch_target(runs_root, args.run_id, repo.expanduser() if repo else None)
+    repo_path = repo.expanduser() if repo else None
+    run_dir = resolve_watch_target(runs_root, args.run_id, repo_path)
     if run_dir is None:
         where = "{0}{1}".format(
             runs_root, " for repo {0}".format(repo) if repo else ""
@@ -343,37 +359,49 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     interval = min(0.5, max(0.3, args.interval))
     live = reporter.LiveReporter(interval=0.0)
+    # A named run is the one thing the user asked to see; it is never handed over.
+    follow = args.run_id in FOLLOW_LATEST and not args.once
+    worktree_root = workspace.default_worktree_root(repo_path) if repo_path is not None else None
     payload: Optional[Dict[str, Any]] = None
     stalled = False
     try:
         while True:
-            fresh = read_live(run_dir)
-            if fresh is not None:
-                payload = fresh  # a bad read just keeps the previous frame
-            if payload is None:
-                # No live.json at all: an old run, or one that never started.
-                data = read_telemetry(run_dir)
-                if data is not None:
-                    print(reporter.render_final(data))
-                    return 0
-                print("waiting for {0}/live.json ...".format(run_dir))
+            while True:
+                fresh = read_live(run_dir)
+                if fresh is not None:
+                    payload = fresh  # a bad read just keeps the previous frame
+                if payload is None:
+                    # No live.json at all: an old run, or one that never started.
+                    data = read_telemetry(run_dir)
+                    if data is not None:
+                        print(reporter.render_final(data))
+                        return 0
+                    print("waiting for {0}/live.json ...".format(run_dir))
+                    if args.once:
+                        return 0
+                    _sleep(interval)
+                    continue
+
+                live.frame(reporter.render_watch(payload), force=True)
+                if payload.get("status") != "running":
+                    break
+                if is_stale(payload, run_dir):
+                    # Polling a run nobody is updating is an infinite loop, which is
+                    # what this did before 2026-08-18. Say so and stop; the run
+                    # itself is not ours to touch either way.
+                    stalled = True
+                    break
                 if args.once:
                     return 0
                 _sleep(interval)
-                continue
 
-            live.frame(reporter.render_watch(payload), force=True)
-            if payload.get("status") != "running":
+            if not follow:
                 break
-            if is_stale(payload, run_dir):
-                # Polling a run nobody is updating is an infinite loop, which is
-                # what this did before 2026-08-18. Say so and stop; the run
-                # itself is not ours to touch either way.
-                stalled = True
+            successor = await_next_run(runs_root, run_dir, repo_path, worktree_root, interval)
+            if successor is None:
                 break
-            if args.once:
-                return 0
-            _sleep(interval)
+            live.clear()
+            run_dir, payload, stalled = successor, None, False
     except KeyboardInterrupt:
         live.clear()
         print("\nwatch stopped. The run itself is unaffected.", file=sys.stderr)
@@ -406,7 +434,8 @@ def resolve_watch_target(
     ``last`` prefers a run that is *actually* running - measured 2026-08-18, it
     attached to one that had been dead for two days, because a killed runner
     leaves live.json saying ``running``. A stale-running run is therefore the
-    last thing offered, not the first, and never silently.
+    last thing offered, not the first, and never silently. ``FOLLOW_LATEST`` is
+    what "no particular run" means, here and in the handoff that follows one.
 
     @param runs_root  where runs are stored
     @param run_id     an id, a prefix, ``last``, or nothing
@@ -415,7 +444,7 @@ def resolve_watch_target(
     @flow  explicit id -> live running -> newest not-stale-running -> newest in scope
     주요 내부 변수: candidates(스코프 안의 run들), root(worktree 상위 경로)
     """
-    if run_id not in (None, "", "last", "latest", "-"):
+    if run_id not in FOLLOW_LATEST:
         return resolve_run_dir(runs_root, run_id)
     root = workspace.default_worktree_root(repo) if repo is not None else None
     running = find_running_run(runs_root, repo, root, now)
@@ -430,6 +459,64 @@ def resolve_watch_target(
     # Nothing but stale-running runs: still better than "no run to watch", and
     # the loop reports the staleness rather than following it forever.
     return candidates[-1] if candidates else None
+
+
+def next_run(
+    runs_root: Path,
+    run_dir: Path,
+    repo: Optional[Path] = None,
+    worktree_root: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> Optional[Path]:
+    """The run that started after the one being watched and is still alive, or ``None``.
+
+    A run id begins with its timestamp, so comparing names compares times - the
+    same reason ``list_run_dirs`` sorts by name. Staleness is already handled:
+    ``find_running_run`` never offers a run nobody is updating.
+
+    @param runs_root      where runs are stored
+    @param run_dir        the run being watched now
+    @param repo           limit the search to this repository's runs
+    @param worktree_root  where this repo's slice worktrees live, if known
+    @param now            the current time, for tests
+    @flow  newest running -> same run or older? None : that one
+    주요 내부 변수: running(살아 있는 가장 최근 run)
+    """
+    running = find_running_run(runs_root, repo, worktree_root, now)
+    if running is None:
+        return None
+    if running.name <= Path(run_dir).name:
+        return None
+    return running
+
+
+def await_next_run(
+    runs_root: Path,
+    run_dir: Path,
+    repo: Optional[Path],
+    worktree_root: Optional[Path],
+    interval: float,
+) -> Optional[Path]:
+    """Give a finished run a few polls to be replaced by its successor.
+
+    The gap is real: the next stage's run directory does not exist at the moment
+    the previous one writes its last frame. A few polls is the difference between
+    following a whole slice and stopping at its first stage.
+
+    @param runs_root      where runs are stored
+    @param run_dir        the run that just finished
+    @param repo           limit the search to this repository's runs
+    @param worktree_root  where this repo's slice worktrees live, if known
+    @param interval       the poll interval already in use
+    @flow  up to HANDOFF_POLLS times: sleep between -> next_run -> found? return
+    """
+    for poll in range(HANDOFF_POLLS):
+        if poll:
+            _sleep(interval)
+        found = next_run(runs_root, run_dir, repo, worktree_root)
+        if found is not None:
+            return found
+    return None
 
 
 def cmd_list(args: argparse.Namespace) -> int:
