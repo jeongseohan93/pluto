@@ -15,10 +15,21 @@ import {
   PipelineSidebar,
   type PipelineSidebarProps
 } from '@renderer/features/pipeline/PipelineSidebar'
+import { DemoBadge } from '@shared/ui/DemoBadge'
+import { FunctionGraphSidebar } from '@domains/graph-view/ui/FunctionGraphSidebar'
+import type { GraphIndexResult } from '@domains/graph-view/types'
+
+/** Which sidebar views are served from `mock-data`, and so wear the badge. */
+const DEMO_VIEWS: ActivityId[] = ['workspaces', 'graph', 'changes', 'tests', 'telemetry']
 
 export function Sidebar(props: {
   activity: ActivityId
   pipeline: PipelineSidebarProps
+  functions: {
+    index: GraphIndexResult | null
+    selected: number | null
+    onSelect: (id: number) => void
+  }
   workspaces: WorkspaceSummary[]
   activeWorkspaceId: string
   onSelectWorkspace: (id: string) => void
@@ -32,22 +43,35 @@ export function Sidebar(props: {
 }): JSX.Element {
   const titles: Record<ActivityId, string> = {
     pipeline: 'Pipeline',
+    functions: 'Function DB',
     workspaces: 'Workspaces',
     graph: 'Graph scope',
     changes: 'Changes',
     tests: 'Tests',
     telemetry: 'Telemetry'
   }
+  const demo = DEMO_VIEWS.includes(props.activity)
 
   return (
     <aside className="flex h-full min-w-0 flex-col bg-panel">
       <PanelHeader
         title={titles[props.activity]}
-        right={<Icon name="search" size={13} className="text-fg-mute hover:text-fg-dim" />}
+        right={
+          <>
+            {demo ? <DemoBadge /> : null}
+            <Icon name="search" size={13} className="text-fg-mute hover:text-fg-dim" />
+          </>
+        }
       />
       <div className="min-h-0 flex-1 overflow-y-auto">
         {props.activity === 'pipeline' ? (
           <PipelineSidebar {...props.pipeline} />
+        ) : props.activity === 'functions' ? (
+          <FunctionGraphSidebar
+            index={props.functions.index}
+            selected={props.functions.selected}
+            onPick={props.functions.onSelect}
+          />
         ) : props.activity === 'workspaces' ? (
           <WorkspacesView {...props} />
         ) : props.activity === 'graph' ? (

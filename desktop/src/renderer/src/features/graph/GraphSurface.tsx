@@ -1,14 +1,18 @@
 import { useMemo, type JSX } from 'react'
 import type { CodeGraph, GraphFileBox } from '@shared/ide'
 import { EmptyState } from '@renderer/components/primitives'
+import { DemoBadge } from '@shared/ui/DemoBadge'
+import { edgePath } from '@domains/graph-view/layout'
 
 /**
- * v0.0.1 graph placeholder.
+ * v0.0.1 graph placeholder — authored mock data, marked [DEMO] on screen.
  *
  * This draws authored coordinates from the mock — there is no layout engine and
  * no renderer abstraction here on purpose. Its job is to settle the visual
  * language (files contain symbols, edges are labelled relationships, scope is
- * legible at a glance) before v0.0.4 builds the real graph from project data.
+ * legible at a glance). The real thing now lives in the Function graph surface,
+ * which reads `.aidev/graph/graph.db`; the two share `edgePath` so one curve is
+ * one curve.
  */
 const HEADER_H = 26
 const ROW_H = 22
@@ -36,22 +40,6 @@ function anchors(graph: CodeGraph): Map<string, Anchor> {
     })
   }
   return map
-}
-
-function edgePath(from: Anchor, to: Anchor): string {
-  const x1 = from.right
-  const x2 = to.left
-
-  // Calls between symbols of the same file (and any other target that is not to
-  // the right of its source) route around the right-hand side, so the arrow
-  // still lands on the target instead of cutting back across the box.
-  if (x2 <= x1) {
-    const lane = x1 + 16 + Math.abs(to.y - from.y) * 0.22
-    return `M ${x1} ${from.y} C ${lane} ${from.y}, ${lane} ${to.y}, ${to.right} ${to.y}`
-  }
-
-  const dx = Math.max(28, (x2 - x1) * 0.45)
-  return `M ${x1} ${from.y} C ${x1 + dx} ${from.y}, ${x2 - dx} ${to.y}, ${x2} ${to.y}`
 }
 
 export function GraphSurface({
@@ -152,6 +140,7 @@ export function GraphSurface({
         </svg>
       </div>
 
+      <DemoBadge className="absolute top-2 left-2" />
       <Legend />
     </div>
   )

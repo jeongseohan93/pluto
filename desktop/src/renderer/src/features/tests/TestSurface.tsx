@@ -1,7 +1,9 @@
 import type { JSX } from 'react'
 import type { TestCase } from '@shared/ide'
 import { EmptyState } from '@renderer/components/primitives'
+import { DemoBadge } from '@shared/ui/DemoBadge'
 
+/** v0.0.1 mock test results. The real run's output is in the Run panel. */
 export function TestSurface({
   tests,
   selectedSymbolName
@@ -30,6 +32,7 @@ export function TestSurface({
   return (
     <div className="flex h-full flex-col">
       <div className="flex h-7 shrink-0 items-center gap-3 border-b border-line px-3 font-mono text-micro">
+        <DemoBadge />
         <span className="text-ok">{passed} passed</span>
         <span className={failed > 0 ? 'text-bad' : 'text-fg-mute'}>{failed} failed</span>
         <span className="text-fg-mute">{skipped} skipped</span>

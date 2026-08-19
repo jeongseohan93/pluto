@@ -5,6 +5,14 @@
  * `aidev` core is not wired in yet — only the shape of the boundary is.
  */
 
+import type { GraphBridge } from '../domains/graph-view/types'
+import type {
+  PipelineBridge,
+  SliceMerge,
+  SliceQuota,
+  SliceStopped
+} from '../domains/pipeline/types'
+
 export type RunState = 'idle' | 'running' | 'awaiting-approval' | 'passed' | 'failed'
 
 export type ApprovalState = 'not-requested' | 'pending' | 'approved' | 'rejected'
@@ -194,6 +202,12 @@ export interface SliceState {
   testVerdict: string | null
   epic: { epic_id?: string; index?: number } | null
   live: LiveStatus | null
+  /** `state["merge"]`: written only by a real merge or a real conflict. */
+  merge: SliceMerge | null
+  /** `state["quota"]`: the usage-limit wait currently open, if any. */
+  quota: SliceQuota | null
+  /** `state["recovery"]["stopped"]`: which safety pin ended the automation. */
+  stopped: SliceStopped | null
   /** state.json was missing or unusable. The slice is still listed. */
   unreadable: boolean
 }
@@ -257,8 +271,12 @@ export interface ApprovalResult {
 /**
  * The full surface the renderer is allowed to reach. Capability-scoped by
  * design — no `exec`, no arbitrary path reads.
+ *
+ * v0.2.6 composes it from the domains: the pipeline half can run five named
+ * CLI invocations (main builds every argv), and the graph half can only read.
+ * The renderer still cannot name a command line or a path of its own.
  */
-export interface AidevBridge {
+export interface AidevBridge extends PipelineBridge, GraphBridge {
   getProject(): Promise<ProjectInfo>
   getWorkspaces(): Promise<WorkspaceSummary[]>
   getProjectTree(): Promise<FileNode[]>
@@ -297,5 +315,16 @@ export const IPC = {
   openRepo: 'aidev:open-repo-dialog',
   selectRepo: 'aidev:select-repo',
   artifact: 'aidev:get-stage-artifact',
-  approve: 'aidev:write-approval'
+  approve: 'aidev:write-approval',
+
+  // v0.2.6 — the pipeline's own commands, and the Function DB.
+  requirements: 'aidev:get-requirements',
+  runCommand: 'aidev:run-command',
+  stopCommand: 'aidev:stop-command',
+  commandState: 'aidev:get-command-state',
+  /** main -> renderer, the only push channel there is. */
+  commandEvent: 'aidev:command-event',
+  sliceFailure: 'aidev:get-slice-failure',
+  graphIndex: 'aidev:get-graph-index',
+  graphNode: 'aidev:get-graph-node'
 } as const

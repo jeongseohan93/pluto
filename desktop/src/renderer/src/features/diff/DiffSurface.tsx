@@ -1,10 +1,12 @@
 import { useState, type JSX } from 'react'
 import type { ChangeSummary, DiffFile } from '@shared/ide'
 import { EmptyState } from '@renderer/components/primitives'
+import { DemoBadge } from '@shared/ui/DemoBadge'
 
 /**
  * Reviewers read top-down: what changed, what it touches, which files, and only
- * then the lines. A raw `git diff` dump would invert that order.
+ * then the lines. A raw `git diff` dump would invert that order. v0.0.1 mock —
+ * this is not the open repository's diff.
  */
 export function DiffSurface({ changes }: { changes: ChangeSummary | null }): JSX.Element {
   const [openPath, setOpenPath] = useState<string | null>(null)
@@ -24,7 +26,9 @@ export function DiffSurface({ changes }: { changes: ChangeSummary | null }): JSX
   return (
     <div className="h-full overflow-y-auto">
       <section className="border-b border-line px-3 py-2.5">
-        <p className="panel-label mb-2">Change summary</p>
+        <p className="panel-label mb-2 flex items-center gap-2">
+          Change summary <DemoBadge />
+        </p>
         <dl className="flex flex-wrap gap-x-6 gap-y-1">
           <Count value={changes.filesChanged} label="files changed" />
           <Count value={changes.functionsModified} label="functions modified" />

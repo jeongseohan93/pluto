@@ -1,0 +1,112 @@
+{
+  "slice_id": "20260819-ui-baseline-graphview",
+  "status": "running:test",
+  "branch": "slice/20260819-ui-baseline-graphview",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "51f0b3f6cfd536b7365f3fd83b039d275f000ea1",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 67,
+    "test_files": 7,
+    "budget": 160,
+    "warn": false
+  },
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "approval_reason": "desktop 신규 코드는 다음 폴더 구조를 따를 것 — domains/(기능·도메인 단위: pipeline, graph-view 등, 각 도메인 안에 컴포넌트·로직·타입 동거), shared/(공용 UI·유틸·타입), app/(진입점·라우팅·전역 설정). 기존 desktop 파일의 대이동은 금지, 신규분만 이 구조로 배치",
+      "run_id": "20260819-174419-ui-baseline-graphview-plan",
+      "attempts": 1,
+      "commit": "411c3e90fd4bdae7a978b2f1c5a47084315ed1a3"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260819-185247-ui-baseline-graphview-implement-2",
+      "attempts": 2,
+      "commit": "7e46f0fb543d3164adae691901584ef3f228074a"
+    },
+    "test": {
+      "status": "done",
+      "run_id": "20260819-185956-ui-baseline-graphview-test",
+      "verdict": "pass",
+      "attempts": 1
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260819-174419-ui-baseline-graphview-plan",
+      "status": "completed",
+      "turns": 86,
+      "tokens": {
+        "input": 126,
+        "cache_creation": 212269,
+        "cache_read": 7982457,
+        "output": 55751,
+        "billed_input": 8194852,
+        "peak_context": 219235
+      },
+      "cost_usd": 7.508323500000001
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260819-181624-ui-baseline-graphview-implement",
+      "status": "failed",
+      "turns": 161,
+      "tokens": {
+        "input": 320,
+        "cache_creation": 303448,
+        "cache_read": 33581885,
+        "output": 170394,
+        "billed_input": 33885653,
+        "peak_context": 311563
+      },
+      "cost_usd": 24.086872499999995
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260819-185247-ui-baseline-graphview-implement-2",
+      "status": "completed",
+      "turns": 33,
+      "tokens": {
+        "input": 66,
+        "cache_creation": 356363,
+        "cache_read": 11314908,
+        "output": 14219,
+        "billed_input": 11671337,
+        "peak_context": 364478
+      },
+      "cost_usd": 9.576889
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260819-185956-ui-baseline-graphview-test",
+      "status": "completed",
+      "turns": 7,
+      "tokens": {
+        "input": 10,
+        "cache_creation": 28031,
+        "cache_read": 142459,
+        "output": 2323,
+        "billed_input": 170500,
+        "peak_context": 36146
+      },
+      "cost_usd": 0.40966449999999993
+    }
+  ],
+  "updated_at": "2026-08-19T19:04:00+09:00"
+}

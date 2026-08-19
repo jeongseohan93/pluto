@@ -4,7 +4,12 @@ import { relationsOf, type SymbolLocation } from '@renderer/lib/graph-lookup'
 import { EmptyState, KeyValue, PanelHeader, RunStateBadge } from '@renderer/components/primitives'
 import { APPROVAL_TEXT } from '@renderer/lib/labels'
 import { Icon } from '@renderer/components/Icon'
+import { DemoBadge } from '@shared/ui/DemoBadge'
 
+/**
+ * The v0.0.1 inspector, over the mock graph. The Function graph surface has its
+ * own detail panel and reads the real Function DB; this one wears the badge.
+ */
 export function Inspector({
   workspace,
   graph,
@@ -20,7 +25,7 @@ export function Inspector({
 }): JSX.Element {
   return (
     <section className="flex h-full min-w-0 flex-col bg-panel">
-      <PanelHeader title="Inspector" />
+      <PanelHeader title="Inspector" right={<DemoBadge />} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         {location && graph ? (
           <SymbolDetail
