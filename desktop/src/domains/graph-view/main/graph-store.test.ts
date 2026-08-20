@@ -16,7 +16,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { graphPaths, hasSqlite, readGraphIndex, readGraphNode } from './graph-store'
+import { graphPaths, hasSqlite, pathInGraph, readGraphIndex, readGraphNode } from './graph-store'
 
 /** The fixture is written with the same driver the reader reads it with. */
 const nodeRequire = createRequire(join(process.cwd(), 'graph-store.test.cjs'))
@@ -246,6 +246,31 @@ describe('readGraphNode', { skip: !available }, () => {
     assert.equal(readGraphNode(root, -1), null)
     assert.equal(readGraphNode(root, 1.5), null)
     assert.equal(readGraphNode(tempRoot(), 1), null)
+  })
+})
+
+describe('pathInGraph', { skip: !available }, () => {
+  test('a file the graph parsed is one this repository knows', () => {
+    const root = repoWithGraph()
+    assert.equal(pathInGraph(root, 'aidev/pipeline.py'), true)
+    assert.equal(pathInGraph(root, 'tests/test_x.py'), true)
+  })
+
+  test('a file that failed to parse is still in the repository', () => {
+    // `files` holds it with parsed = 0. It draws no box, but a reader who got
+    // to its name some other way is still asking about a real file.
+    assert.equal(pathInGraph(repoWithGraph(), 'aidev/broken.py'), true)
+  })
+
+  test('a path this graph never saw is refused', () => {
+    const root = repoWithGraph()
+    assert.equal(pathInGraph(root, 'aidev/nowhere.py'), false)
+    assert.equal(pathInGraph(root, '../../etc/passwd'), false)
+    assert.equal(pathInGraph(root, ''), false)
+  })
+
+  test('no graph at all answers no, rather than throwing', () => {
+    assert.equal(pathInGraph(tempRoot(), 'aidev/pipeline.py'), false)
   })
 })
 

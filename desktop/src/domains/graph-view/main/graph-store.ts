@@ -310,6 +310,40 @@ export function readGraphNode(repoRoot: string, id: number): GraphNodeDetail | n
   }
 }
 
+/**
+ * Does this graph know this file — the second check on a path from the screen.
+ *
+ * `register-handlers.ts` asks the same kind of question of a requirement before
+ * it will start a pipeline: being well-formed is not being *ours*. A path that
+ * no box on the canvas came from is a path the renderer had no way to learn,
+ * and so not one this app will read off the disk.
+ *
+ * @param repoRoot  the repository or worktree the app has open
+ * @param path      the relative path the renderer sent, spelled as the DB does
+ * @flow  no path, no db, or no driver -> false ; a `files` row -> true ; else a
+ *        `functions` row, because a half-written update can lose the file row
+ *        while keeping the functions it held ids for (see `readGraphIndex`)
+ */
+export function pathInGraph(repoRoot: string, path: string): boolean {
+  if (typeof path !== 'string' || path === '') return false
+  const paths = graphPaths(repoRoot)
+  if (!existsSync(paths.db)) return false
+
+  const opened = openReadonly(paths.db)
+  if (!opened.db) return false
+
+  try {
+    if (opened.db.prepare('SELECT 1 FROM files WHERE path = ? LIMIT 1').all(path).length > 0) {
+      return true
+    }
+    return opened.db.prepare('SELECT 1 FROM functions WHERE path = ? LIMIT 1').all(path).length > 0
+  } catch {
+    return false
+  } finally {
+    closeQuietly(opened.db)
+  }
+}
+
 // ------------------------------------------------------------------- driver
 
 /**

@@ -5,6 +5,7 @@
  * `aidev` core is not wired in yet — only the shape of the boundary is.
  */
 
+import type { CodeViewBridge } from '../domains/code-view/types'
 import type { GraphBridge } from '../domains/graph-view/types'
 import type {
   PipelineBridge,
@@ -275,8 +276,12 @@ export interface ApprovalResult {
  * v0.2.6 composes it from the domains: the pipeline half can run five named
  * CLI invocations (main builds every argv), and the graph half can only read.
  * The renderer still cannot name a command line or a path of its own.
+ *
+ * v0.2.7 adds the code half, which is the one place the renderer does name a
+ * path — and the only one it can, because main answers nothing that this
+ * repository's graph did not already put on the screen.
  */
-export interface AidevBridge extends PipelineBridge, GraphBridge {
+export interface AidevBridge extends PipelineBridge, GraphBridge, CodeViewBridge {
   getProject(): Promise<ProjectInfo>
   getWorkspaces(): Promise<WorkspaceSummary[]>
   getProjectTree(): Promise<FileNode[]>
@@ -326,5 +331,9 @@ export const IPC = {
   commandEvent: 'aidev:command-event',
   sliceFailure: 'aidev:get-slice-failure',
   graphIndex: 'aidev:get-graph-index',
-  graphNode: 'aidev:get-graph-node'
+  graphNode: 'aidev:get-graph-node',
+
+  /** v0.2.7 — one text file out of the open repository, and only one the
+   *  graph already knows about. */
+  sourceFile: 'aidev:get-source-file'
 } as const

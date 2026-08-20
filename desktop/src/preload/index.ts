@@ -54,7 +54,14 @@ const aidev: AidevBridge = {
 
   // -- v0.2.6 the Function DB, read-only
   getGraphIndex: () => ipcRenderer.invoke(IPC.graphIndex),
-  getGraphNode: (id) => ipcRenderer.invoke(IPC.graphNode, id)
+  getGraphNode: (id) => ipcRenderer.invoke(IPC.graphNode, id),
+
+  // -- v0.2.7 one source file, read-only.
+  // This is not the `readFile(anyPath)` line 10 rules out. Main resolves the
+  // path inside the repository it has open, refuses anything the graph does not
+  // already know, and refuses anything past an extension list and a size
+  // ceiling. The renderer can name a path it was shown; it cannot widen that.
+  getSourceFile: (path) => ipcRenderer.invoke(IPC.sourceFile, path)
 }
 
 contextBridge.exposeInMainWorld('aidev', aidev)
