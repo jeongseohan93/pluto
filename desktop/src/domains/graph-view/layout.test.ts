@@ -9,11 +9,14 @@
  */
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import {
   BOX_W,
   COLUMN_H,
   DRAG_SLOP,
+  EDGE_STYLES,
   EDGE_W_MAX,
   EDGE_W_MIN,
   FILE_BOX_H,
@@ -39,6 +42,7 @@ import {
   centerScroll,
   clampOffset,
   edgePath,
+  edgeStyle,
   edgeWidth,
   fileLines,
   fitChars,
@@ -47,6 +51,7 @@ import {
   isDrag,
   layoutGraph,
   lodFor,
+  markColour,
   matchFunctions,
   mergeMarks,
   minimapFit,
@@ -1144,5 +1149,59 @@ describe('fileLines with dragged boxes', () => {
       after.lines.map((line) => line.d),
       before.lines.map((line) => line.d)
     )
+  })
+})
+
+// out-test/domains/graph-view -> desktop/, then into the renderer's styles.
+// Tied to tsconfig.test.json's rootDir/outDir on purpose: if those move, this
+// fails loudly rather than silently stopping checking anything.
+const THEME = readFileSync(resolve(__dirname, '../../../src/renderer/src/styles/theme.css'), 'utf8')
+
+/**
+ * Is this `var(--color-…)` token actually declared in the theme?
+ *
+ * @param token  the exact string the layout hands to a `stroke` or a `fill`
+ */
+function defined(token: string): boolean {
+  const name = token.slice('var('.length, -1)
+  return THEME.includes(name + ':')
+}
+
+describe('edge style, one table for the edges, the row marks and the legend', () => {
+  test('an outgoing edge is drawn as calls, an incoming one as callers', () => {
+    assert.equal(edgeStyle(false), EDGE_STYLES.calls)
+    assert.equal(edgeStyle(true), EDGE_STYLES.callers)
+  })
+
+  test('the two kinds differ by more than colour', () => {
+    assert.notEqual(EDGE_STYLES.calls.stroke, EDGE_STYLES.callers.stroke)
+    assert.equal(EDGE_STYLES.calls.dash, null)
+    assert.ok(EDGE_STYLES.callers.dash)
+  })
+
+  test('each kind names its own arrowhead', () => {
+    assert.notEqual(EDGE_STYLES.calls.marker, EDGE_STYLES.callers.marker)
+    assert.ok(EDGE_STYLES.calls.marker.length > 0)
+    assert.ok(EDGE_STYLES.callers.marker.length > 0)
+  })
+
+  test('a row mark is painted the colour of the edge it stands for', () => {
+    assert.equal(markColour('calls'), EDGE_STYLES.calls.stroke)
+    assert.equal(markColour('selected'), EDGE_STYLES.calls.stroke)
+    assert.equal(markColour('callers'), EDGE_STYLES.callers.stroke)
+  })
+
+  test('the marks that stand for no edge are still neutral', () => {
+    assert.equal(markColour('hover'), 'var(--color-fg-dim)')
+    assert.equal(markColour('near'), 'var(--color-fg-mute)')
+  })
+
+  test('every colour the graph asks for exists in the theme', () => {
+    const marks: RowMark[] = ['selected', 'calls', 'callers', 'both', 'hover', 'near']
+    assert.ok(defined(EDGE_STYLES.calls.stroke))
+    assert.ok(defined(EDGE_STYLES.callers.stroke))
+    for (const mark of marks) {
+      assert.ok(defined(markColour(mark)), mark + ' asks for a token theme.css does not define')
+    }
   })
 })

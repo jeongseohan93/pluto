@@ -19,6 +19,7 @@ import type {
   GraphNodeDetail
 } from '@domains/graph-view/types'
 import {
+  EDGE_STYLES,
   FILE_BOX_H,
   FILE_LABEL_PX,
   FILE_META_PX,
@@ -36,6 +37,7 @@ import {
   centerScroll,
   clampOffset,
   edgePath,
+  edgeStyle,
   fileLines,
   fitChars,
   flattenFunctions,
@@ -43,6 +45,7 @@ import {
   isDrag,
   layoutGraph,
   lodFor,
+  markColour,
   matchFunctions,
   mergeMarks,
   nearestBoxPath,
@@ -891,8 +894,16 @@ export function FunctionGraphSurface({
               onPointerDownCapture={clearDragFlag}
             >
               <defs>
+                {/* One arrowhead per edge kind, each painted with that kind's
+                    own token. These markers used `context-stroke`, which is a
+                    Firefox extension that Chromium does not implement — and
+                    marker content inherits from `<defs>`, not from the path
+                    that references it, so the arrowheads were resolving to
+                    `stroke: none` and never painted at all. The direction the
+                    legend promises has to be drawn in a colour this renderer
+                    actually has. */}
                 <marker
-                  id="fn-arrow"
+                  id="fn-arrow-calls"
                   viewBox="0 0 8 8"
                   refX="7"
                   refY="4"
@@ -900,7 +911,28 @@ export function FunctionGraphSurface({
                   markerHeight="7"
                   orient="auto-start-reverse"
                 >
-                  <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
+                  <path
+                    d="M1 1 L7 4 L1 7"
+                    fill="none"
+                    stroke={EDGE_STYLES.calls.stroke}
+                    strokeWidth="1.2"
+                  />
+                </marker>
+                <marker
+                  id="fn-arrow-callers"
+                  viewBox="0 0 8 8"
+                  refX="7"
+                  refY="4"
+                  markerWidth="7"
+                  markerHeight="7"
+                  orient="auto-start-reverse"
+                >
+                  <path
+                    d="M1 1 L7 4 L1 7"
+                    fill="none"
+                    stroke={EDGE_STYLES.callers.stroke}
+                    strokeWidth="1.2"
+                  />
                 </marker>
                 {/* File links run from 0.5px to 4px wide. In the default marker
                     units the arrowhead scales with the line and the heavy links
@@ -939,18 +971,21 @@ export function FunctionGraphSurface({
               {/* LOD, level two: function edges exist only around a selection,
                   and only where this zoom draws function rows at all. */}
               <g>
-                {edges.map((edge) => (
-                  <path
-                    key={edge.key}
-                    d={edge.d}
-                    fill="none"
-                    stroke={edge.incoming ? 'var(--color-ok)' : 'var(--color-accent)'}
-                    strokeWidth={1.4}
-                    strokeDasharray={edge.incoming ? '3 3' : undefined}
-                    strokeOpacity={edge.faint ? 0.55 : 1}
-                    markerEnd="url(#fn-arrow)"
-                  />
-                ))}
+                {edges.map((edge) => {
+                  const style = edgeStyle(edge.incoming)
+                  return (
+                    <path
+                      key={edge.key}
+                      d={edge.d}
+                      fill="none"
+                      stroke={style.stroke}
+                      strokeWidth={1.4}
+                      strokeDasharray={style.dash ?? undefined}
+                      strokeOpacity={edge.faint ? 0.55 : 1}
+                      markerEnd={`url(#${style.marker})`}
+                    />
+                  )
+                })}
               </g>
 
               {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
@@ -1365,8 +1400,14 @@ const FileBox = memo(function FileBox({
             />
             {mark === 'both' ? (
               <>
-                <rect x={1} y={0} width={2} height={ROW_H / 2} fill="var(--color-accent)" />
-                <rect x={1} y={ROW_H / 2} width={2} height={ROW_H / 2} fill="var(--color-ok)" />
+                <rect x={1} y={0} width={2} height={ROW_H / 2} fill={EDGE_STYLES.calls.stroke} />
+                <rect
+                  x={1}
+                  y={ROW_H / 2}
+                  width={2}
+                  height={ROW_H / 2}
+                  fill={EDGE_STYLES.callers.stroke}
+                />
               </>
             ) : mark ? (
               <rect x={1} y={0} width={2} height={ROW_H} fill={markColour(mark)} />
@@ -1415,19 +1456,6 @@ const FileBox = memo(function FileBox({
     </g>
   )
 })
-
-/**
- * The colour one mark is drawn in — the same two the edges use.
- *
- * @param mark  what this row is to whatever the pointer is on
- * @flow  outgoing reads accent, incoming reads ok, the rest are neutral
- */
-function markColour(mark: RowMark): string {
-  if (mark === 'selected' || mark === 'calls') return 'var(--color-accent)'
-  if (mark === 'callers') return 'var(--color-ok)'
-  if (mark === 'hover') return 'var(--color-fg-dim)'
-  return 'var(--color-fg-mute)'
-}
 
 interface DrawnEdge {
   key: string
@@ -1569,7 +1597,7 @@ function Legend({
     <div className="pointer-events-none absolute bottom-2 left-2 inline-flex items-center gap-3 rounded-sm border border-line bg-panel/90 px-2 py-1 text-micro text-fg-mute">
       <span className="flex items-center gap-1.5">
         <svg width="18" height="6" aria-hidden="true">
-          <line x1="0" y1="3" x2="18" y2="3" stroke="var(--color-accent)" strokeWidth="1.4" />
+          <line x1="0" y1="3" x2="18" y2="3" stroke={EDGE_STYLES.calls.stroke} strokeWidth="1.4" />
         </svg>
         calls
       </span>
@@ -1580,9 +1608,9 @@ function Legend({
             y1="3"
             x2="18"
             y2="3"
-            stroke="var(--color-ok)"
+            stroke={EDGE_STYLES.callers.stroke}
             strokeWidth="1.4"
-            strokeDasharray="3 3"
+            strokeDasharray={EDGE_STYLES.callers.dash ?? undefined}
           />
         </svg>
         called by

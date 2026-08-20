@@ -978,6 +978,66 @@ export function groupMarks(
   return out
 }
 
+// -------------------------------------------------------------- edge style
+//
+// One table, three readers: the drawn edge, the row's 2px mark, and the legend.
+// Three copies of one mapping is how a legend comes to disagree with the screen,
+// which is the regression this section exists to make impossible. The values are
+// theme tokens and never literals, and `layout.test.ts` holds every one of them
+// against theme.css — a renamed token fails a test instead of quietly painting
+// an uncoloured line.
+
+/** Which way an edge points, seen from the selection. */
+export type EdgeKind = 'calls' | 'callers'
+
+/** How one kind of edge is drawn: line, dash and arrowhead as one fact. */
+export interface EdgeStyle {
+  /** A `var(--color-…)` token — never a literal colour. */
+  stroke: string
+  /** `stroke-dasharray`, or null for a solid line. */
+  dash: string | null
+  /** The `<marker>` id this kind's arrowhead is drawn by. */
+  marker: string
+}
+
+/**
+ * calls = accent(파랑) 실선, callers = ok(초록) 파선. 색이 유일한 차이가 되지
+ * 않도록 파선을 함께 남긴다 — graph-visual의 결정 그대로.
+ */
+export const EDGE_STYLES: Readonly<Record<EdgeKind, EdgeStyle>> = {
+  calls: { stroke: 'var(--color-accent)', dash: null, marker: 'fn-arrow-calls' },
+  callers: { stroke: 'var(--color-ok)', dash: '3 3', marker: 'fn-arrow-callers' }
+}
+
+/**
+ * How one edge of the selection's neighbourhood is drawn.
+ *
+ * @param incoming  is this someone calling the selection, rather than the
+ *                  selection calling out?
+ * @flow  incoming reads the callers row of the table, outgoing the calls row
+ */
+export function edgeStyle(incoming: boolean): EdgeStyle {
+  return incoming ? EDGE_STYLES.callers : EDGE_STYLES.calls
+}
+
+/**
+ * The colour one row mark is drawn in — the same two the edges use.
+ *
+ * Lives here rather than beside the rows it paints so the mapping has one home,
+ * and so a test can hold it against `EDGE_STYLES` without a browser
+ * (`tsconfig.test.json` excludes `ui/`).
+ *
+ * @param mark  what this row is to whatever the pointer is on
+ * @flow  outgoing and the selection itself read accent, incoming reads ok, the
+ *        rest are neutral
+ */
+export function markColour(mark: RowMark): string {
+  if (mark === 'selected' || mark === 'calls') return EDGE_STYLES.calls.stroke
+  if (mark === 'callers') return EDGE_STYLES.callers.stroke
+  if (mark === 'hover') return 'var(--color-fg-dim)'
+  return 'var(--color-fg-mute)'
+}
+
 /**
  * Functions whose name or qualname contains the query, best match first.
  *
