@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,47 +11,66 @@ import {
   type PointerEvent as ReactPointerEvent
 } from 'react'
 import type {
+  GraphEdge,
   GraphFileEdge,
+  GraphFileGroup,
   GraphFunction,
   GraphIndexResult,
   GraphNodeDetail
 } from '@domains/graph-view/types'
 import {
-  BOX_W,
+  FILE_BOX_H,
+  FILE_LABEL_PX,
+  FILE_META_PX,
   HEADER_H,
+  KEY_FN_PER_FILE,
   MAX_FILE_EDGES,
   NO_OFFSETS,
   ROW_H,
+  ZOOM_DETAIL,
+  boxCenter,
   buildAdjacency,
+  callerCounts,
   canvasSize,
+  centerScroll,
   clampOffset,
   edgePath,
   fileLines,
+  fitChars,
   flattenFunctions,
   groupMarks,
   isDrag,
   layoutGraph,
+  lodFor,
   matchFunctions,
   mergeMarks,
+  nearestBoxPath,
   neighbourMarks,
   offsetOf,
   offsetsByBox,
-  shiftAnchor,
+  resolveAnchor,
+  viewportOf,
   withOffset,
-  type Anchor,
   type FileLine,
   type GraphBox,
+  type GraphLayout,
+  type Lod,
   type Offset,
   type Offsets,
   type RowMark
 } from '@domains/graph-view/layout'
 import { FunctionDetail } from '@domains/graph-view/ui/FunctionDetail'
+import { Minimap } from '@domains/graph-view/ui/Minimap'
 import { Icon } from '@renderer/components/Icon'
 import { EmptyState } from '@renderer/components/primitives'
 
 /** A stable empty map, so a box with nothing marked keeps identical props. */
 const NO_MARKS: Map<number, RowMark> = new Map()
 const NO_FILE_EDGES: GraphFileEdge[] = []
+/** No index, or an index that could not be read. Shared, so `[files]` is a
+ *  dependency that means "a different graph" and not "another render". */
+const NO_FILES: GraphFileGroup[] = []
+const NO_EDGES: GraphEdge[] = []
 /** How much of the whole view survives behind a selection: context, not lines. */
 const AGGREGATE_DIM = 0.18
 /** How far an unrelated box recedes while something else is in focus. */
@@ -66,9 +86,6 @@ interface Hover {
 }
 
 const NO_HOVER: Hover = { fn: null, path: null }
-
-/** A box with no offset of its own, for the anchors of boxes nobody moved. */
-const NO_OFFSET: Offset = { dx: 0, dy: 0 }
 
 /** A drag in progress: the box, the pointer that owns it, and where it began. */
 interface Dragging {
@@ -95,6 +112,13 @@ interface Dragging {
  * arithmetic (files in path order, packed into columns) instead of a physics
  * simulation, which is why this slice adds no rendering dependency at all.
  *
+ * **The zoom is a scale bar, not a magnifier.** Far out, only file boxes are
+ * placed — name, function count, spec coverage — and the canvas shrinks with
+ * them, from 6808 units wide to 2044. In between, each file keeps its
+ * most-called rows. Close in, everything is drawn, exactly as before. The level
+ * is an argument to `layoutGraph` rather than a condition inside a component,
+ * so moving the zoom inside one band recomputes nothing at all.
+ *
  * **Selection draws, hover only lights up.** A selection is what makes edges
  * appear and dims everything unrelated; hovering merely brightens a row and its
  * direct neighbours. So a pointer crossing 1435 rows never makes a single path
@@ -117,11 +141,14 @@ interface Dragging {
  * @param onBuild    run `aidev graph build`
  * @param busy       a command is already running (one slot)
  * @param zoom       the surface's zoom factor
+ * @param onZoomChange  change the scale — how a jump to one function brings the
+ *                      level of detail it needs along with it
  * @flow  no index -> a reading state ; index not ok -> the reason and a way out
  *        -> otherwise the canvas, plus the detail panel for the selection,
  *        which folds away and comes back by itself when a row is picked
  * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
- * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그)
+ * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그),
+ * lod(이 줌이 그리는 레벨)
  */
 export function FunctionGraphSurface({
   index,
@@ -130,7 +157,8 @@ export function FunctionGraphSurface({
   onSelect,
   onBuild,
   busy,
-  zoom
+  zoom,
+  onZoomChange
 }: {
   index: GraphIndexResult | null
   loading: boolean
@@ -139,6 +167,7 @@ export function FunctionGraphSurface({
   onBuild: () => void
   busy: boolean
   zoom: number
+  onZoomChange?: (zoom: number) => void
 }): JSX.Element {
   const [detail, setDetail] = useState<GraphNodeDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -146,6 +175,7 @@ export function FunctionGraphSurface({
   const [hover, setHover] = useState<Hover>(NO_HOVER)
   const [offsets, setOffsets] = useState<Offsets>(NO_OFFSETS)
   const [detailOpen, setDetailOpen] = useState(true)
+  const [mapOpen, setMapOpen] = useState(true)
   const canvas = useRef<HTMLDivElement>(null)
 
   // The drag itself is a ref, not state: a pointer move already re-renders
@@ -156,10 +186,24 @@ export function FunctionGraphSurface({
   const offsetsRef = useRef(offsets)
   offsetsRef.current = offsets
 
-  const files = index?.ok ? index.files : []
-  const layout = useMemo(() => layoutGraph(files), [files])
+  /** The last selection this surface already answered by moving the scale. */
+  const jumped = useRef<number | null>(null)
+  /** The zoom and placement the current scroll position was measured against. */
+  const view = useRef<{ zoom: number; layout: GraphLayout } | null>(null)
+  /** A file to land on at the next placement — the far view's way in. */
+  const pendingPath = useRef<string | null>(null)
+
+  const files = index?.ok ? index.files : NO_FILES
+  // A string, so every zoom inside one band is the same dependency and the
+  // placement below is not rebuilt for a change that would not alter it.
+  const lod = useMemo(() => lodFor(zoom), [zoom])
+  const counts = useMemo(() => callerCounts(index?.ok ? index.edges : NO_EDGES), [index])
+  const layout = useMemo(() => layoutGraph(files, lod, counts), [files, lod, counts])
   const functions = useMemo(() => flattenFunctions(files), [files])
+  // Search reads the whole index, never the drawn rows: a function you cannot
+  // see at this zoom is still a function you can look for.
   const results = useMemo(() => matchFunctions(functions, query), [functions, query])
+  const byId = useMemo(() => new Map(functions.map((fn) => [fn.id, fn])), [functions])
 
   // Everything the drag moves, and nothing it does not: `layout` above does not
   // depend on `offsets`, so the marks and the boxes are left alone by a drag.
@@ -173,7 +217,21 @@ export function FunctionGraphSurface({
   )
   // Folded once from the index, not queried per hover: at 1435 rows, one round
   // trip per row the pointer crosses is exactly the lag being avoided here.
-  const adjacency = useMemo(() => buildAdjacency(index?.ok ? index.edges : []), [index])
+  const adjacency = useMemo(() => buildAdjacency(index?.ok ? index.edges : NO_EDGES), [index])
+
+  // Read inside effects that must not *re-run* when these change. `zoom` and
+  // `size` move with the level; the scroll should follow the selection, not
+  // chase every rung of the ladder.
+  const zoomRef = useRef(zoom)
+  zoomRef.current = zoom
+  const sizeRef = useRef(size)
+  sizeRef.current = size
+  const layoutRef = useRef(layout)
+  layoutRef.current = layout
+  const byIdRef = useRef(byId)
+  byIdRef.current = byId
+  const byBoxRef = useRef(byBox)
+  byBoxRef.current = byBox
 
   // The node's own record, which is also where its edges come from.
   useEffect(() => {
@@ -199,30 +257,82 @@ export function FunctionGraphSurface({
     if (selected !== null) setDetailOpen(true)
   }, [selected])
 
-  // Dragged positions are of *this* layout and no other. A rebuild or a reload
-  // makes a new one, and the boxes are back where everybody else sees them —
+  // Dragged positions are of *this graph* and no other. A rebuild or a reload
+  // makes new files, and the boxes are back where everybody else sees them —
   // which is how "not saved anywhere" is kept true without any code to save.
+  // Keyed on the files rather than the layout, or a single zoom step would
+  // throw away an arrangement the reader built by hand.
   useEffect(() => {
     setOffsets((prev) => (prev.size === 0 ? prev : NO_OFFSETS))
-  }, [layout])
+  }, [files])
+
+  // A selection that this level does not draw is a selection nobody can see, so
+  // picking one brings the scale along with it. Only a *new* selection does
+  // this: otherwise deliberately zooming out with a row picked would spring
+  // straight back in.
+  useEffect(() => {
+    if (selected === null) {
+      jumped.current = null
+      return
+    }
+    if (jumped.current === selected) return
+    jumped.current = selected
+    if (!layoutRef.current.anchors.has(selected)) onZoomChange?.(ZOOM_DETAIL)
+  }, [selected, onZoomChange])
+
+  // Keep looking at what you were looking at. `scrollLeft` is client pixels, so
+  // it points somewhere else entirely once the zoom moves, and a level change
+  // moves every box besides. The one thing that survives both is a file's path,
+  // so the box nearest the middle of the old view is put back in the middle of
+  // the new one. Before paint, or the canvas visibly jumps first and corrects.
+  useLayoutEffect(() => {
+    const node = canvas.current
+    const was = view.current
+    view.current = { zoom, layout }
+    if (!node || !was || (was.zoom === zoom && was.layout === layout)) return
+
+    const want = pendingPath.current
+    pendingPath.current = null
+    const port = viewportOf(
+      {
+        left: node.scrollLeft,
+        top: node.scrollTop,
+        width: node.clientWidth,
+        height: node.clientHeight
+      },
+      was.zoom
+    )
+    const path =
+      want ?? nearestBoxPath(was.layout, { x: port.x + port.w / 2, y: port.y + port.h / 2 })
+    const at = path === null ? undefined : layout.boxOf.get(path)
+    if (at === undefined) return
+    const to = centerScroll(
+      boxCenter(layout.boxes[at], offsetOf(offsetsRef.current, layout.boxes[at].path)),
+      zoom,
+      { width: node.clientWidth, height: node.clientHeight },
+      sizeRef.current
+    )
+    node.scrollTo({ left: to.left, top: to.top })
+  }, [zoom, layout])
 
   // Bring the selection into view wherever it came from — a click, a search
-  // hit, a caller in the panel, or the file list on the left. The offsets are
-  // read from the ref: a drag must not re-run this and yank the scroll.
+  // hit, a caller in the panel, or the file list on the left. A row this level
+  // does not draw lands on its file's box instead of silently doing nothing,
+  // which is what used to make a search hit at the wrong zoom go nowhere. Being
+  // a plain effect, this runs after the one above and so wins the scroll.
   useEffect(() => {
-    const box = canvas.current
-    const anchor = selected === null ? undefined : layout.anchors.get(selected)
-    if (!box || !anchor) return
-    const at = shiftAnchor(
-      anchor,
-      offsetOf(offsetsRef.current, layout.boxes[anchor.boxIndex]?.path ?? '')
+    const node = canvas.current
+    if (!node || selected === null) return
+    const at = resolveAnchor(layout, byIdRef.current, byBoxRef.current, selected)
+    if (!at) return
+    const to = centerScroll(
+      { x: (at.left + at.right) / 2, y: at.y },
+      zoomRef.current,
+      { width: node.clientWidth, height: node.clientHeight },
+      sizeRef.current
     )
-    box.scrollTo({
-      left: Math.max(0, at.left * zoom - box.clientWidth / 2 + (BOX_W * zoom) / 2),
-      top: Math.max(0, at.y * zoom - box.clientHeight / 2),
-      behavior: 'smooth'
-    })
-  }, [selected, layout, zoom])
+    node.scrollTo({ left: to.left, top: to.top, behavior: 'smooth' })
+  }, [selected, layout])
 
   // Escape is the third way back to the whole view. The search box keeps its
   // own Escape — clearing what you typed comes before clearing the selection.
@@ -237,7 +347,10 @@ export function FunctionGraphSurface({
     return () => window.removeEventListener('keydown', onKey)
   }, [onSelect])
 
-  const edges = useMemo(() => edgesFor(detail, layout.anchors, byBox), [detail, layout, byBox])
+  const edges = useMemo(
+    () => edgesFor(detail, layout, byId, byBox, lod),
+    [detail, layout, byId, byBox, lod]
+  )
 
   // What the selection marks: itself, what it calls, what calls it. Read off
   // the drawn edges rather than the adjacency, so an unresolved call site is
@@ -273,10 +386,18 @@ export function FunctionGraphSurface({
     const set = new Set<number>()
     for (const id of focusMarks.keys()) {
       const anchor = layout.anchors.get(id)
-      if (anchor) set.add(anchor.boxIndex)
+      if (anchor) {
+        set.add(anchor.boxIndex)
+        continue
+      }
+      // No row for it at this level: its file stays lit anyway, so a selection
+      // made close in is still visible as a box after zooming out.
+      const path = byId.get(id)?.path
+      const at = path === undefined ? undefined : layout.boxOf.get(path)
+      if (at !== undefined) set.add(at)
     }
     return set
-  }, [focusMarks, layout])
+  }, [focusMarks, layout, byId])
 
   // Which boxes the hovered file links to. Read from the full edge list rather
   // than the drawn one: a link the cap left out is still a link.
@@ -296,6 +417,12 @@ export function FunctionGraphSurface({
 
   const focus = selected !== null
   const selectedBox = selected === null ? -1 : (layout.anchors.get(selected)?.boxIndex ?? -1)
+
+  // The far view's labels are sized in client pixels rather than user units, or
+  // an 11px name would be 5.5px at 50% and the file boxes would be unreadable
+  // rectangles. Only the file level reads this, so at every other level
+  // `FileBox`'s props stay independent of the zoom and its memo holds.
+  const labelScale = lod === 'file' ? 1 / Math.max(zoom, 0.1) : 1
 
   // A ref rather than a dependency: the row callback has to stay referentially
   // identical across selections, or every box re-renders and `memo` buys
@@ -319,6 +446,28 @@ export function FunctionGraphSurface({
     },
     [onSelect]
   )
+
+  /**
+   * The far view's way in: a file box is clicked, and the level that shows its
+   * functions arrives with that file in the middle of it.
+   *
+   * @param path  the file whose box was clicked
+   */
+  const pickFile = useCallback(
+    (path: string): void => {
+      // Without a way to change the scale there is nowhere to go, and a
+      // remembered path would then hijack whatever moved the level next.
+      if (dragged.current || !onZoomChange) return
+      pendingPath.current = path
+      onZoomChange(ZOOM_DETAIL)
+    },
+    [onZoomChange]
+  )
+
+  /** Fold the minimap away, or bring it back. Takes no arguments. */
+  const toggleMap = useCallback((): void => {
+    setMapOpen((prev) => !prev)
+  }, [])
 
   /** A new pointer sequence has begun: whatever the last one was, it is over. */
   const clearDragFlag = useCallback((): void => {
@@ -484,105 +633,130 @@ export function FunctionGraphSurface({
       />
 
       <div className="flex min-h-0 flex-1">
-        <div ref={canvas} className="relative min-w-0 flex-1 overflow-auto bg-app">
-          <svg
-            width={size.width * zoom}
-            height={size.height * zoom}
-            viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
-            className="block select-none"
-            onPointerDownCapture={clearDragFlag}
-          >
-            <defs>
-              <marker
-                id="fn-arrow"
-                viewBox="0 0 8 8"
-                refX="7"
-                refY="4"
-                markerWidth="7"
-                markerHeight="7"
-                orient="auto-start-reverse"
-              >
-                <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
-              </marker>
-              {/* File links run from 0.5px to 4px wide. In the default marker
-                  units the arrowhead scales with the line and the heavy links
-                  end in a blot, so this one is measured in user space. */}
-              <marker
-                id="fn-arrow-flat"
-                viewBox="0 0 8 8"
-                refX="7"
-                refY="4"
-                markerWidth="8"
-                markerHeight="8"
-                markerUnits="userSpaceOnUse"
-                orient="auto-start-reverse"
-              >
-                <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
-              </marker>
-            </defs>
-
-            {/* Clicking bare canvas is the first way back to the whole view. */}
-            <rect
-              width={Math.max(1, size.width)}
-              height={Math.max(1, size.height)}
-              fill="transparent"
-              onClick={clearSelection}
-            />
-
-            {/* LOD, level one: the whole view, one curve per file pair. */}
-            <FileLinks lines={links.lines} hotPath={hover.path} dim={focus} />
-
-            {/* LOD, level two: function edges exist only around a selection. */}
-            <g>
-              {edges.map((edge) => (
-                <path
-                  key={edge.key}
-                  d={edge.d}
-                  fill="none"
-                  stroke={edge.incoming ? 'var(--color-ok)' : 'var(--color-accent)'}
-                  strokeWidth={1.4}
-                  strokeDasharray={edge.incoming ? '3 3' : undefined}
-                  strokeOpacity={edge.faint ? 0.55 : 1}
-                  markerEnd="url(#fn-arrow)"
-                />
-              ))}
-            </g>
-
-            {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
-                one attribute changes, so the rows inside are not re-rendered
-                even once while the box is being carried across the canvas. */}
-            {layout.boxes.map((box, i) => {
-              const off = offsets.get(box.path)
-              return (
-                <g
-                  key={box.path}
-                  transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
-                  opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
-                  className="cursor-grab"
-                  // Only `opacity` transitions — a dragged box must not lag
-                  // 90ms behind the pointer carrying it.
-                  style={{ transition: 'opacity 90ms linear', touchAction: 'none' }}
-                  onPointerDown={(event) => startDrag(event, box)}
-                  onPointerMove={moveDrag}
-                  onPointerUp={endDrag}
-                  onPointerCancel={endDrag}
-                  onClickCapture={swallowClick}
-                  onMouseOver={(event) => enter(event.target, box.path)}
-                  onMouseLeave={leave}
+        {/* The legend and the minimap sit on a layer that does not scroll, so
+            neither of them has to be pinned with a sticky trick. */}
+        <div className="relative min-w-0 flex-1">
+          <div ref={canvas} className="h-full w-full overflow-auto bg-app">
+            <svg
+              width={size.width * zoom}
+              height={size.height * zoom}
+              viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
+              className="block select-none"
+              onPointerDownCapture={clearDragFlag}
+            >
+              <defs>
+                <marker
+                  id="fn-arrow"
+                  viewBox="0 0 8 8"
+                  refX="7"
+                  refY="4"
+                  markerWidth="7"
+                  markerHeight="7"
+                  orient="auto-start-reverse"
                 >
-                  <FileBox
-                    box={box}
-                    selectedId={i === selectedBox ? selected : null}
-                    marks={marks.get(i) ?? NO_MARKS}
-                    hot={hotBoxes.has(i)}
-                    onSelect={pickRow}
-                  />
-                </g>
-              )
-            })}
-          </svg>
+                  <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
+                </marker>
+                {/* File links run from 0.5px to 4px wide. In the default marker
+                    units the arrowhead scales with the line and the heavy links
+                    end in a blot, so this one is measured in user space. */}
+                <marker
+                  id="fn-arrow-flat"
+                  viewBox="0 0 8 8"
+                  refX="7"
+                  refY="4"
+                  markerWidth="8"
+                  markerHeight="8"
+                  markerUnits="userSpaceOnUse"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
+                </marker>
+              </defs>
 
-          <Legend shown={links.shown} total={links.total} />
+              {/* Clicking bare canvas is the first way back to the whole view. */}
+              <rect
+                width={Math.max(1, size.width)}
+                height={Math.max(1, size.height)}
+                fill="transparent"
+                onClick={clearSelection}
+              />
+
+              {/* LOD, level one: the whole view, one curve per file pair. It
+                  survives every zoom — the far view keeps the file links and
+                  drops only the function edges. */}
+              <FileLinks lines={links.lines} hotPath={hover.path} dim={focus} />
+
+              {/* LOD, level two: function edges exist only around a selection,
+                  and only where this zoom draws function rows at all. */}
+              <g>
+                {edges.map((edge) => (
+                  <path
+                    key={edge.key}
+                    d={edge.d}
+                    fill="none"
+                    stroke={edge.incoming ? 'var(--color-ok)' : 'var(--color-accent)'}
+                    strokeWidth={1.4}
+                    strokeDasharray={edge.incoming ? '3 3' : undefined}
+                    strokeOpacity={edge.faint ? 0.55 : 1}
+                    markerEnd="url(#fn-arrow)"
+                  />
+                ))}
+              </g>
+
+              {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
+                  one attribute changes, so the rows inside are not re-rendered
+                  even once while the box is being carried across the canvas. */}
+              {layout.boxes.map((box, i) => {
+                const off = offsets.get(box.path)
+                return (
+                  <g
+                    key={box.path}
+                    transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
+                    opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
+                    className="cursor-grab"
+                    // Only `opacity` transitions — a dragged box must not lag
+                    // 90ms behind the pointer carrying it.
+                    style={{ transition: 'opacity 90ms linear', touchAction: 'none' }}
+                    onPointerDown={(event) => startDrag(event, box)}
+                    onPointerMove={moveDrag}
+                    onPointerUp={endDrag}
+                    onPointerCancel={endDrag}
+                    onClickCapture={swallowClick}
+                    onMouseOver={(event) => enter(event.target, box.path)}
+                    onMouseLeave={leave}
+                  >
+                    <FileBox
+                      box={box}
+                      lod={lod}
+                      labelScale={labelScale}
+                      selectedId={i === selectedBox ? selected : null}
+                      marks={marks.get(i) ?? NO_MARKS}
+                      hot={hotBoxes.has(i)}
+                      onSelect={pickRow}
+                      onPickFile={lod === 'file' ? pickFile : undefined}
+                    />
+                  </g>
+                )
+              })}
+            </svg>
+          </div>
+
+          <Legend
+            shown={links.shown}
+            total={links.total}
+            lod={lod}
+            boxes={layout.boxes.length}
+            rows={layout.anchors.size}
+          />
+          <Minimap
+            scrollRef={canvas}
+            layout={layout}
+            offsets={offsets}
+            size={size}
+            zoom={zoom}
+            open={mapOpen}
+            onToggle={toggleMap}
+          />
         </div>
 
         {detailOpen ? (
@@ -803,28 +977,81 @@ const FileLinks = memo(function FileLinks({
  * the same empty map.
  *
  * @param box         the placed box
+ * @param lod         what this zoom draws
+ * @param labelScale  1/zoom at the file level, 1 everywhere else — how the far
+ *                    view's two lines keep their size on screen
  * @param selectedId  the selection, when it is one of this box's rows
  * @param marks       what each of this box's marked rows is to the pointer
  * @param hot         does the hovered file link to this one?
  * @param onSelect    focus a row, or unfocus it when it is already the one
- * @flow  the header, then one row per function, each drawn by its mark
+ * @param onPickFile  the far view only: go in to this file
+ * @flow  the file level -> a two-line card and nothing else ; otherwise the
+ *        header, one row per drawn function each drawn by its mark, and a last
+ *        line counting whatever this level left out
+ * 주요 내부 변수: label/meta(원경 글자 크기, user unit)
  */
 const FileBox = memo(function FileBox({
   box,
+  lod,
+  labelScale,
   selectedId,
   marks,
   hot,
-  onSelect
+  onSelect,
+  onPickFile
 }: {
   box: GraphBox
+  lod: Lod
+  labelScale: number
   selectedId: number | null
   marks: ReadonlyMap<number, RowMark>
   hot: boolean
   onSelect: (id: number) => void
+  onPickFile?: (path: string) => void
 }): JSX.Element {
   const name = box.path.split('/').pop() ?? box.path
-  const covered = box.functions.filter((fn) => !fn.isTest && fn.hasSpec).length
-  const total = box.functions.filter((fn) => !fn.isTest).length
+  const thin = box.specCovered < box.specTotal
+
+  if (lod === 'file') {
+    // In user units, because the canvas is: 12 client pixels at 40% zoom is 30
+    // of them. This is the whole reason the far view can be read at all.
+    const label = FILE_LABEL_PX * labelScale
+    const meta = FILE_META_PX * labelScale
+    return (
+      <g
+        transform={`translate(${box.x} ${box.y})`}
+        onClick={() => onPickFile?.(box.path)}
+        className="cursor-pointer"
+      >
+        <rect
+          width={box.width}
+          height={box.height}
+          rx={3}
+          fill="var(--color-panel)"
+          stroke={hot ? 'var(--color-line-strong)' : 'var(--color-line)'}
+        />
+        <text
+          x={8}
+          y={8 + label}
+          fontSize={label}
+          fontFamily="var(--font-mono)"
+          fill="var(--color-fg)"
+        >
+          {truncate(name, fitChars(box.width, label))}
+        </text>
+        <text
+          x={8}
+          y={FILE_BOX_H - 8}
+          fontSize={meta}
+          fontFamily="var(--font-mono)"
+          fill={thin ? 'var(--color-warn)' : 'var(--color-fg-mute)'}
+        >
+          {box.total} fn · {box.specCovered}/{box.specTotal}
+        </text>
+        <title>{box.path}</title>
+      </g>
+    )
+  }
 
   return (
     <g transform={`translate(${box.x} ${box.y})`}>
@@ -844,9 +1071,9 @@ const FileBox = memo(function FileBox({
         fontSize={9}
         textAnchor="end"
         fontFamily="var(--font-mono)"
-        fill={covered < total ? 'var(--color-warn)' : 'var(--color-fg-mute)'}
+        fill={thin ? 'var(--color-warn)' : 'var(--color-fg-mute)'}
       >
-        {box.functions.length} fn · {covered}/{total}
+        {box.total} fn · {box.specCovered}/{box.specTotal}
       </text>
       <title>{box.path}</title>
       <line
@@ -918,6 +1145,20 @@ const FileBox = memo(function FileBox({
           </g>
         )
       })}
+
+      {/* A cut list must never read as the whole file. Not a button: turning
+          rows back on one box at a time is the next slice, not this one. */}
+      {box.hidden > 0 ? (
+        <text
+          x={10}
+          y={HEADER_H + box.functions.length * ROW_H + 8}
+          fontSize={9}
+          fontFamily="var(--font-mono)"
+          fill="var(--color-fg-mute)"
+        >
+          +{box.hidden} more
+        </text>
+      ) : null}
     </g>
   )
 })
@@ -949,35 +1190,40 @@ interface DrawnEdge {
 /**
  * The selected node's own edges, and only those.
  *
- * @param detail   the loaded node, or null
- * @param anchors  where every row sits
- * @param byBox    how far each dragged box has been pulled, by box index
- * @flow  no selection -> none ; each resolved call and each caller both ends of
- *        which are actually on the canvas, recursion excluded — a call to
- *        yourself has no curve to draw, only a mark on its own row ; every
- *        anchor is read where its box is now, so the curves follow a drag
+ * @param detail  the loaded node, or null
+ * @param layout  the placement at this level of detail
+ * @param byId    every function of the index, by id
+ * @param byBox   how far each dragged box has been pulled, by box index
+ * @param lod     what this zoom draws
+ * @flow  the far view draws no function edges at all — that is what makes it
+ *        readable ; otherwise each resolved call and each caller, recursion
+ *        excluded — a call to yourself has no curve to draw, only a mark on its
+ *        own row ; an end this level does not draw as a row attaches to its
+ *        file's box instead, and every anchor is read where its box is now, so
+ *        the curves follow a drag
  * 주요 내부 변수: seen(같은 쌍의 중복 엣지 제거)
  */
 function edgesFor(
   detail: GraphNodeDetail | null,
-  anchors: Map<number, Anchor>,
-  byBox: Map<number, Offset>
+  layout: GraphLayout,
+  byId: Map<number, GraphFunction>,
+  byBox: Map<number, Offset>,
+  lod: Lod
 ): DrawnEdge[] {
-  if (!detail) return []
-  const found = anchors.get(detail.fn.id)
-  if (!found) return []
-  const self = shiftAnchor(found, byBox.get(found.boxIndex) ?? NO_OFFSET)
+  if (!detail || lod === 'file') return []
+  const self = resolveAnchor(layout, byId, byBox, detail.fn.id)
+  if (!self) return []
 
   const out: DrawnEdge[] = []
   const seen = new Set<string>()
 
   for (const call of detail.calls) {
     if (call.targetId === null || call.targetId === detail.fn.id) continue
-    const at = anchors.get(call.targetId)
     const key = `out-${call.targetId}`
-    if (!at || seen.has(key)) continue
+    if (seen.has(key)) continue
+    const target = resolveAnchor(layout, byId, byBox, call.targetId)
+    if (!target) continue
     seen.add(key)
-    const target = shiftAnchor(at, byBox.get(at.boxIndex) ?? NO_OFFSET)
     out.push({
       key,
       d: edgePath(self, target),
@@ -990,11 +1236,11 @@ function edgesFor(
 
   for (const caller of detail.callers) {
     if (caller.callerId === detail.fn.id) continue
-    const at = anchors.get(caller.callerId)
     const key = `in-${caller.callerId}`
-    if (!at || seen.has(key)) continue
+    if (seen.has(key)) continue
+    const source = resolveAnchor(layout, byId, byBox, caller.callerId)
+    if (!source) continue
     seen.add(key)
-    const source = shiftAnchor(at, byBox.get(at.boxIndex) ?? NO_OFFSET)
     out.push({
       key,
       d: edgePath(source, self),
@@ -1039,18 +1285,35 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * What the colours mean, and how many file links are actually on screen.
+ * What the colours mean, how many file links are on screen, and which level.
  *
  * The cap is printed rather than hidden: a drawn subset that reads as the whole
- * graph would be the picture lying about the repository.
+ * graph would be the picture lying about the repository. The level is printed
+ * for the same reason — rows that vanished with the zoom must say so, or the
+ * graph is claiming this repository has fewer functions than it does.
  *
  * @param shown  how many file links are drawn
  * @param total  how many there are
+ * @param lod    what this zoom draws
+ * @param boxes  how many file boxes are placed
+ * @param rows   how many function rows are placed
  * @flow  says "top N of M" only where the list was really cut
  */
-function Legend({ shown, total }: { shown: number; total: number }): JSX.Element {
+function Legend({
+  shown,
+  total,
+  lod,
+  boxes,
+  rows
+}: {
+  shown: number
+  total: number
+  lod: Lod
+  boxes: number
+  rows: number
+}): JSX.Element {
   return (
-    <div className="pointer-events-none sticky bottom-2 left-2 ml-2 inline-flex items-center gap-3 rounded-sm border border-line bg-panel/90 px-2 py-1 text-micro text-fg-mute">
+    <div className="pointer-events-none absolute bottom-2 left-2 inline-flex items-center gap-3 rounded-sm border border-line bg-panel/90 px-2 py-1 text-micro text-fg-mute">
       <span className="flex items-center gap-1.5">
         <svg width="18" height="6" aria-hidden="true">
           <line x1="0" y1="3" x2="18" y2="3" stroke="var(--color-accent)" strokeWidth="1.4" />
@@ -1083,6 +1346,13 @@ function Legend({ shown, total }: { shown: number; total: number }): JSX.Element
         has spec
       </span>
       <span className="text-fg-mute/70">grey = no spec</span>
+      <span className="text-fg-dim">
+        {lod === 'file'
+          ? `files only · ${boxes} boxes`
+          : lod === 'key'
+            ? `top ${KEY_FN_PER_FILE} fn per file · ${rows} rows`
+            : `all ${rows} fn`}
+      </span>
     </div>
   )
 }

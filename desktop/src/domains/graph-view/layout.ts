@@ -11,6 +11,10 @@
  * exist to survive 8669 edges at once, and drawing 8669 edges at once is
  * precisely what we refuse to do.
  *
+ * The zoom decides which of three levels is placed — file boxes, key rows, or
+ * every row — so the placement shrinks with the detail instead of leaving empty
+ * rectangles behind. `lodFor` and the thresholds around it are the scale bar.
+ *
  * Pure and deterministic, so `layout.test.ts` can assert that 78 boxes do not
  * overlap without a browser.
  */
@@ -36,6 +40,47 @@ export const HOVER_MARK_LIMIT = 300
 /** How far right a routed-around curve may bulge before it invades the next column. */
 export const LANE_MAX = 160
 
+// ----------------------------------------------------------- scale of detail
+//
+// A map with no scale bar is unreadable at 1435 functions — that is measured,
+// not feared. So the zoom decides *what* is drawn and not merely how big it is
+// drawn, and the placement follows: at the file level a box is 72 units tall
+// instead of 400, which is what turns a 6800px canvas into one that fits on a
+// screen. Every threshold below is a constant on purpose: tuning this after
+// looking at a real repository must be three numbers, not a refactor.
+
+/** Which level of detail a zoom draws. */
+export type Lod = 'file' | 'key' | 'full'
+
+/** At or below this zoom: file boxes only, no function rows and no function
+ *  edges. 105 boxes at FILE_BOX_H pack into 2044x1400 user units, which at 0.55
+ *  is 1124x770 client pixels — one screen. */
+export const LOD_FILE_MAX = 0.55
+/** At or below this zoom: file boxes plus each file's most-called functions. */
+export const LOD_KEY_MAX = 0.85
+/** How many function rows one file shows at the middle level. */
+export const KEY_FN_PER_FILE = 6
+/** How tall a file box is when it holds no rows — two lines of header. */
+export const FILE_BOX_H = 72
+/** The size the file level's two header lines keep *on screen*, in client
+ *  pixels. In user units they are these divided by the zoom, which is the only
+ *  way a label stays legible while the canvas shrinks under it. */
+export const FILE_LABEL_PX = 12
+export const FILE_META_PX = 9
+/** The zoom a jump to one function lands at: the level that draws every row. */
+export const ZOOM_DETAIL = 1
+/** The rungs the zoom buttons climb. The bottom two are this slice's far view. */
+export const ZOOM_STEPS: readonly number[] = [0.4, 0.5, 0.7, 0.85, 1, 1.25, 1.5, 1.8]
+
+/** How big the minimap may get, in client pixels. */
+export const MINIMAP_W = 196
+export const MINIMAP_H = 132
+
+/** No rows at all. One shared instance, so `memo` is not woken by it. */
+const NO_ROWS: GraphFunction[] = []
+/** No caller counted yet — the default for a layout built without an index. */
+const NO_COUNTS: Map<number, number> = new Map()
+
 export interface GraphBox {
   path: string
   lang: string
@@ -43,7 +88,15 @@ export interface GraphBox {
   y: number
   width: number
   height: number
+  /** The rows this level actually draws. Empty at the file level. */
   functions: GraphFunction[]
+  /** Every function the file defines, drawn or not — the header's "N fn". */
+  total: number
+  /** Spec coverage: the non-test functions, and how many of them carry a spec. */
+  specTotal: number
+  specCovered: number
+  /** How many rows this level leaves out. Above zero, a "+N more" line is added. */
+  hidden: number
 }
 
 /** Where an edge may attach to one function row. */
@@ -68,24 +121,155 @@ export interface GraphLayout {
 }
 
 /**
- * How tall a file box is: header, one row per function, a little padding.
+ * What this zoom draws. The boundaries are inclusive.
  *
- * @param count  how many functions the file defines
+ * @param zoom  the surface's zoom factor
+ * @flow  anything that is not a positive number reads as the coarsest level
+ *        rather than throwing a canvas away
  */
-export function boxHeight(count: number): number {
-  return HEADER_H + count * ROW_H + PAD_B
+export function lodFor(zoom: number): Lod {
+  if (!(zoom > 0)) return 'file'
+  if (zoom <= LOD_FILE_MAX) return 'file'
+  if (zoom <= LOD_KEY_MAX) return 'key'
+  return 'full'
+}
+
+/**
+ * Which rung of the ladder a zoom is standing on, or the nearest one to it.
+ *
+ * @param zoom  the current zoom, which need not be a rung at all
+ * @flow  the smallest absolute gap wins; ties keep the lower rung
+ */
+function nearestStep(zoom: number): number {
+  let at = 0
+  let best = Number.POSITIVE_INFINITY
+  for (let i = 0; i < ZOOM_STEPS.length; i++) {
+    const gap = Math.abs(ZOOM_STEPS[i] - zoom)
+    if (gap < best) {
+      best = gap
+      at = i
+    }
+  }
+  return at
+}
+
+/**
+ * One rung closer, or this one again at the top.
+ *
+ * @param zoom  the current zoom
+ */
+export function zoomIn(zoom: number): number {
+  return ZOOM_STEPS[Math.min(ZOOM_STEPS.length - 1, nearestStep(zoom) + 1)]
+}
+
+/**
+ * One rung further away, or this one again at the bottom.
+ *
+ * @param zoom  the current zoom
+ */
+export function zoomOut(zoom: number): number {
+  return ZOOM_STEPS[Math.max(0, nearestStep(zoom) - 1)]
+}
+
+/**
+ * How many distinct functions call each function — its in-degree.
+ *
+ * `index.edges` is already deduplicated caller→callee, so counting the targets
+ * is the whole answer. This is the middle level's idea of "a key function":
+ * the DB has no export column (see `aidev/graph/model.py`), and "who is called
+ * most" is in any case a more honest way to pick a file's representatives.
+ *
+ * @param edges  the deduplicated function-to-function calls
+ * @flow  one pass over the edges, counting each target
+ */
+export function callerCounts(edges: GraphEdge[]): Map<number, number> {
+  const counts = new Map<number, number>()
+  for (const edge of edges) counts.set(edge.to, (counts.get(edge.to) ?? 0) + 1)
+  return counts
+}
+
+/**
+ * The rows this level draws for one file.
+ *
+ * A level that shows everything hands back the very array it was given, and the
+ * file level hands back one shared empty array. That referential identity is
+ * not a nicety: it is what lets `FileBox`'s memo skip a hundred boxes.
+ *
+ * @param functions  the file's functions, in coordinate order
+ * @param lod        what this zoom draws
+ * @param counts     each function's in-degree, from `callerCounts`
+ * @param perFile    how many rows the middle level keeps
+ * @flow  file level -> nothing ; full level or a short file -> the same array ;
+ *        otherwise the most-called `perFile`, put back in coordinate order so a
+ *        row never moves for a reason the reader cannot see
+ * 주요 내부 변수: ranked(순위 매기려고 감싼 것), kept(살아남은 행)
+ */
+export function visibleRows(
+  functions: GraphFunction[],
+  lod: Lod,
+  counts: Map<number, number>,
+  perFile = KEY_FN_PER_FILE
+): GraphFunction[] {
+  if (lod === 'file') return NO_ROWS
+  if (lod === 'full' || functions.length <= perFile) return functions
+
+  const ranked = functions.map((fn, order) => ({ fn, order, weight: counts.get(fn.id) ?? 0 }))
+  ranked.sort((a, b) => (a.weight !== b.weight ? b.weight - a.weight : a.order - b.order))
+  const kept = ranked.slice(0, Math.max(0, perFile))
+  kept.sort((a, b) => a.order - b.order)
+  return kept.map((entry) => entry.fn)
+}
+
+/**
+ * How many monospace characters of this size fit across this width.
+ *
+ * @param width     the space there is, in the same units as `fontSize`
+ * @param fontSize  the size the text is drawn at
+ * @flow  never below four: a name cut to nothing says less than a cut name
+ */
+export function fitChars(width: number, fontSize: number): number {
+  if (!(fontSize > 0)) return 4
+  // 0.62 is Cascadia Mono / Consolas' advance-to-size ratio, measured.
+  return Math.max(4, Math.floor((width - 16) / (fontSize * 0.62)))
+}
+
+/**
+ * How tall a file box is: header, one row per drawn function, a little padding.
+ *
+ * @param count   how many rows this level actually draws
+ * @param lod     what this zoom draws
+ * @param hidden  how many rows this level leaves out, for the "+N more" line
+ * @flow  the file level is a fixed two-line card ; otherwise the rows decide,
+ *        plus one more line where something was left out
+ */
+export function boxHeight(count: number, lod: Lod = 'full', hidden = 0): number {
+  if (lod === 'file') return FILE_BOX_H
+  return HEADER_H + count * ROW_H + (hidden > 0 ? ROW_H : 0) + PAD_B
 }
 
 /**
  * Place every file box and every function row, in path order.
  *
- * @param files  the file groups, already in the order they should be read
+ * The level of detail is an *input* here rather than a condition inside a
+ * component, and that is the whole design: hiding rows while keeping the boxes
+ * 400 units tall would leave a hundred empty rectangles scattered over 6800
+ * pixels, which is no more readable than the hairball. Because the anchors, the
+ * canvas size, the minimap and the file links all read off this one result,
+ * changing the level in one place keeps every one of them agreeing.
+ *
+ * @param files   the file groups, already in the order they should be read
+ * @param lod     what this zoom draws
+ * @param counts  each function's in-degree, for picking a file's key rows
  * @flow  fill a column until the next box would pass COLUMN_H -> start another
- *        -> record one anchor per function and one per file -> the canvas is
- *        the outer bound
- * 주요 내부 변수: x/y(현재 열의 좌상단), tallest(캔버스 높이)
+ *        -> record one anchor per *drawn* row and one box per file -> the canvas
+ *        is the outer bound
+ * 주요 내부 변수: x/y(현재 열의 좌상단), rows(이 레벨이 그리는 행), tallest(캔버스 높이)
  */
-export function layoutGraph(files: GraphFileGroup[]): GraphLayout {
+export function layoutGraph(
+  files: GraphFileGroup[],
+  lod: Lod = 'full',
+  counts: Map<number, number> = NO_COUNTS
+): GraphLayout {
   const boxes: GraphBox[] = []
   const anchors = new Map<number, Anchor>()
   const boxOf = new Map<string, number>()
@@ -94,13 +278,22 @@ export function layoutGraph(files: GraphFileGroup[]): GraphLayout {
   let tallest = 0
 
   for (const file of files) {
-    const height = boxHeight(file.functions.length)
+    const rows = visibleRows(file.functions, lod, counts)
+    const hidden = file.functions.length - rows.length
+    const height = boxHeight(rows.length, lod, hidden)
     // A box taller than a whole column still gets its own column rather than
     // being cut: pipeline.py is one file with 207 functions, and hiding half of
     // it would be the graph lying about the repository.
     if (y > 0 && y + height > COLUMN_H) {
       x += BOX_W + GAP_X
       y = 0
+    }
+    let specTotal = 0
+    let specCovered = 0
+    for (const fn of file.functions) {
+      if (fn.isTest) continue
+      specTotal += 1
+      if (fn.hasSpec) specCovered += 1
     }
     const box: GraphBox = {
       path: file.path,
@@ -109,13 +302,17 @@ export function layoutGraph(files: GraphFileGroup[]): GraphLayout {
       y,
       width: BOX_W,
       height,
-      functions: file.functions
+      functions: rows,
+      total: file.functions.length,
+      specTotal,
+      specCovered,
+      hidden
     }
     const boxIndex = boxes.length
     boxes.push(box)
     boxOf.set(file.path, boxIndex)
 
-    file.functions.forEach((fn, row) => {
+    rows.forEach((fn, row) => {
       anchors.set(fn.id, {
         left: x,
         right: x + BOX_W,
@@ -300,6 +497,145 @@ export function canvasSize(
     height = Math.max(height, box.y + offset.dy + box.height)
   }
   return { width, height }
+}
+
+// ---------------------------------------------------------------- viewport
+//
+// Where the reader is looking, in the canvas's own units rather than in client
+// pixels. `scrollLeft` is pixels, so it means something different at every zoom
+// and something different again after a level change moves every box — which is
+// exactly why zooming out of a large graph normally loses your place. Everything
+// below converts in one direction or the other so that it does not.
+
+/** A rectangle of the canvas, in user units. */
+export interface Viewport {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * The scroll position that puts one point of the canvas in the middle.
+ *
+ * @param point  where to look, in user units
+ * @param zoom   the surface's zoom factor
+ * @param view   the scroll container's client size, in pixels
+ * @param size   the canvas, in user units
+ * @flow  clamped at both ends: neither before the origin, which the viewBox
+ *        cuts, nor past what there is to scroll
+ */
+export function centerScroll(
+  point: { x: number; y: number },
+  zoom: number,
+  view: { width: number; height: number },
+  size: { width: number; height: number }
+): { left: number; top: number } {
+  const z = zoom > 0 ? zoom : 1
+  const left = point.x * z - view.width / 2
+  const top = point.y * z - view.height / 2
+  return {
+    left: Math.min(Math.max(0, left), Math.max(0, size.width * z - view.width)),
+    top: Math.min(Math.max(0, top), Math.max(0, size.height * z - view.height))
+  }
+}
+
+/**
+ * What is on screen right now, in user units.
+ *
+ * @param scroll  the container's scroll position and client size, in pixels
+ * @param zoom    the surface's zoom factor
+ */
+export function viewportOf(
+  scroll: { left: number; top: number; width: number; height: number },
+  zoom: number
+): Viewport {
+  const z = zoom > 0 ? zoom : 1
+  return { x: scroll.left / z, y: scroll.top / z, w: scroll.width / z, h: scroll.height / z }
+}
+
+/**
+ * The path of the box nearest a point — the one thing that survives a level
+ * change, since the coordinates themselves do not.
+ *
+ * @param layout  the placement
+ * @param point   a point in user units
+ * @flow  squared distance between centres, smallest wins ; no boxes -> null
+ */
+export function nearestBoxPath(
+  layout: GraphLayout,
+  point: { x: number; y: number }
+): string | null {
+  let best: string | null = null
+  let bestGap = Number.POSITIVE_INFINITY
+  for (const box of layout.boxes) {
+    const dx = box.x + box.width / 2 - point.x
+    const dy = box.y + box.height / 2 - point.y
+    const gap = dx * dx + dy * dy
+    if (gap < bestGap) {
+      bestGap = gap
+      best = box.path
+    }
+  }
+  return best
+}
+
+/**
+ * The middle of one box, where it now is.
+ *
+ * @param box     the box as it was placed
+ * @param offset  how far it has been dragged
+ */
+export function boxCenter(box: GraphBox, offset: Offset): { x: number; y: number } {
+  return { x: box.x + offset.dx + box.width / 2, y: box.y + offset.dy + box.height / 2 }
+}
+
+/**
+ * The scale that fits the whole canvas into the minimap, and the size it takes.
+ *
+ * @param size  the canvas, in user units
+ * @param maxW  the widest the minimap may be, in client pixels
+ * @param maxH  the tallest
+ * @flow  an empty canvas is a zero-sized map rather than a NaN ; a canvas that
+ *        already fits is drawn at its own size instead of being magnified
+ */
+export function minimapFit(
+  size: { width: number; height: number },
+  maxW = MINIMAP_W,
+  maxH = MINIMAP_H
+): { scale: number; width: number; height: number } {
+  if (!(size.width > 0) || !(size.height > 0)) return { scale: 0, width: 0, height: 0 }
+  const scale = Math.min(1, maxW / size.width, maxH / size.height)
+  return { scale, width: size.width * scale, height: size.height * scale }
+}
+
+/**
+ * Where an edge attaches to one function, at whatever level is being drawn.
+ *
+ * A row that this level does not draw still has a box, and a curve to the side
+ * of the box says one thing less rather than nothing at all. That fallback is
+ * what keeps a selection made at one zoom meaningful at another.
+ *
+ * @param layout  the placement
+ * @param byId    every function of the index, by id
+ * @param byBox   how far each dragged box has been pulled, by box index
+ * @param id      the function being attached to
+ * @flow  its own row -> that row ; else its file's box -> the box's side ;
+ *        a function this index never had -> null
+ */
+export function resolveAnchor(
+  layout: GraphLayout,
+  byId: Map<number, GraphFunction>,
+  byBox: Map<number, Offset>,
+  id: number
+): EdgeAnchor | null {
+  const anchor = layout.anchors.get(id)
+  if (anchor) return shiftAnchor(anchor, byBox.get(anchor.boxIndex) ?? ZERO)
+  const path = byId.get(id)?.path
+  if (path === undefined) return null
+  const at = layout.boxOf.get(path)
+  if (at === undefined) return null
+  return shiftAnchor(boxAnchor(layout.boxes[at]), byBox.get(at) ?? ZERO)
 }
 
 // -------------------------------------------------------------- file links
