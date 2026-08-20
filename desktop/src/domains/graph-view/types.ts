@@ -51,6 +51,26 @@ export interface GraphFileGroup {
   functions: GraphFunction[]
 }
 
+/**
+ * One file→file link: `calls` grouped by the two ends' files.
+ *
+ * This is the whole-view level of detail. A file pair is the coarsest thing the
+ * graph can say that is still true, which is why it is what the canvas draws
+ * when nothing is selected — structure without the hairball.
+ */
+export interface GraphFileEdge {
+  from: string
+  to: string
+  /** How many call sites in `from` resolve into a function of `to`. */
+  weight: number
+}
+
+/** One resolved call, function to function, deduplicated. */
+export interface GraphEdge {
+  from: number
+  to: number
+}
+
 /** Why the graph could not be read. Each has its own thing to say on screen. */
 export type GraphProblem = 'no-graph' | 'unreadable' | 'schema' | 'no-sqlite'
 
@@ -62,6 +82,11 @@ export interface GraphIndexResult {
   dbPath: string
   meta: GraphMeta | null
   files: GraphFileGroup[]
+  /** What the whole view draws: per file pair call totals, heaviest first. */
+  fileEdges: GraphFileEdge[]
+  /** Adjacency's raw material, for deciding a hover's neighbours in memory.
+   *  Not a render list — the canvas never draws all of these at once. */
+  edges: GraphEdge[]
 }
 
 /** One row of `tags`: `@param`, `@flow`, and whatever else a spec carried. */
