@@ -18,16 +18,18 @@ import { StatusBar } from '@renderer/features/statusbar/StatusBar'
 import { useCommandState } from '@domains/pipeline/ui/useCommandState'
 import { useSliceFailure } from '@domains/pipeline/ui/useSliceFailure'
 import { useFunctionGraph } from '@domains/graph-view/ui/useFunctionGraph'
+import { SPLIT_DEFAULT } from '@domains/code-view/split'
 import type { CommandRequest, CommandState } from '@domains/pipeline/types'
 import mark from '@renderer/assets/pluto-mark.png'
 
-/** Which surface each activity opens in the main pane. */
+/**
+ * Which surface each activity opens in the main pane. The mock screens left the
+ * tab bar, so graph/changes/tests are missing here on purpose: those activities
+ * now change the sidebar only, because there is no main screen left to open.
+ */
 const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
   pipeline: 'plan',
-  functions: 'functions',
-  graph: 'graph',
-  changes: 'diff',
-  tests: 'test'
+  functions: 'functions'
 }
 
 /**
@@ -38,18 +40,25 @@ const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
  *
  * @flow  no global data yet -> the boot mark ; otherwise the whole shell
  * 주요 내부 변수: activity(좌측 패널이 무엇을 보여주는가),
- * inspectorCollapsed(셰브런 방향 — 접힘의 진실은 패널 자신이 안다)
+ * inspectorCollapsed(셰브런 방향 — 접힘의 진실은 패널 자신이 안다),
+ * codeSplit(그래프와 코드가 나눠 갖는 비율 — 탭을 옮겨 다녀도 남도록 셸이 든다)
  */
 function App(): JSX.Element {
   const [activity, setActivity] = useState<ActivityId>('workspaces')
   const [workspaceId, setWorkspaceId] = useState('ws-night-role')
   const [selectedSymbolId, setSelectedSymbolId] = useState<string | null>(null)
-  const [primary, setPrimary] = useState<SurfaceId>('graph')
-  const [secondary, setSecondary] = useState<SurfaceId>('diff')
+  const [primary, setPrimary] = useState<SurfaceId>('functions')
+  const [secondary, setSecondary] = useState<SurfaceId>('plan')
   // Graph-first: the main pane opens undivided so the whole graph is legible.
   // Split is one click away in the surface tab bar.
   const [splitOpen, setSplitOpen] = useState(false)
   const [zoom, setZoom] = useState(1)
+  // The graph/code divider's position. It lives here rather than in the surface
+  // because a tab change unmounts that surface, and a ratio forgotten by a trip
+  // to Plan is not remembered for the session. Nothing is written to disk: the
+  // requirement asks for the session and no further. Same reason, same place as
+  // `zoom` above.
+  const [codeSplit, setCodeSplit] = useState(SPLIT_DEFAULT)
   const [bottomTab, setBottomTab] = useState<BottomTab>('run')
   const [bottomCollapsed, setBottomCollapsed] = useState(false)
   // Only the chevron's direction. Whether the panel is really collapsed is
@@ -138,6 +147,24 @@ function App(): JSX.Element {
     [pipelineSlice, refreshRepo]
   )
 
+  /**
+   * Code has appeared beside the graph — fold the inspector away to make room.
+   * Takes no arguments.
+   *
+   * Called at the *moment* it appears and only then (the surface's effect fires
+   * on `codeOpen`'s false→true), so double-clicking a second node never folds
+   * away an inspector somebody deliberately opened again. There is no path
+   * back: re-opening it is the reader's to do.
+   *
+   * @flow  already folded -> nothing, because the panel itself owns that truth
+   */
+  const makeRoomForCode = useCallback((): void => {
+    const panel = inspectorRef.current
+    if (!panel || panel.isCollapsed()) return
+    panel.collapse()
+    setInspectorCollapsed(true)
+  }, [inspectorRef])
+
   if (!global) return <Booting />
 
   const activeWorkspace = global.workspaces.find((w) => w.id === workspaceId)
@@ -176,13 +203,7 @@ function App(): JSX.Element {
       onRun: runCommand
     },
     functions: functionsData,
-    waitingCount: waiting.length,
-    graph: workspace?.graph ?? null,
-    changes: workspace?.changes ?? null,
-    tests: workspace?.tests ?? null,
-    location,
-    selectedSymbolId,
-    onSelectSymbol: setSelectedSymbolId
+    waitingCount: waiting.length
   }
 
   /**
@@ -294,6 +315,9 @@ function App(): JSX.Element {
                       onZoomChange={setZoom}
                       onToggleSplit={() => setSplitOpen((v) => !v)}
                       splitOpen={splitOpen}
+                      codeSplit={codeSplit}
+                      onCodeSplitChange={setCodeSplit}
+                      onCodeSplitOpen={makeRoomForCode}
                     />
                   </Panel>
                   {splitOpen ? (
@@ -306,6 +330,9 @@ function App(): JSX.Element {
                           data={surfaceData}
                           zoom={zoom}
                           onZoomChange={setZoom}
+                          codeSplit={codeSplit}
+                          onCodeSplitChange={setCodeSplit}
+                          onCodeSplitOpen={makeRoomForCode}
                         />
                       </Panel>
                     </>

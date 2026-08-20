@@ -45,7 +45,10 @@ and writes exactly one kind of file back:
 Judgement stays in the Python core. `writeApproval` is the only capability in
 `src/preload/index.ts` that writes into a target repository; everything else the
 renderer can reach is a read or a main-owned command. Every other screen
-(Graph / Code / Diff / Test / Browser) is still mock data.
+(Graph / Code / Diff / Test / Browser) is still mock data, and none of them is
+reachable from the tab bar any more: the files stay, the routing is gone. The
+tab bar is Plan and Graph — and Graph is the Function DB, read from
+`.aidev/graph/graph.db`.
 
 ### Unit tests
 

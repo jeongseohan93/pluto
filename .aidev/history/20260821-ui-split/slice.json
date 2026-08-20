@@ -1,6 +1,6 @@
 {
   "slice_id": "20260821-ui-split",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260821-ui-split",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9a9af6a5531b0c551fda09898451667b6e8d48e5",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260821-004215-ui-split-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "8ec721a913a4c85b9a54873bdcd392202e2bae4c"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260821-005340-ui-split-implement",
+      "attempts": 1
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,23 @@
         "peak_context": 142440
       },
       "cost_usd": 3.4957089999999997
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260821-005340-ui-split-implement",
+      "status": "completed",
+      "turns": 71,
+      "tokens": {
+        "input": 6284,
+        "cache_creation": 113190,
+        "cache_read": 6871214,
+        "output": 41595,
+        "billed_input": 6990688,
+        "peak_context": 134076
+      },
+      "cost_usd": 5.638802000000001
     }
   ],
-  "updated_at": "2026-08-21T00:52:45+09:00"
+  "updated_at": "2026-08-21T01:02:41+09:00"
 }
