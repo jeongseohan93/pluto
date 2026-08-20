@@ -50,7 +50,8 @@
       "commit": "9e246f685dba35f35b66b9aeaa7a1814f4557e79"
     },
     "test": {
-      "status": "pending",
+      "status": "done",
+      "verdict": "pass",
       "commit": "c4a87cb88f91d32a89a2707e6def9eefef7da9d5"
     }
   },
@@ -104,5 +105,5 @@
       "cost_usd": 0.629012
     }
   ],
-  "updated_at": "2026-08-20T18:51:33+09:00"
+  "updated_at": "2026-08-20T18:51:36+09:00"
 }
