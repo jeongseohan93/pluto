@@ -31,10 +31,12 @@
     "implement": {
       "status": "done",
       "run_id": "20260820-181731-graph-lod-implement",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "9e246f685dba35f35b66b9aeaa7a1814f4557e79"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -71,5 +73,5 @@
       "cost_usd": 10.2040605
     }
   ],
-  "updated_at": "2026-08-20T18:50:01+09:00"
+  "updated_at": "2026-08-20T18:50:05+09:00"
 }
