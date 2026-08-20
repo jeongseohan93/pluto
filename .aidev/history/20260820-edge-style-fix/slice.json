@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-edge-style-fix",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260820-edge-style-fix",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "88d7108a7e64a6cb0fe95df7c5ca02ef8e2866bf",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 25,
+    "test_files": 6,
+    "budget": 60,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-202710-edge-style-fix-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-20T20:27:06+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-202710-edge-style-fix-plan",
+      "status": "completed",
+      "turns": 41,
+      "tokens": {
+        "input": 48,
+        "cache_creation": 125533,
+        "cache_read": 2201778,
+        "output": 48376,
+        "billed_input": 2327359,
+        "peak_context": 140001
+      },
+      "cost_usd": 3.565859
+    }
+  ],
+  "updated_at": "2026-08-20T20:38:42+09:00"
 }
