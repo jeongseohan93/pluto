@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260820-edge-style-fix",
+  "status": "pending",
+  "branch": "slice/20260820-edge-style-fix",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "88d7108a7e64a6cb0fe95df7c5ca02ef8e2866bf",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-20T20:27:06+09:00"
+}
