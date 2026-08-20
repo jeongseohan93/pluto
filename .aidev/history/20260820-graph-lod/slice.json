@@ -16,7 +16,22 @@
     "budget": 120,
     "warn": true
   },
-  "amends": null,
+  "amends": [
+    {
+      "n": 1,
+      "instruction": "reindent_tmp.py를 커밋에서 제거하라 (임시 스크립트 잔재). git rm 사용. 다른 변경 금지.",
+      "stages": [
+        "implement",
+        "test"
+      ],
+      "opened_at": "2026-08-20T18:50:45+09:00",
+      "previous_result": {
+        "stage": "implement",
+        "run_id": "20260820-181731-graph-lod-implement",
+        "summary": "Done.\n\n## Files changed\n\n| File | What |\n|---|---|\n| `desktop/src/domains/graph-view/layout.ts` | LOD thresholds as constants (`LOD_FILE_MAX`, `LOD_KEY_MAX`, `KEY_FN_PER_FILE`, `FILE_BOX_H`, `ZOOM_STEPS`, `MINIMAP_W/H`); new pure functions `lodFor`, `zoomIn/zoomOut`, `callerCounts`, `visibleRows`, `fitChars`, `centerScroll`, `viewportOf`, `nearestBoxPath`, `boxCenter`, `minimapFit`, `resolveAnchor`. `boxHeight`/`layoutGraph` take `lod`/`counts` as **defaulted** arguments, so every existing call site and test is unchanged. `GraphBox` gains `total`/`specTotal`/`specCovered`/`hidden` (header arithmetic moved out of `FileBox`). |\n| `desktop/src/domains/graph-view/ui/Minimap.tsx` | **new** — overview + viewport rectangle, click/drag to move, collapsible. Subscribes to scroll itself; boxes are a separate `memo`, so a scroll frame changes one `<rect>`. |\n| `desktop/src/domains/graph-view/ui/FunctionGraphSurface.tsx` | LOD-driven layout, far-view file cards with zoom-compensated labels, `+N more`, `onZoomChange` prop, minimap + non-scrolling legend layer, and the four effects (offset reset keyed on `files`, auto-zoom on an invisible new selection, keep-your-place on zoom/level change, selection centering via `resolveAnchor`). |\n| `desktop/src/renderer/src/features/workspace/SurfacePane.tsx` | Zoom buttons use the ladder (`zoomIn`/`zoomOut`) instead of ±0.2 clamped at 0.6 — that is what opens the 0.4/0.5 rungs; passes `onZoomChange` down. |\n| `desktop/src/domains/graph-view/layout.test.ts` | 38 new tests (93 total, all passing). No existing test was edited. |\n\n## Verification\n\n- `aidev verify` → **PASS**. But the declared command is `npx --prefix desktop tsc --noEmit -p desktop`, and `desktop/tsconfig.json` is a solution file (`\"files\": []`, two `references`), so **that command typechecks nothing** — it passed in 1.8s. It also failed outright at first because this worktree had no `desktop/node_modules`; I installed them via `aidev verify --command \"npm --prefix desktop ci --"
+      }
+    }
+  ],
   "repairs": null,
   "replans": null,
   "rejections": null,
@@ -30,13 +45,13 @@
     },
     "implement": {
       "status": "done",
-      "run_id": "20260820-181731-graph-lod-implement",
-      "attempts": 1,
+      "run_id": "20260820-185047-graph-lod-implement-2",
+      "attempts": 2,
       "commit": "9e246f685dba35f35b66b9aeaa7a1814f4557e79"
     },
     "test": {
-      "status": "done",
-      "verdict": "pass"
+      "status": "pending",
+      "commit": "c4a87cb88f91d32a89a2707e6def9eefef7da9d5"
     }
   },
   "runs": [
@@ -71,7 +86,23 @@
         "peak_context": 197696
       },
       "cost_usd": 10.2040605
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260820-185047-graph-lod-implement-2",
+      "status": "completed",
+      "turns": 8,
+      "tokens": {
+        "input": 16,
+        "cache_creation": 37411,
+        "cache_read": 420444,
+        "output": 1784,
+        "billed_input": 457871,
+        "peak_context": 58297
+      },
+      "cost_usd": 0.629012
     }
   ],
-  "updated_at": "2026-08-20T18:50:05+09:00"
+  "updated_at": "2026-08-20T18:51:33+09:00"
 }
