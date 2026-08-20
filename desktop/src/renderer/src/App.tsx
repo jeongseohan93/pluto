@@ -30,6 +30,16 @@ const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
   tests: 'test'
 }
 
+/**
+ * The shell: the activity bar, the three panels around the surfaces, and the
+ * state they share. Both side panels fold away — the left one to nothing, since
+ * the activity bar beside it is already a permanent icon rail and is also how
+ * it comes back; the right one to a 32px strip that keeps its own chevron.
+ *
+ * @flow  no global data yet -> the boot mark ; otherwise the whole shell
+ * 주요 내부 변수: activity(좌측 패널이 무엇을 보여주는가),
+ * inspectorCollapsed(셰브런 방향 — 접힘의 진실은 패널 자신이 안다)
+ */
 function App(): JSX.Element {
   const [activity, setActivity] = useState<ActivityId>('workspaces')
   const [workspaceId, setWorkspaceId] = useState('ws-night-role')
@@ -42,6 +52,9 @@ function App(): JSX.Element {
   const [zoom, setZoom] = useState(1)
   const [bottomTab, setBottomTab] = useState<BottomTab>('run')
   const [bottomCollapsed, setBottomCollapsed] = useState(false)
+  // Only the chevron's direction. Whether the panel is really collapsed is
+  // asked of the panel itself — a separator dragged shut says nothing here.
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false)
   const [pipelineSliceId, setPipelineSliceId] = useState<string | null>(null)
   const [functionId, setFunctionId] = useState<number | null>(null)
   // Bumped when a command ends, so the failure panel re-reads what it left.
@@ -52,6 +65,8 @@ function App(): JSX.Element {
   const repo = useRepoState()
   const graph = useFunctionGraph()
   const bottomRef = usePanelRef()
+  const sidebarRef = usePanelRef()
+  const inspectorRef = usePanelRef()
 
   const location = useMemo(
     () => (workspace ? findSymbol(workspace.graph, selectedSymbolId) : null),
@@ -70,6 +85,16 @@ function App(): JSX.Element {
     if (pipelineSliceId && slices.some((s) => s.id === pipelineSliceId)) return
     setPipelineSliceId(waiting[0]?.id ?? slices[0]?.id ?? null)
   }, [pipelineSliceId, slices, waiting])
+
+  // Picking a node with the inspector folded away is picking something and
+  // being told nothing about it. The panel comes back on its own.
+  useEffect(() => {
+    if (selectedSymbolId === null) return
+    const panel = inspectorRef.current
+    if (!panel?.isCollapsed()) return
+    panel.expand()
+    setInspectorCollapsed(false)
+  }, [selectedSymbolId, inspectorRef])
 
   const artifactStage = pipelineSlice ? (pipelineSlice.waitingStage ?? 'plan') : null
   const artifact = useStageArtifact(pipelineSlice?.id ?? null, artifactStage)
@@ -160,10 +185,36 @@ function App(): JSX.Element {
     onSelectSymbol: setSelectedSymbolId
   }
 
+  /**
+   * Open one activity's view — and, since the sidebar collapses to nothing,
+   * this rail is also how it is opened again.
+   *
+   * @param id  which activity was pressed
+   * @flow  the open view pressed again -> fold the panel away ; anything else
+   *        -> the panel is there, whether it was folded or not
+   */
   function handleActivity(id: ActivityId): void {
+    const panel = sidebarRef.current
+    if (id === activity && panel && !panel.isCollapsed()) panel.collapse()
+    else panel?.expand()
     setActivity(id)
     const surface = ACTIVITY_SURFACE[id]
     if (surface) setPrimary(surface)
+  }
+
+  /**
+   * Fold the inspector away, or bring it back. Takes no arguments.
+   *
+   * @flow  the panel itself is asked whether it is collapsed, so a separator
+   *        dragged shut and a chevron pressed mean the same thing here
+   */
+  function toggleInspector(): void {
+    const panel = inspectorRef.current
+    if (!panel) return
+    const collapsed = panel.isCollapsed()
+    if (collapsed) panel.expand()
+    else panel.collapse()
+    setInspectorCollapsed(!collapsed)
   }
 
   function toggleBottom(): void {
@@ -187,9 +238,12 @@ function App(): JSX.Element {
 
         <Group orientation="horizontal" className="min-w-0 flex-1">
           <Panel
+            panelRef={sidebarRef}
             defaultSize={260}
             minSize={180}
             maxSize={420}
+            collapsible
+            collapsedSize={0}
             groupResizeBehavior="preserve-pixel-size"
           >
             <Sidebar
@@ -221,6 +275,7 @@ function App(): JSX.Element {
               telemetry={global.telemetry}
               selectedSymbolId={selectedSymbolId}
               onSelectSymbol={setSelectedSymbolId}
+              onCollapse={() => sidebarRef.current?.collapse()}
             />
           </Panel>
 
@@ -285,9 +340,12 @@ function App(): JSX.Element {
           <Separator className="rp-separator" />
 
           <Panel
+            panelRef={inspectorRef}
             defaultSize={300}
             minSize={220}
             maxSize={460}
+            collapsible
+            collapsedSize={32}
             groupResizeBehavior="preserve-pixel-size"
           >
             <Inspector
@@ -296,6 +354,8 @@ function App(): JSX.Element {
               location={location}
               tests={workspace?.tests ?? null}
               onSelectSymbol={setSelectedSymbolId}
+              collapsed={inspectorCollapsed}
+              onToggle={toggleInspector}
             />
           </Panel>
         </Group>

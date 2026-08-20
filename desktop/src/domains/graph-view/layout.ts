@@ -167,6 +167,141 @@ export function edgePath(from: EdgeAnchor, to: EdgeAnchor): string {
   return `M ${x1} ${from.y} C ${x1 + dx} ${from.y}, ${x2 - dx} ${to.y}, ${x2} ${to.y}`
 }
 
+// ----------------------------------------------------------------- dragging
+//
+// Where the human has pulled a box, as one thin layer over the placement rather
+// than a rewrite of it. `layoutGraph`'s result stays byte-identical while a box
+// is dragged, which is the whole point: the boxes keep their identity, so
+// `FileBox`'s memo survives a drag and only the curves touching a moved box are
+// recomputed. Nothing here is written anywhere — these offsets live exactly as
+// long as the layout they sit on, so a rebuild is also the way back.
+
+/** How far a pointer may travel and still be a click, in client pixels. */
+export const DRAG_SLOP = 3
+
+/** How far one box has been pulled from where it was placed. */
+export interface Offset {
+  dx: number
+  dy: number
+}
+
+/** path -> offset. No key means "wherever the layout put it". */
+export type Offsets = ReadonlyMap<string, Offset>
+
+/** Nothing dragged yet. One shared instance, so `memo` is not woken by it. */
+export const NO_OFFSETS: Offsets = new Map<string, Offset>()
+
+/** The answer for every box nobody has touched — shared, never allocated. */
+const ZERO: Offset = { dx: 0, dy: 0 }
+
+/**
+ * Has the pointer travelled far enough that this is a drag and not a click?
+ *
+ * @param dx    how far it has moved across, in client pixels
+ * @param dy    how far it has moved down
+ * @param slop  how much a click is still allowed to wander
+ */
+export function isDrag(dx: number, dy: number, slop = DRAG_SLOP): boolean {
+  return Math.abs(dx) > slop || Math.abs(dy) > slop
+}
+
+/**
+ * Where this file's box has been pulled to, or the origin when it has not.
+ *
+ * @param offsets  every box that has been moved
+ * @param path     the file being asked about
+ */
+export function offsetOf(offsets: Offsets, path: string): Offset {
+  return offsets.get(path) ?? ZERO
+}
+
+/**
+ * The same offsets with one path moved: a new map, the old one untouched.
+ *
+ * @param offsets  what is moved now
+ * @param path     the file being dragged
+ * @param offset   where it has got to
+ */
+export function withOffset(offsets: Offsets, path: string, offset: Offset): Offsets {
+  const next = new Map(offsets)
+  next.set(path, offset)
+  return next
+}
+
+/**
+ * An offset that cannot push its box off the top or the left of the canvas.
+ *
+ * The viewBox starts at 0,0 and anything before that is cut, so a box dragged
+ * far enough up and left would vanish rather than move. Right and down are not
+ * limited at all — `canvasSize` grows the canvas to hold them.
+ *
+ * @param box     the box as it was placed
+ * @param offset  where the pointer wants it
+ */
+export function clampOffset(box: GraphBox, offset: Offset): Offset {
+  return { dx: Math.max(-box.x, offset.dx), dy: Math.max(-box.y, offset.dy) }
+}
+
+/**
+ * One anchor moved by its box's offset — this is edges following their node.
+ *
+ * @param anchor  where the row sits in the placement
+ * @param offset  how far its box has been dragged
+ * @flow  an untouched box hands back the very same anchor, so the curve string
+ *        it produces is identical to the one before any dragging began
+ */
+export function shiftAnchor(anchor: EdgeAnchor, offset: Offset): EdgeAnchor {
+  if (offset.dx === 0 && offset.dy === 0) return anchor
+  return {
+    left: anchor.left + offset.dx,
+    right: anchor.right + offset.dx,
+    y: anchor.y + offset.dy
+  }
+}
+
+/**
+ * The offsets keyed by box index, which is all an anchor knows of its box.
+ *
+ * Only the moved paths are walked: at 105 boxes and one being dragged, this is
+ * a map of one, rebuilt per frame and costing nothing.
+ *
+ * @param layout   the placement, for path -> box index
+ * @param offsets  every box that has been moved
+ * @flow  each moved path finds its box ; one naming no box is skipped
+ */
+export function offsetsByBox(layout: GraphLayout, offsets: Offsets): Map<number, Offset> {
+  const out = new Map<number, Offset>()
+  for (const [path, offset] of offsets) {
+    const at = layout.boxOf.get(path)
+    if (at !== undefined) out.set(at, offset)
+  }
+  return out
+}
+
+/**
+ * How big the canvas has to be to still hold every box that was dragged.
+ *
+ * @param layout   the placement
+ * @param offsets  every box that has been moved
+ * @flow  nothing moved -> the placement's own size ; otherwise each moved box
+ *        may stretch it right and down, and none of them may shrink it
+ */
+export function canvasSize(
+  layout: GraphLayout,
+  offsets: Offsets
+): { width: number; height: number } {
+  let width = layout.width
+  let height = layout.height
+  for (const [path, offset] of offsets) {
+    const at = layout.boxOf.get(path)
+    if (at === undefined) continue
+    const box = layout.boxes[at]
+    width = Math.max(width, box.x + offset.dx + box.width)
+    height = Math.max(height, box.y + offset.dy + box.height)
+  }
+  return { width, height }
+}
+
 // -------------------------------------------------------------- file links
 //
 // The whole view's level of detail. One curve per file pair instead of one per
@@ -205,18 +340,21 @@ export interface FileLines {
 /**
  * The file links the whole view draws, heaviest first and capped.
  *
- * @param edges   every file pair the index counted
- * @param layout  the placed boxes, for both ends of each link
- * @param limit   how many links to draw at most
+ * @param edges    every file pair the index counted
+ * @param layout   the placed boxes, for both ends of each link
+ * @param limit    how many links to draw at most
+ * @param offsets  the boxes the human has dragged, whose links follow them
  * @flow  drop pairs whose ends are not on this canvas (a half-written DB names
  *        files that have no box) -> heaviest first -> keep `limit` of them ->
- *        one curve each, its width scaled against the heaviest kept
+ *        one curve each between the two boxes where they now are, its width
+ *        scaled against the heaviest kept
  * 주요 내부 변수: usable(양끝이 캔버스에 있는 쌍), heaviest(굵기의 기준)
  */
 export function fileLines(
   edges: GraphFileEdge[],
   layout: GraphLayout,
-  limit = MAX_FILE_EDGES
+  limit = MAX_FILE_EDGES,
+  offsets: Offsets = NO_OFFSETS
 ): FileLines {
   const usable = edges.filter(
     (edge) => layout.boxOf.has(edge.from) && layout.boxOf.has(edge.to) && edge.from !== edge.to
@@ -228,9 +366,11 @@ export function fileLines(
   const lines = kept.map((edge) => {
     const fromBox = layout.boxOf.get(edge.from) as number
     const toBox = layout.boxOf.get(edge.to) as number
+    const from = shiftAnchor(boxAnchor(layout.boxes[fromBox]), offsetOf(offsets, edge.from))
+    const to = shiftAnchor(boxAnchor(layout.boxes[toBox]), offsetOf(offsets, edge.to))
     return {
       key: `${edge.from}->${edge.to}`,
-      d: edgePath(boxAnchor(layout.boxes[fromBox]), boxAnchor(layout.boxes[toBox])),
+      d: edgePath(from, to),
       from: edge.from,
       to: edge.to,
       weight: edge.weight,

@@ -9,35 +9,70 @@ import { DemoBadge } from '@shared/ui/DemoBadge'
 /**
  * The v0.0.1 inspector, over the mock graph. The Function graph surface has its
  * own detail panel and reads the real Function DB; this one wears the badge.
+ *
+ * Collapsed, it keeps its header and drops its body: a mock symbol record
+ * squeezed into 32px is worse than none, and the chevron sits at the left edge
+ * so it is still there to press when that is all the width there is.
+ *
+ * @param workspace       the workspace the summary is of, or undefined
+ * @param graph           the mock code graph, or null while it loads
+ * @param location        the selected symbol and its file, or null
+ * @param tests           the mock test runs, or null
+ * @param onSelectSymbol  move to another symbol
+ * @param collapsed       is the panel folded to its header?
+ * @param onToggle        fold it away / bring it back
+ * @flow  collapsed -> the header alone ; a selection -> its record ; otherwise
+ *        the workspace summary
  */
 export function Inspector({
   workspace,
   graph,
   location,
   tests,
-  onSelectSymbol
+  onSelectSymbol,
+  collapsed,
+  onToggle
 }: {
   workspace: WorkspaceSummary | undefined
   graph: CodeGraph | null
   location: SymbolLocation | null
   tests: TestCase[] | null
   onSelectSymbol: (id: string) => void
+  collapsed: boolean
+  onToggle: () => void
 }): JSX.Element {
   return (
     <section className="flex h-full min-w-0 flex-col bg-panel">
-      <PanelHeader title="Inspector" right={<DemoBadge />} />
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {location && graph ? (
-          <SymbolDetail
-            location={location}
-            graph={graph}
-            tests={tests}
-            onSelectSymbol={onSelectSymbol}
-          />
-        ) : (
-          <NoSelection workspace={workspace} />
-        )}
-      </div>
+      <PanelHeader
+        title="Inspector"
+        left={
+          <button
+            type="button"
+            onClick={onToggle}
+            title={collapsed ? 'Expand panel' : 'Collapse panel'}
+            aria-label={collapsed ? 'Expand panel' : 'Collapse panel'}
+            aria-expanded={!collapsed}
+            className="text-fg-mute hover:text-fg-dim"
+          >
+            <Icon name="chevron" size={13} className={collapsed ? 'rotate-180' : ''} />
+          </button>
+        }
+        right={collapsed ? undefined : <DemoBadge />}
+      />
+      {collapsed ? null : (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {location && graph ? (
+            <SymbolDetail
+              location={location}
+              graph={graph}
+              tests={tests}
+              onSelectSymbol={onSelectSymbol}
+            />
+          ) : (
+            <NoSelection workspace={workspace} />
+          )}
+        </div>
+      )}
     </section>
   )
 }

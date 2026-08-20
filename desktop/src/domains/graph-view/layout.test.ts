@@ -13,21 +13,32 @@ import assert from 'node:assert/strict'
 import {
   BOX_W,
   COLUMN_H,
+  DRAG_SLOP,
   EDGE_W_MAX,
   EDGE_W_MIN,
   LANE_MAX,
+  MAX_FILE_EDGES,
+  NO_OFFSETS,
   boxAnchor,
   boxHeight,
   buildAdjacency,
+  canvasSize,
+  clampOffset,
   edgePath,
   edgeWidth,
   fileLines,
   flattenFunctions,
   groupMarks,
+  isDrag,
   layoutGraph,
   matchFunctions,
   mergeMarks,
   neighbourMarks,
+  offsetOf,
+  offsetsByBox,
+  shiftAnchor,
+  withOffset,
+  type Offsets,
   type RowMark
 } from './layout'
 import type { GraphEdge, GraphFileEdge, GraphFileGroup, GraphFunction } from './types'
@@ -452,5 +463,172 @@ describe('matchFunctions', () => {
 
   test('a path fragment finds a file’s functions when no name matches', () => {
     assert.ok(matchFunctions(functions, 'graph/build').length > 0)
+  })
+})
+
+describe('isDrag', () => {
+  test('a hand that barely moved was pointing, not dragging', () => {
+    assert.equal(isDrag(0, 0), false)
+    assert.equal(isDrag(DRAG_SLOP, DRAG_SLOP), false)
+    assert.equal(isDrag(-DRAG_SLOP, -DRAG_SLOP), false)
+  })
+
+  test('past the slop on either axis, in either direction, it is a drag', () => {
+    assert.equal(isDrag(DRAG_SLOP + 1, 0), true)
+    assert.equal(isDrag(0, DRAG_SLOP + 1), true)
+    assert.equal(isDrag(-(DRAG_SLOP + 1), 0), true)
+    assert.equal(isDrag(0, -(DRAG_SLOP + 1)), true)
+  })
+
+  test('the slop can be said out loud', () => {
+    assert.equal(isDrag(5, 0, 10), false)
+    assert.equal(isDrag(5, 0, 1), true)
+  })
+})
+
+describe('offsetOf', () => {
+  test('a box nobody touched is at the origin, and always the same origin', () => {
+    const at = offsetOf(NO_OFFSETS, 'a.py')
+    assert.deepEqual(at, { dx: 0, dy: 0 })
+    // The same object every time: this is read once per link per frame, and a
+    // fresh allocation there is 240 of them a frame for no new fact.
+    assert.equal(offsetOf(NO_OFFSETS, 'b.py'), at)
+  })
+
+  test('a box that was dragged says where it went', () => {
+    const offsets = withOffset(NO_OFFSETS, 'a.py', { dx: 12, dy: -4 })
+    assert.deepEqual(offsetOf(offsets, 'a.py'), { dx: 12, dy: -4 })
+  })
+})
+
+describe('withOffset', () => {
+  test('the map handed in is never the map handed back', () => {
+    const first = withOffset(NO_OFFSETS, 'a.py', { dx: 1, dy: 2 })
+    assert.equal(NO_OFFSETS.size, 0)
+    assert.equal(first.size, 1)
+    const second = withOffset(first, 'b.py', { dx: 3, dy: 4 })
+    assert.equal(first.size, 1)
+    assert.equal(second.size, 2)
+  })
+
+  test('dragging the same box twice leaves where it ended, not the way there', () => {
+    let offsets: Offsets = NO_OFFSETS
+    offsets = withOffset(offsets, 'a.py', { dx: 5, dy: 5 })
+    offsets = withOffset(offsets, 'a.py', { dx: 50, dy: 0 })
+    assert.equal(offsets.size, 1)
+    assert.deepEqual(offsetOf(offsets, 'a.py'), { dx: 50, dy: 0 })
+  })
+})
+
+describe('clampOffset', () => {
+  test('a box cannot be pushed off the top or the left, where it would be cut', () => {
+    const layout = layoutGraph(threeFiles())
+    const box = layout.boxes[1]
+    const at = clampOffset(box, { dx: -9999, dy: -9999 })
+    assert.equal(box.x + at.dx, 0)
+    assert.equal(box.y + at.dy, 0)
+  })
+
+  test('right and down are free — that is what "move it anywhere" means', () => {
+    const box = layoutGraph(threeFiles()).boxes[0]
+    assert.deepEqual(clampOffset(box, { dx: 4000, dy: 9000 }), { dx: 4000, dy: 9000 })
+  })
+})
+
+describe('shiftAnchor', () => {
+  const anchor = { left: 10, right: 110, y: 50 }
+
+  test('both sides and the row move by exactly the offset', () => {
+    assert.deepEqual(shiftAnchor(anchor, { dx: 7, dy: -3 }), { left: 17, right: 117, y: 47 })
+  })
+
+  test('an untouched box hands back the anchor it was given', () => {
+    assert.equal(shiftAnchor(anchor, { dx: 0, dy: 0 }), anchor)
+  })
+})
+
+describe('offsetsByBox', () => {
+  test('only the dragged boxes are keys, and a path with no box is dropped', () => {
+    const layout = layoutGraph(threeFiles())
+    let offsets: Offsets = withOffset(NO_OFFSETS, 'b.py', { dx: 20, dy: 5 })
+    offsets = withOffset(offsets, 'gone.py', { dx: 1, dy: 1 })
+    const byBox = offsetsByBox(layout, offsets)
+    assert.equal(byBox.size, 1)
+    const at = layout.boxOf.get('b.py') as number
+    assert.deepEqual(byBox.get(at), { dx: 20, dy: 5 })
+  })
+
+  test('at this repository’s size, one dragged box costs one entry', () => {
+    const layout = layoutGraph(bigRepo(105, 1435))
+    const offsets = withOffset(NO_OFFSETS, layout.boxes[40].path, { dx: 300, dy: 100 })
+    assert.equal(offsetsByBox(layout, offsets).size, 1)
+    assert.equal(offsetsByBox(layout, NO_OFFSETS).size, 0)
+  })
+})
+
+describe('canvasSize', () => {
+  test('nothing dragged is the placement’s own size, to the pixel', () => {
+    const layout = layoutGraph(bigRepo(105, 1435))
+    assert.deepEqual(canvasSize(layout, NO_OFFSETS), {
+      width: layout.width,
+      height: layout.height
+    })
+  })
+
+  test('a box dragged right and down takes the canvas with it', () => {
+    const layout = layoutGraph(threeFiles())
+    const box = layout.boxes[0]
+    const size = canvasSize(layout, withOffset(NO_OFFSETS, box.path, { dx: 900, dy: 700 }))
+    assert.equal(size.width, box.x + 900 + box.width)
+    assert.equal(size.height, box.y + 700 + box.height)
+  })
+
+  test('a box dragged left never shrinks the canvas onto the others', () => {
+    const layout = layoutGraph(threeFiles())
+    const last = layout.boxes[layout.boxes.length - 1]
+    const size = canvasSize(layout, withOffset(NO_OFFSETS, last.path, { dx: 0, dy: -last.y }))
+    assert.equal(size.width, layout.width)
+    assert.equal(size.height, layout.height)
+  })
+})
+
+describe('fileLines with dragged boxes', () => {
+  const edges: GraphFileEdge[] = [
+    { from: 'a.py', to: 'b.py', weight: 9 },
+    { from: 'b.py', to: 'c.py', weight: 4 }
+  ]
+
+  test('a link out of a dragged box leaves it where it now is', () => {
+    const layout = layoutGraph(threeFiles())
+    const box = layout.boxes[layout.boxOf.get('a.py') as number]
+    const offsets = withOffset(NO_OFFSETS, 'a.py', { dx: 40, dy: 25 })
+    const drawn = fileLines(edges, layout, MAX_FILE_EDGES, offsets).lines.filter(
+      (each) => each.from === 'a.py'
+    )
+    assert.equal(drawn.length, 1)
+    const moved = shiftAnchor(boxAnchor(box), { dx: 40, dy: 25 })
+    assert.ok(drawn[0].d.startsWith(`M ${moved.right} ${moved.y} `))
+  })
+
+  test('a link into a dragged box lands on it where it now is', () => {
+    const layout = layoutGraph(threeFiles())
+    const target = layout.boxes[layout.boxOf.get('c.py') as number]
+    const offsets = withOffset(NO_OFFSETS, 'c.py', { dx: 0, dy: 60 })
+    const drawn = fileLines(edges, layout, MAX_FILE_EDGES, offsets).lines.filter(
+      (each) => each.to === 'c.py'
+    )
+    assert.equal(drawn.length, 1)
+    const from = boxAnchor(layout.boxes[layout.boxOf.get('b.py') as number])
+    assert.equal(drawn[0].d, edgePath(from, shiftAnchor(boxAnchor(target), { dx: 0, dy: 60 })))
+  })
+
+  test('with nothing dragged the curves are the ones that were there before', () => {
+    const layout = layoutGraph(threeFiles())
+    const before = fileLines(edges, layout)
+    const after = fileLines(edges, layout, MAX_FILE_EDGES, NO_OFFSETS)
+    assert.deepEqual(
+      after.lines.map((line) => line.d),
+      before.lines.map((line) => line.d)
+    )
   })
 })

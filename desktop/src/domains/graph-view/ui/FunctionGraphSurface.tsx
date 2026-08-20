@@ -1,4 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react'
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type JSX,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent
+} from 'react'
 import type {
   GraphFileEdge,
   GraphFunction,
@@ -8,22 +18,34 @@ import type {
 import {
   BOX_W,
   HEADER_H,
+  MAX_FILE_EDGES,
+  NO_OFFSETS,
   ROW_H,
   buildAdjacency,
+  canvasSize,
+  clampOffset,
   edgePath,
   fileLines,
   flattenFunctions,
   groupMarks,
+  isDrag,
   layoutGraph,
   matchFunctions,
   mergeMarks,
   neighbourMarks,
+  offsetOf,
+  offsetsByBox,
+  shiftAnchor,
+  withOffset,
   type Anchor,
   type FileLine,
   type GraphBox,
+  type Offset,
+  type Offsets,
   type RowMark
 } from '@domains/graph-view/layout'
 import { FunctionDetail } from '@domains/graph-view/ui/FunctionDetail'
+import { Icon } from '@renderer/components/Icon'
 import { EmptyState } from '@renderer/components/primitives'
 
 /** A stable empty map, so a box with nothing marked keeps identical props. */
@@ -44,6 +66,21 @@ interface Hover {
 }
 
 const NO_HOVER: Hover = { fn: null, path: null }
+
+/** A box with no offset of its own, for the anchors of boxes nobody moved. */
+const NO_OFFSET: Offset = { dx: 0, dy: 0 }
+
+/** A drag in progress: the box, the pointer that owns it, and where it began. */
+interface Dragging {
+  path: string
+  box: GraphBox
+  pointerId: number
+  /** Where the pointer went down, in client pixels — the slop is measured here. */
+  startX: number
+  startY: number
+  /** Where the box already was when this drag started. */
+  base: Offset
+}
 
 /**
  * B — the Function DB on screen: files as boxes, functions as rows.
@@ -66,6 +103,13 @@ const NO_HOVER: Hover = { fn: null, path: null }
  * **Grey means no spec.** `has_spec = 0` renders muted, so coverage is
  * something you see rather than something you compute.
  *
+ * **A box can be dragged, and only for as long as this layout lives.** The
+ * placement stays exactly as `layoutGraph` computed it; a dragged box is a
+ * translate on the wrapper `<g>` and a shifted anchor on the curves that touch
+ * it, so the 1435 rows inside are never re-rendered by a drag. The positions
+ * are deliberately not stored anywhere: a rebuild or a reload is the way back
+ * to the arrangement everybody else sees.
+ *
  * @param index      the loaded index, or null while it loads
  * @param loading    is a read in flight?
  * @param selected   the focused function id, or null for the whole view
@@ -74,8 +118,10 @@ const NO_HOVER: Hover = { fn: null, path: null }
  * @param busy       a command is already running (one slot)
  * @param zoom       the surface's zoom factor
  * @flow  no index -> a reading state ; index not ok -> the reason and a way out
- *        -> otherwise the canvas, plus the detail panel for the selection
- * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드)
+ *        -> otherwise the canvas, plus the detail panel for the selection,
+ *        which folds away and comes back by itself when a row is picked
+ * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
+ * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그)
  */
 export function FunctionGraphSurface({
   index,
@@ -98,15 +144,33 @@ export function FunctionGraphSurface({
   const [detailLoading, setDetailLoading] = useState(false)
   const [query, setQuery] = useState('')
   const [hover, setHover] = useState<Hover>(NO_HOVER)
+  const [offsets, setOffsets] = useState<Offsets>(NO_OFFSETS)
+  const [detailOpen, setDetailOpen] = useState(true)
   const canvas = useRef<HTMLDivElement>(null)
+
+  // The drag itself is a ref, not state: a pointer move already re-renders
+  // through `offsets`, and there is nothing to gain from a second one.
+  const drag = useRef<Dragging | null>(null)
+  /** Did the pointer sequence just ending actually move? A click reads this. */
+  const dragged = useRef(false)
+  const offsetsRef = useRef(offsets)
+  offsetsRef.current = offsets
 
   const files = index?.ok ? index.files : []
   const layout = useMemo(() => layoutGraph(files), [files])
   const functions = useMemo(() => flattenFunctions(files), [files])
   const results = useMemo(() => matchFunctions(functions, query), [functions, query])
 
+  // Everything the drag moves, and nothing it does not: `layout` above does not
+  // depend on `offsets`, so the marks and the boxes are left alone by a drag.
+  const byBox = useMemo(() => offsetsByBox(layout, offsets), [layout, offsets])
+  const size = useMemo(() => canvasSize(layout, offsets), [layout, offsets])
+
   const fileEdges = index?.ok ? index.fileEdges : NO_FILE_EDGES
-  const links = useMemo(() => fileLines(fileEdges, layout), [fileEdges, layout])
+  const links = useMemo(
+    () => fileLines(fileEdges, layout, MAX_FILE_EDGES, offsets),
+    [fileEdges, layout, offsets]
+  )
   // Folded once from the index, not queried per hover: at 1435 rows, one round
   // trip per row the pointer crosses is exactly the lag being avoided here.
   const adjacency = useMemo(() => buildAdjacency(index?.ok ? index.edges : []), [index])
@@ -129,15 +193,33 @@ export function FunctionGraphSurface({
     }
   }, [selected])
 
+  // A selection nobody can see is a selection nobody made: the panel comes back
+  // by itself rather than leaving a picked row with nothing said about it.
+  useEffect(() => {
+    if (selected !== null) setDetailOpen(true)
+  }, [selected])
+
+  // Dragged positions are of *this* layout and no other. A rebuild or a reload
+  // makes a new one, and the boxes are back where everybody else sees them —
+  // which is how "not saved anywhere" is kept true without any code to save.
+  useEffect(() => {
+    setOffsets((prev) => (prev.size === 0 ? prev : NO_OFFSETS))
+  }, [layout])
+
   // Bring the selection into view wherever it came from — a click, a search
-  // hit, a caller in the panel, or the file list on the left.
+  // hit, a caller in the panel, or the file list on the left. The offsets are
+  // read from the ref: a drag must not re-run this and yank the scroll.
   useEffect(() => {
     const box = canvas.current
     const anchor = selected === null ? undefined : layout.anchors.get(selected)
     if (!box || !anchor) return
+    const at = shiftAnchor(
+      anchor,
+      offsetOf(offsetsRef.current, layout.boxes[anchor.boxIndex]?.path ?? '')
+    )
     box.scrollTo({
-      left: Math.max(0, anchor.left * zoom - box.clientWidth / 2 + (BOX_W * zoom) / 2),
-      top: Math.max(0, anchor.y * zoom - box.clientHeight / 2),
+      left: Math.max(0, at.left * zoom - box.clientWidth / 2 + (BOX_W * zoom) / 2),
+      top: Math.max(0, at.y * zoom - box.clientHeight / 2),
       behavior: 'smooth'
     })
   }, [selected, layout, zoom])
@@ -155,7 +237,7 @@ export function FunctionGraphSurface({
     return () => window.removeEventListener('keydown', onKey)
   }, [onSelect])
 
-  const edges = useMemo(() => edgesFor(detail, layout.anchors), [detail, layout])
+  const edges = useMemo(() => edgesFor(detail, layout.anchors, byBox), [detail, layout, byBox])
 
   // What the selection marks: itself, what it calls, what calls it. Read off
   // the drawn edges rather than the adjacency, so an unresolved call site is
@@ -238,9 +320,103 @@ export function FunctionGraphSurface({
     [onSelect]
   )
 
+  /** A new pointer sequence has begun: whatever the last one was, it is over. */
+  const clearDragFlag = useCallback((): void => {
+    dragged.current = false
+  }, [])
+
+  /**
+   * Take hold of a box. The capture is what keeps the rest of the drag — and
+   * the click that ends it — inside this one `<g>`, wherever the pointer goes.
+   *
+   * @param event  the pointerdown on the box's wrapper
+   * @param box    the box under it
+   * @flow  anything but the primary button is left alone
+   */
+  const startDrag = useCallback((event: ReactPointerEvent<SVGGElement>, box: GraphBox): void => {
+    if (event.button !== 0) return
+    // Otherwise the browser starts its own image drag and the text selection
+    // that `user-select: none` is only half of.
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    drag.current = {
+      path: box.path,
+      box,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      base: offsetOf(offsetsRef.current, box.path)
+    }
+  }, [])
+
+  /**
+   * Move the held box, once the pointer has said it means it.
+   *
+   * @param event  a pointermove, captured back to the box that was grabbed
+   * @flow  no drag or another pointer -> nothing ; still inside the slop ->
+   *        this is a click and the box stays where it is
+   */
+  const moveDrag = useCallback(
+    (event: ReactPointerEvent<SVGGElement>): void => {
+      const at = drag.current
+      if (!at || at.pointerId !== event.pointerId) return
+      const mx = event.clientX - at.startX
+      const my = event.clientY - at.startY
+      if (!dragged.current && !isDrag(mx, my)) return
+      dragged.current = true
+      // One user unit is `zoom` client pixels, so the box keeps up with the
+      // cursor at 60% as exactly as it does at 180%.
+      const z = zoom || 1
+      const to = clampOffset(at.box, { dx: at.base.dx + mx / z, dy: at.base.dy + my / z })
+      setOffsets((prev) => withOffset(prev, at.path, to))
+    },
+    [zoom]
+  )
+
+  /**
+   * Let go. `dragged` stays set — the click right behind this one reads it.
+   *
+   * @param event  the pointerup, or the cancel that stands in for one
+   */
+  const endDrag = useCallback((event: ReactPointerEvent<SVGGElement>): void => {
+    const at = drag.current
+    if (!at || at.pointerId !== event.pointerId) return
+    drag.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }, [])
+
+  /**
+   * A drag that ends on a row must not also select it.
+   *
+   * @param event  the click that follows the pointer being released
+   * @flow  the capture phase is early enough to reach the row's own onClick
+   */
+  const swallowClick = useCallback((event: ReactMouseEvent<SVGGElement>): void => {
+    if (dragged.current) event.stopPropagation()
+  }, [])
+
+  /**
+   * Nor must one that ends on bare canvas clear the selection. Takes no
+   * arguments — it is the background rect's click, guarded.
+   */
+  const clearSelection = useCallback((): void => {
+    if (dragged.current) return
+    onSelect(null)
+  }, [onSelect])
+
+  /** Put every box back where the layout placed it. Takes no arguments. */
+  const resetOffsets = useCallback((): void => {
+    setOffsets(NO_OFFSETS)
+  }, [])
+
   // One listener per box instead of one per row: 1435 row listeners is 1435
   // closures rebuilt on every render, and the row is in the event anyway.
   const enter = useCallback((target: EventTarget | null, path: string): void => {
+    // Hovering while dragging would set the marks flickering under the box the
+    // pointer is carrying.
+    if (drag.current) return
     const node = target instanceof Element ? target.closest('[data-fn]') : null
     const raw = node === null ? null : node.getAttribute('data-fn')
     const id = raw === null ? Number.NaN : Number(raw)
@@ -272,6 +448,8 @@ export function FunctionGraphSurface({
           onBuild={onBuild}
           busy={busy}
           loading={loading}
+          moved={offsets.size}
+          onReset={resetOffsets}
         />
         <div className="min-h-0 flex-1">
           <EmptyState title={problemTitle(index)} hint={index.detail ?? ''}>
@@ -301,15 +479,18 @@ export function FunctionGraphSurface({
         onBuild={onBuild}
         busy={busy}
         loading={loading}
+        moved={offsets.size}
+        onReset={resetOffsets}
       />
 
       <div className="flex min-h-0 flex-1">
         <div ref={canvas} className="relative min-w-0 flex-1 overflow-auto bg-app">
           <svg
-            width={layout.width * zoom}
-            height={layout.height * zoom}
-            viewBox={`0 0 ${Math.max(1, layout.width)} ${Math.max(1, layout.height)}`}
-            className="block"
+            width={size.width * zoom}
+            height={size.height * zoom}
+            viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
+            className="block select-none"
+            onPointerDownCapture={clearDragFlag}
           >
             <defs>
               <marker
@@ -342,10 +523,10 @@ export function FunctionGraphSurface({
 
             {/* Clicking bare canvas is the first way back to the whole view. */}
             <rect
-              width={Math.max(1, layout.width)}
-              height={Math.max(1, layout.height)}
+              width={Math.max(1, size.width)}
+              height={Math.max(1, size.height)}
               fill="transparent"
-              onClick={() => onSelect(null)}
+              onClick={clearSelection}
             />
 
             {/* LOD, level one: the whole view, one curve per file pair. */}
@@ -367,31 +548,74 @@ export function FunctionGraphSurface({
               ))}
             </g>
 
-            {layout.boxes.map((box, i) => (
-              <g
-                key={box.path}
-                opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
-                style={{ transition: 'opacity 90ms linear' }}
-                onMouseOver={(event) => enter(event.target, box.path)}
-                onMouseLeave={leave}
-              >
-                <FileBox
-                  box={box}
-                  selectedId={i === selectedBox ? selected : null}
-                  marks={marks.get(i) ?? NO_MARKS}
-                  hot={hotBoxes.has(i)}
-                  onSelect={pickRow}
-                />
-              </g>
-            ))}
+            {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
+                one attribute changes, so the rows inside are not re-rendered
+                even once while the box is being carried across the canvas. */}
+            {layout.boxes.map((box, i) => {
+              const off = offsets.get(box.path)
+              return (
+                <g
+                  key={box.path}
+                  transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
+                  opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
+                  className="cursor-grab"
+                  // Only `opacity` transitions — a dragged box must not lag
+                  // 90ms behind the pointer carrying it.
+                  style={{ transition: 'opacity 90ms linear', touchAction: 'none' }}
+                  onPointerDown={(event) => startDrag(event, box)}
+                  onPointerMove={moveDrag}
+                  onPointerUp={endDrag}
+                  onPointerCancel={endDrag}
+                  onClickCapture={swallowClick}
+                  onMouseOver={(event) => enter(event.target, box.path)}
+                  onMouseLeave={leave}
+                >
+                  <FileBox
+                    box={box}
+                    selectedId={i === selectedBox ? selected : null}
+                    marks={marks.get(i) ?? NO_MARKS}
+                    hot={hotBoxes.has(i)}
+                    onSelect={pickRow}
+                  />
+                </g>
+              )
+            })}
           </svg>
 
           <Legend shown={links.shown} total={links.total} />
         </div>
 
-        <div className="w-80 shrink-0 border-l border-line bg-panel">
-          <FunctionDetail detail={detail} loading={detailLoading} onSelect={pick} />
-        </div>
+        {detailOpen ? (
+          <div className="flex w-80 shrink-0 flex-col border-l border-line bg-panel">
+            <div className="flex h-7 shrink-0 items-center gap-1.5 border-b border-line px-2.5">
+              <button
+                type="button"
+                onClick={() => setDetailOpen(false)}
+                title="Collapse node detail"
+                aria-label="Collapse node detail"
+                aria-expanded={true}
+                className="shrink-0 text-fg-mute hover:text-fg-dim"
+              >
+                <Icon name="chevron" size={13} />
+              </button>
+              <span className="panel-label truncate">Node</span>
+            </div>
+            <div className="min-h-0 flex-1">
+              <FunctionDetail detail={detail} loading={detailLoading} onSelect={pick} />
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setDetailOpen(true)}
+            title="Show node detail"
+            aria-label="Show node detail"
+            aria-expanded={false}
+            className="flex w-7 shrink-0 items-start justify-center border-l border-line bg-panel pt-2 text-fg-mute hover:text-fg-dim"
+          >
+            <Icon name="chevron" size={13} className="rotate-180" />
+          </button>
+        )}
       </div>
     </div>
   )
@@ -408,7 +632,10 @@ export function FunctionGraphSurface({
  * @param onBuild  run `aidev graph build`
  * @param busy     a command is already running
  * @param loading  a read is in flight
+ * @param moved    how many boxes have been dragged out of place
+ * @param onReset  put every dragged box back where the layout placed it
  * @flow  meta -> the commit/branch/times line, with dirty and stale called out
+ *        ; a box has been dragged -> the way back out of that arrangement
  */
 function FreshnessBar({
   index,
@@ -418,7 +645,9 @@ function FreshnessBar({
   onPick,
   onBuild,
   busy,
-  loading
+  loading,
+  moved,
+  onReset
 }: {
   index: GraphIndexResult
   query: string
@@ -428,6 +657,8 @@ function FreshnessBar({
   onBuild: () => void
   busy: boolean
   loading: boolean
+  moved: number
+  onReset: () => void
 }): JSX.Element {
   const meta = index.meta
   return (
@@ -457,6 +688,16 @@ function FreshnessBar({
       ) : null}
 
       <div className="relative ml-auto flex shrink-0 items-center gap-1.5">
+        {moved > 0 ? (
+          <button
+            type="button"
+            onClick={onReset}
+            title="put every box back where the layout placed it"
+            className="rounded-sm border border-line px-1.5 py-0.5 text-micro text-fg-dim hover:bg-hover hover:text-fg"
+          >
+            Reset positions
+          </button>
+        ) : null}
         <input
           value={query}
           onChange={(event) => onQuery(event.target.value)}
@@ -710,25 +951,33 @@ interface DrawnEdge {
  *
  * @param detail   the loaded node, or null
  * @param anchors  where every row sits
+ * @param byBox    how far each dragged box has been pulled, by box index
  * @flow  no selection -> none ; each resolved call and each caller both ends of
  *        which are actually on the canvas, recursion excluded — a call to
- *        yourself has no curve to draw, only a mark on its own row
+ *        yourself has no curve to draw, only a mark on its own row ; every
+ *        anchor is read where its box is now, so the curves follow a drag
  * 주요 내부 변수: seen(같은 쌍의 중복 엣지 제거)
  */
-function edgesFor(detail: GraphNodeDetail | null, anchors: Map<number, Anchor>): DrawnEdge[] {
+function edgesFor(
+  detail: GraphNodeDetail | null,
+  anchors: Map<number, Anchor>,
+  byBox: Map<number, Offset>
+): DrawnEdge[] {
   if (!detail) return []
-  const self = anchors.get(detail.fn.id)
-  if (!self) return []
+  const found = anchors.get(detail.fn.id)
+  if (!found) return []
+  const self = shiftAnchor(found, byBox.get(found.boxIndex) ?? NO_OFFSET)
 
   const out: DrawnEdge[] = []
   const seen = new Set<string>()
 
   for (const call of detail.calls) {
     if (call.targetId === null || call.targetId === detail.fn.id) continue
-    const target = anchors.get(call.targetId)
+    const at = anchors.get(call.targetId)
     const key = `out-${call.targetId}`
-    if (!target || seen.has(key)) continue
+    if (!at || seen.has(key)) continue
     seen.add(key)
+    const target = shiftAnchor(at, byBox.get(at.boxIndex) ?? NO_OFFSET)
     out.push({
       key,
       d: edgePath(self, target),
@@ -741,10 +990,11 @@ function edgesFor(detail: GraphNodeDetail | null, anchors: Map<number, Anchor>):
 
   for (const caller of detail.callers) {
     if (caller.callerId === detail.fn.id) continue
-    const source = anchors.get(caller.callerId)
+    const at = anchors.get(caller.callerId)
     const key = `in-${caller.callerId}`
-    if (!source || seen.has(key)) continue
+    if (!at || seen.has(key)) continue
     seen.add(key)
+    const source = shiftAnchor(at, byBox.get(at.boxIndex) ?? NO_OFFSET)
     out.push({
       key,
       d: edgePath(source, self),
