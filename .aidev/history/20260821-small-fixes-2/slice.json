@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260821-small-fixes-2",
+  "status": "pending",
+  "branch": "slice/20260821-small-fixes-2",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "a61096ef27adb6ca747ac293e182f936d2406bcd",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-21T05:01:33+09:00"
+}
