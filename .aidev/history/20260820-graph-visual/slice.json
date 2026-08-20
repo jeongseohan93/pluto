@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-visual",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260820-graph-visual",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "db0e8db7f01d496a715e6f1a90c5729ff83f1630",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260820-141317-graph-visual-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "9bfc2e3c0801a34c9543051ab67987e05fa40bc2"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-144414-graph-visual-implement",
+      "attempts": 1
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,23 @@
         "peak_context": 117741
       },
       "cost_usd": 3.0260704999999994
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-144414-graph-visual-implement",
+      "status": "completed",
+      "turns": 82,
+      "tokens": {
+        "input": 141,
+        "cache_creation": 171112,
+        "cache_read": 10116988,
+        "output": 72644,
+        "billed_input": 10288241,
+        "peak_context": 191997
+      },
+      "cost_usd": 8.586419000000001
     }
   ],
-  "updated_at": "2026-08-20T14:22:55+09:00"
+  "updated_at": "2026-08-20T15:08:52+09:00"
 }

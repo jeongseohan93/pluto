@@ -23,7 +23,8 @@ export interface SurfaceData {
     index: GraphIndexResult | null
     loading: boolean
     selected: number | null
-    onSelect: (id: number) => void
+    /** null clears the selection — the canvas goes back to the whole view. */
+    onSelect: (id: number | null) => void
     onBuild: () => void
     busy: boolean
   }

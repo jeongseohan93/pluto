@@ -93,13 +93,24 @@ export function registerSliceHandlers(ctx: SliceHandlerContext): void {
         detail: 'no repository selected',
         dbPath: '',
         meta: null,
-        files: []
+        files: [],
+        fileEdges: [],
+        edges: []
       }
     }
     try {
       return readGraphIndex(root)
     } catch (err) {
-      return { ok: false, problem: 'unreadable', detail: String(err), dbPath: '', meta: null, files: [] }
+      return {
+        ok: false,
+        problem: 'unreadable',
+        detail: String(err),
+        dbPath: '',
+        meta: null,
+        files: [],
+        fileEdges: [],
+        edges: []
+      }
     }
   })
 

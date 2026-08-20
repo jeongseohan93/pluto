@@ -1,15 +1,36 @@
 /**
- * The placement and the search, at the size this repository actually is.
+ * The placement, the links and the search, at the size this repository is.
  *
- * 78 files and 1335 functions is the measured shape of Pluto's own graph, so
- * that is what the layout is checked at: every function has somewhere to be,
- * and no two boxes are drawn on top of each other.
+ * 105 files and 1435 functions is the measured shape of this graph today (78
+ * and 1335 when the layout was first written, which is why both sizes appear
+ * below), so that is what everything here is checked at: every function has
+ * somewhere to be, no two boxes are drawn on top of each other, and pointing at
+ * the most-called function in the repository stays a Map lookup.
  */
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { BOX_W, COLUMN_H, boxHeight, edgePath, flattenFunctions, layoutGraph, matchFunctions } from './layout'
-import type { GraphFileGroup, GraphFunction } from './types'
+import {
+  BOX_W,
+  COLUMN_H,
+  EDGE_W_MAX,
+  EDGE_W_MIN,
+  LANE_MAX,
+  boxAnchor,
+  boxHeight,
+  buildAdjacency,
+  edgePath,
+  edgeWidth,
+  fileLines,
+  flattenFunctions,
+  groupMarks,
+  layoutGraph,
+  matchFunctions,
+  mergeMarks,
+  neighbourMarks,
+  type RowMark
+} from './layout'
+import type { GraphEdge, GraphFileEdge, GraphFileGroup, GraphFunction } from './types'
 
 let nextId = 1
 
@@ -32,21 +53,35 @@ function fn(name: string, path: string, overrides: Partial<GraphFunction> = {}):
   }
 }
 
-/** A repository the size of this one: 78 files, 1335 functions. */
-function bigRepo(): GraphFileGroup[] {
+/**
+ * A repository the size of this one, with one file as big as pipeline.py.
+ *
+ * @param fileCount  how many files
+ * @param total      how many functions in all of them
+ */
+function bigRepo(fileCount = 78, total = 1335): GraphFileGroup[] {
   const files: GraphFileGroup[] = []
   let made = 0
-  for (let i = 0; i < 78; i++) {
+  for (let i = 0; i < fileCount; i++) {
     const path = `pkg${String(i).padStart(2, '0')}/module_${i}.py`
-    const count = i === 0 ? 207 : Math.max(1, Math.round((1335 - 207) / 77))
+    const count = i === 0 ? 207 : Math.max(1, Math.round((total - 207) / (fileCount - 1)))
     const functions: GraphFunction[] = []
-    for (let j = 0; j < count && made < 1335; j++) {
+    for (let j = 0; j < count && made < total; j++) {
       functions.push(fn(`fn_${i}_${j}`, path))
       made += 1
     }
     files.push({ path, lang: 'py', functions })
   }
   return files
+}
+
+/** Three small files in one column — enough for a file link to have two ends. */
+function threeFiles(): GraphFileGroup[] {
+  return ['a.py', 'b.py', 'c.py'].map((path) => ({
+    path,
+    lang: 'py',
+    functions: [fn(`${path.slice(0, 1)}_one`, path)]
+  }))
 }
 
 describe('layoutGraph', () => {
@@ -112,6 +147,17 @@ describe('layoutGraph', () => {
     assert.ok(layout.boxes[0].height > COLUMN_H)
     assert.equal(layout.anchors.size, 400)
   })
+
+  test('every file knows which box is its own', () => {
+    const files = bigRepo()
+    const layout = layoutGraph(files)
+    assert.equal(layout.boxOf.size, layout.boxes.length)
+    for (const file of files) {
+      const at = layout.boxOf.get(file.path)
+      assert.ok(at !== undefined)
+      assert.equal(layout.boxes[at].path, file.path)
+    }
+  })
 })
 
 describe('edgePath', () => {
@@ -124,6 +170,247 @@ describe('edgePath', () => {
   test('a target that is not to the right routes around instead of cutting back', () => {
     const d = edgePath({ left: 0, right: 100, y: 10 }, { left: 0, right: 100, y: 200 })
     assert.match(d, /100 200$/)
+  })
+
+  test('however tall the drop, the detour never invades the next column', () => {
+    // pipeline.py's box is 3700px tall. Without the clamp the curve would swing
+    // hundreds of pixels right, straight through whatever is drawn there.
+    const d = edgePath({ left: 0, right: 100, y: 0 }, { left: 0, right: 100, y: 100000 })
+    const control = Number(d.split('C ')[1].split(' ')[0])
+    assert.ok(control > 100, 'the detour still leaves the box')
+    assert.ok(control <= 100 + 16 + LANE_MAX, `lane ${control} passed the limit`)
+  })
+})
+
+describe('boxAnchor', () => {
+  test('a file link attaches to the middle of the box’s two sides', () => {
+    const layout = layoutGraph(threeFiles())
+    for (const box of layout.boxes) {
+      const anchor = boxAnchor(box)
+      assert.equal(anchor.left, box.x)
+      assert.equal(anchor.right, box.x + box.width)
+      assert.equal(anchor.y, box.y + box.height / 2)
+    }
+  })
+})
+
+describe('edgeWidth', () => {
+  test('heavier is never thinner, and nothing leaves the range', () => {
+    let last = 0
+    for (let w = 0; w <= 300; w++) {
+      const width = edgeWidth(w, 300)
+      assert.ok(width >= EDGE_W_MIN && width <= EDGE_W_MAX, `${w} -> ${width}`)
+      assert.ok(width >= last, `${w} came out thinner than ${w - 1}`)
+      last = width
+    }
+  })
+
+  test('the heaviest link reaches the maximum', () => {
+    assert.equal(edgeWidth(300, 300), EDGE_W_MAX)
+  })
+
+  test('nothing to compare against is the minimum, not a NaN', () => {
+    for (const [w, heaviest] of [
+      [1, 1],
+      [0, 0],
+      [5, 0],
+      [0, 10]
+    ]) {
+      const width = edgeWidth(w, heaviest)
+      assert.ok(Number.isFinite(width))
+      assert.equal(width, EDGE_W_MIN)
+    }
+  })
+})
+
+describe('fileLines', () => {
+  const edges: GraphFileEdge[] = [
+    { from: 'a.py', to: 'b.py', weight: 9 },
+    { from: 'b.py', to: 'c.py', weight: 4 },
+    { from: 'c.py', to: 'a.py', weight: 1 },
+    { from: 'a.py', to: 'gone.py', weight: 99 }
+  ]
+
+  test('a pair naming a file with no box is dropped without a word', () => {
+    const layout = layoutGraph(threeFiles())
+    const links = fileLines(edges, layout)
+    assert.equal(links.total, 3)
+    assert.equal(links.shown, 3)
+    assert.ok(!links.lines.some((line) => line.to === 'gone.py'))
+  })
+
+  test('the heaviest links are the ones drawn, and the count says so', () => {
+    const layout = layoutGraph(threeFiles())
+    const links = fileLines(edges, layout, 2)
+    assert.equal(links.total, 3)
+    assert.equal(links.shown, 2)
+    assert.deepEqual(
+      links.lines.map((line) => line.weight),
+      [9, 4]
+    )
+    assert.equal(links.lines[0].width, EDGE_W_MAX)
+    assert.ok(links.lines[1].width < links.lines[0].width)
+  })
+
+  test('each curve leaves its own box and reaches the other one', () => {
+    const layout = layoutGraph(threeFiles())
+    for (const line of fileLines(edges, layout).lines) {
+      const from = layout.boxes[line.fromBox]
+      const to = layout.boxes[line.toBox]
+      assert.equal(from.path, line.from)
+      assert.equal(to.path, line.to)
+      assert.ok(line.d.startsWith(`M ${from.x + from.width} `))
+      assert.equal(line.d, edgePath(boxAnchor(from), boxAnchor(to)))
+    }
+  })
+
+  test('nothing to draw is an empty answer, not a crash', () => {
+    const links = fileLines([], layoutGraph([]))
+    assert.deepEqual(links.lines, [])
+    assert.equal(links.total, 0)
+  })
+})
+
+describe('buildAdjacency', () => {
+  const edges: GraphEdge[] = [
+    { from: 1, to: 2 },
+    { from: 1, to: 3 },
+    { from: 4, to: 2 }
+  ]
+
+  test('both directions stand, and an id nobody named has nothing', () => {
+    const adj = buildAdjacency(edges)
+    assert.deepEqual(adj.outs.get(1), [2, 3])
+    assert.deepEqual((adj.ins.get(2) ?? []).slice().sort(), [1, 4])
+    assert.equal(adj.outs.get(2), undefined)
+    assert.equal(adj.ins.get(99), undefined)
+  })
+
+  test('an empty graph builds an empty adjacency', () => {
+    const adj = buildAdjacency([])
+    assert.equal(adj.outs.size, 0)
+    assert.equal(adj.ins.size, 0)
+  })
+})
+
+describe('neighbourMarks', () => {
+  const adj = buildAdjacency([
+    { from: 1, to: 2 },
+    { from: 1, to: 3 },
+    { from: 4, to: 1 },
+    { from: 2, to: 1 }
+  ])
+
+  test('which way the call goes is what the mark says', () => {
+    const marks = neighbourMarks(adj, 1)
+    assert.equal(marks.get(1), 'hover')
+    assert.equal(marks.get(3), 'calls')
+    assert.equal(marks.get(4), 'callers')
+    // 2 is called by 1 *and* calls 1 back.
+    assert.equal(marks.get(2), 'both')
+  })
+
+  test('a function nobody touches marks only itself', () => {
+    const marks = neighbourMarks(adj, 77)
+    assert.equal(marks.size, 1)
+    assert.equal(marks.get(77), 'hover')
+  })
+
+  test('a very popular function stops at the limit', () => {
+    const many: GraphEdge[] = []
+    for (let i = 2; i < 500; i++) many.push({ from: i, to: 1 })
+    const marks = neighbourMarks(buildAdjacency(many), 1, 10)
+    // ten neighbours plus the node itself.
+    assert.equal(marks.size, 11)
+  })
+})
+
+describe('mergeMarks', () => {
+  test('a selection outranks a hover', () => {
+    const base = new Map<number, RowMark>([[1, 'selected']])
+    const merged = mergeMarks(base, new Map<number, RowMark>([[1, 'hover']]))
+    assert.equal(merged.get(1), 'selected')
+  })
+
+  test('calls meeting callers becomes both, whichever side it arrives from', () => {
+    const a = mergeMarks(
+      new Map<number, RowMark>([[1, 'calls']]),
+      new Map<number, RowMark>([[1, 'callers']])
+    )
+    const b = mergeMarks(
+      new Map<number, RowMark>([[1, 'callers']]),
+      new Map<number, RowMark>([[1, 'calls']])
+    )
+    assert.equal(a.get(1), 'both')
+    assert.equal(b.get(1), 'both')
+  })
+
+  test('neither argument is touched', () => {
+    const base = new Map<number, RowMark>([[1, 'near']])
+    const extra = new Map<number, RowMark>([[1, 'calls'], [2, 'hover']])
+    const merged = mergeMarks(base, extra)
+    assert.equal(base.get(1), 'near')
+    assert.equal(extra.size, 2)
+    assert.equal(merged.get(1), 'calls')
+    assert.equal(merged.get(2), 'hover')
+  })
+})
+
+describe('groupMarks', () => {
+  test('a box with nothing marked is not a key at all', () => {
+    const layout = layoutGraph(threeFiles())
+    const first = [...layout.anchors.keys()][0]
+    const grouped = groupMarks(layout.anchors, new Map<number, RowMark>([[first, 'calls']]))
+    assert.equal(grouped.size, 1)
+    assert.equal(grouped.get(0)?.get(first), 'calls')
+    assert.equal(grouped.get(1), undefined)
+    assert.equal(grouped.get(2), undefined)
+    // An id nobody placed is skipped rather than inventing a box for it.
+    const stray = groupMarks(layout.anchors, new Map<number, RowMark>([[first + 90000, 'near']]))
+    assert.equal(stray.size, 0)
+  })
+
+  test('rows fold under the box that holds them', () => {
+    const files = threeFiles()
+    const layout = layoutGraph(files)
+    const marks = new Map<number, RowMark>()
+    for (const file of files) marks.set(file.functions[0].id, 'near')
+    const grouped = groupMarks(layout.anchors, marks)
+    assert.equal(grouped.size, 3)
+    for (const [boxIndex, rows] of grouped) {
+      assert.equal(rows.size, 1)
+      assert.ok(boxIndex >= 0 && boxIndex < layout.boxes.length)
+    }
+  })
+})
+
+describe('at the size this repository actually is', () => {
+  test('1435 functions, 6000 edges: pointing at the busiest one still answers', () => {
+    const files = bigRepo(105, 1435)
+    const layout = layoutGraph(files)
+    assert.equal(layout.boxes.length, 105)
+
+    const ids = flattenFunctions(files).map((f) => f.id)
+    const hub = ids[0]
+    const edges: GraphEdge[] = []
+    for (let i = 1; i <= 150; i++) edges.push({ from: ids[i], to: hub })
+    for (let i = 0; i < 6000; i++) {
+      edges.push({ from: ids[i % ids.length], to: ids[(i * 7 + 3) % ids.length] })
+    }
+
+    const adj = buildAdjacency(edges)
+    const marks = neighbourMarks(adj, hub)
+    assert.ok(marks.size > 1)
+    assert.equal(marks.get(hub), 'hover')
+
+    const grouped = groupMarks(layout.anchors, marks)
+    assert.ok(grouped.size > 0)
+    // Only the boxes that hold a marked row are keys — that is the contract
+    // `FileBox`'s memo relies on to leave the other hundred alone.
+    assert.ok(grouped.size <= layout.boxes.length)
+    let counted = 0
+    for (const [, rows] of grouped) counted += rows.size
+    assert.equal(counted, marks.size)
   })
 })
 

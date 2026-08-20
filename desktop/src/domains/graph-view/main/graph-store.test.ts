@@ -56,8 +56,8 @@ CREATE TABLE tags (func_id INTEGER, tag TEXT, value TEXT, core INTEGER, lineno I
  * A repository with a graph in it, built by hand at schema 1.
  *
  * Contents: two parsed files and one that failed to parse, four functions (one
- * without a spec, one a test), one resolved call, one ambiguous call, and one
- * call that resolves to somebody else entirely.
+ * without a spec, one a test), one call within a file, two across one, one
+ * ambiguous call, and one call that resolves to an id that is not there.
  */
 function repoWithGraph(schema = '1'): string {
   const root = tempRoot()
@@ -94,7 +94,9 @@ function repoWithGraph(schema = '1'): string {
       (1, 1, 'say', 'say', 12, 2),
       (2, 3, 'run_pipeline', 'pipeline.run_pipeline', 8, 1),
       (3, 4, 'run_pipeline', 'run_pipeline', 4, NULL),
-      (4, 2, 'run_pipeline', 'other.run_pipeline', 101, 999);
+      (4, 2, 'run_pipeline', 'other.run_pipeline', 101, 999),
+      (5, 2, 'main', 'main', 102, 3),
+      (6, 2, 'main', 'cli.main', 103, 3);
 
     INSERT INTO tags (func_id, tag, value, core, lineno) VALUES
       (1, 'param', 'args  the parsed arguments', 1, 11),
@@ -167,6 +169,43 @@ describe('readGraphIndex', { skip: !available }, () => {
     assert.equal(index.ok, false)
     assert.equal(index.problem, 'schema')
     assert.match(index.detail ?? '', /schema 2/)
+  })
+
+  test('file links are counted per pair, heaviest first', () => {
+    const index = readGraphIndex(repoWithGraph())
+    // say -> main twice, main -> run_pipeline once. run_pipeline -> say is
+    // inside one file and so is not a link between two; the ambiguous call and
+    // the one aimed at a missing id are not links at all.
+    assert.deepEqual(index.fileEdges, [
+      { from: 'aidev/pipeline.py', to: 'aidev/cli.py', weight: 2 },
+      { from: 'aidev/cli.py', to: 'aidev/pipeline.py', weight: 1 }
+    ])
+  })
+
+  test('the function edges are the resolved calls, each pair once', () => {
+    const index = readGraphIndex(repoWithGraph())
+    const pairs = index.edges.map((e) => `${e.from}->${e.to}`).sort()
+    // (2,3) is written twice in `calls` and arrives once. 999 is nobody, and
+    // the unresolved call points at nothing to draw.
+    assert.deepEqual(pairs, ['1->2', '2->3', '3->1'])
+  })
+
+  test('a graph that could not be read still answers with empty edge lists', () => {
+    const missing = readGraphIndex(tempRoot())
+    assert.deepEqual(missing.fileEdges, [])
+    assert.deepEqual(missing.edges, [])
+
+    const root = tempRoot()
+    const paths = graphPaths(root)
+    mkdirSync(paths.dir, { recursive: true })
+    writeFileSync(paths.db, 'this is not a database', 'utf8')
+    const broken = readGraphIndex(root)
+    assert.deepEqual(broken.fileEdges, [])
+    assert.deepEqual(broken.edges, [])
+
+    const wrong = readGraphIndex(repoWithGraph('2'))
+    assert.deepEqual(wrong.fileEdges, [])
+    assert.deepEqual(wrong.edges, [])
   })
 })
 

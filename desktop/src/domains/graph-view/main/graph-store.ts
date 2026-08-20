@@ -22,6 +22,8 @@ import { join } from 'node:path'
 import type {
   GraphCallRow,
   GraphCallerRow,
+  GraphEdge,
+  GraphFileEdge,
   GraphFileGroup,
   GraphFunction,
   GraphIndexResult,
@@ -72,16 +74,27 @@ export function graphPaths(repoRoot: string): { dir: string; db: string; dirtyMa
 /**
  * The whole index: meta, one group per parsed file, every function in it.
  *
+ * The two edge lists ride along on purpose. This is read once per mount and
+ * once per finished build, so aggregating here is the "compute it once" the
+ * requirement asks for: the canvas never scans the graph to draw a frame, and
+ * `GROUP BY` in SQLite beats counting 8669 rows in the renderer either way.
+ *
  * @param repoRoot  the repository or worktree the app has open
  * @flow  no file -> no-graph ; open fails -> unreadable/no-sqlite ; wrong
  *        schema -> schema (the screen offers Rebuild) ; else read meta, files
- *        and functions, group the functions under their file, and count spec
- *        coverage over non-test functions
+ *        and functions, group the functions under their file, count spec
+ *        coverage over non-test functions, and aggregate the call edges
  * 주요 내부 변수: byPath(파일별 함수 묶음), meta(meta 테이블 그대로)
  */
 export function readGraphIndex(repoRoot: string): GraphIndexResult {
   const paths = graphPaths(repoRoot)
-  const empty = { dbPath: paths.db, meta: null, files: [] as GraphFileGroup[] }
+  const empty = {
+    dbPath: paths.db,
+    meta: null,
+    files: [] as GraphFileGroup[],
+    fileEdges: [] as GraphFileEdge[],
+    edges: [] as GraphEdge[]
+  }
 
   if (!existsSync(paths.db)) {
     return { ok: false, problem: 'no-graph', detail: 'no graph.db yet', ...empty }
@@ -144,6 +157,33 @@ export function readGraphIndex(repoRoot: string): GraphIndexResult {
     }
     files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
+    // `JOIN functions dst` is the filter that matters: it drops both the
+    // unresolved calls (resolved_id IS NULL) and the ones pointing at an id
+    // that no longer exists, so the screen only ever hears about real nodes.
+    const fileEdges: GraphFileEdge[] = opened.db
+      .prepare(
+        `SELECT src.path AS from_path, dst.path AS to_path, COUNT(*) AS weight
+           FROM calls c
+           JOIN functions src ON src.id = c.caller_id
+           JOIN functions dst ON dst.id = c.resolved_id
+          WHERE src.path <> dst.path
+          GROUP BY src.path, dst.path
+          ORDER BY weight DESC, from_path, to_path`
+      )
+      .all()
+      .map((row) => ({ from: text(row.from_path), to: text(row.to_path), weight: int(row.weight) }))
+
+    const edges: GraphEdge[] = opened.db
+      .prepare(
+        `SELECT DISTINCT c.caller_id AS from_id, c.resolved_id AS to_id
+           FROM calls c
+           JOIN functions src ON src.id = c.caller_id
+           JOIN functions dst ON dst.id = c.resolved_id
+          WHERE c.caller_id <> c.resolved_id`
+      )
+      .all()
+      .map((row) => ({ from: int(row.from_id), to: int(row.to_id) }))
+
     return {
       ok: true,
       dbPath: paths.db,
@@ -162,7 +202,9 @@ export function readGraphIndex(repoRoot: string): GraphIndexResult {
         specCovered,
         specTotal
       } satisfies GraphMeta,
-      files
+      files,
+      fileEdges,
+      edges
     }
   } catch (err) {
     return { ok: false, problem: 'unreadable', detail: String(err), ...empty }
