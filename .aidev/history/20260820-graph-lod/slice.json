@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-lod",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260820-graph-lod",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "4dad8ad770aec755deedfe370553734f2c79132b",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 26,
+    "test_files": 4,
+    "budget": 120,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-180435-graph-lod-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-20T18:04:29+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-180435-graph-lod-plan",
+      "status": "completed",
+      "turns": 30,
+      "tokens": {
+        "input": 40,
+        "cache_creation": 117048,
+        "cache_read": 1753914,
+        "output": 40764,
+        "billed_input": 1871002,
+        "peak_context": 131517
+      },
+      "cost_usd": 3.066737
+    }
+  ],
+  "updated_at": "2026-08-20T18:14:45+09:00"
 }
