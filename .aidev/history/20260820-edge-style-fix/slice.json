@@ -1,0 +1,118 @@
+{
+  "slice_id": "20260820-edge-style-fix",
+  "status": "running:implement",
+  "branch": "slice/20260820-edge-style-fix",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "88d7108a7e64a6cb0fe95df7c5ca02ef8e2866bf",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 25,
+    "test_files": 6,
+    "budget": 60,
+    "warn": true
+  },
+  "amends": null,
+  "repairs": [
+    {
+      "n": 1,
+      "grade": "large",
+      "at": "2026-08-20T21:13:28+09:00",
+      "failed": 0,
+      "spec_violations": 0,
+      "diagnosis": true
+    }
+  ],
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260820-202710-edge-style-fix-plan",
+      "attempts": 1,
+      "commit": "18c38ee8a7b0f7a0b5e562414dbfd31c2ff78f8f"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260820-211329-edge-style-fix-implement-2",
+      "attempts": 2,
+      "commit": "cc59b1e6f7247f4eb534be35d3ed76284b4afa6e"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-202710-edge-style-fix-plan",
+      "status": "completed",
+      "turns": 41,
+      "tokens": {
+        "input": 48,
+        "cache_creation": 125533,
+        "cache_read": 2201778,
+        "output": 48376,
+        "billed_input": 2327359,
+        "peak_context": 140001
+      },
+      "cost_usd": 3.565859
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-210155-edge-style-fix-implement",
+      "status": "completed",
+      "turns": 67,
+      "tokens": {
+        "input": 704,
+        "cache_creation": 87745,
+        "cache_read": 4107544,
+        "output": 36729,
+        "billed_input": 4195993,
+        "peak_context": 108631
+      },
+      "cost_usd": 3.8529669999999996
+    },
+    {
+      "stage": "diagnose",
+      "attempt": 1,
+      "run_id": "20260820-211058-edge-style-fix-diagnose",
+      "status": "completed",
+      "turns": 28,
+      "tokens": {
+        "input": 36,
+        "cache_creation": 50233,
+        "cache_read": 908105,
+        "output": 9571,
+        "billed_input": 958374,
+        "peak_context": 64702
+      },
+      "cost_usd": 1.1958374999999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260820-211329-edge-style-fix-implement-2",
+      "status": "completed",
+      "turns": 26,
+      "tokens": {
+        "input": 644,
+        "cache_creation": 50685,
+        "cache_read": 1371035,
+        "output": 8298,
+        "billed_input": 1422364,
+        "peak_context": 71571
+      },
+      "cost_usd": 1.4030375000000002
+    }
+  ],
+  "updated_at": "2026-08-20T21:35:14+09:00"
+}
