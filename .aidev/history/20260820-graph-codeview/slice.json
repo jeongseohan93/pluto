@@ -1,0 +1,118 @@
+{
+  "slice_id": "20260820-graph-codeview",
+  "status": "running:implement",
+  "branch": "slice/20260820-graph-codeview",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "938c101d3aa49734de33a9fcb40af3b6d2529b8a",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 44,
+    "test_files": 7,
+    "budget": 120,
+    "warn": true
+  },
+  "amends": null,
+  "repairs": [
+    {
+      "n": 1,
+      "grade": "large",
+      "at": "2026-08-20T22:28:57+09:00",
+      "failed": 0,
+      "spec_violations": 0,
+      "diagnosis": true
+    }
+  ],
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260820-215052-graph-codeview-plan",
+      "attempts": 1,
+      "commit": "8380dcd5f58bad181d52a602f2e3ff7181d8722e"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260820-222858-graph-codeview-implement-2",
+      "attempts": 2,
+      "commit": "212a7cb11ab826ab506347a2b806c0b2bdb345a9"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-215052-graph-codeview-plan",
+      "status": "completed",
+      "turns": 50,
+      "tokens": {
+        "input": 320,
+        "cache_creation": 121230,
+        "cache_read": 2117345,
+        "output": 41824,
+        "billed_input": 2238895,
+        "peak_context": 135699
+      },
+      "cost_usd": 3.3181724999999997
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-221149-graph-codeview-implement",
+      "status": "completed",
+      "turns": 93,
+      "tokens": {
+        "input": 1783,
+        "cache_creation": 142450,
+        "cache_read": 8192630,
+        "output": 56572,
+        "billed_input": 8336863,
+        "peak_context": 163336
+      },
+      "cost_usd": 6.944029999999999
+    },
+    {
+      "stage": "diagnose",
+      "attempt": 1,
+      "run_id": "20260820-222710-graph-codeview-diagnose",
+      "status": "completed",
+      "turns": 15,
+      "tokens": {
+        "input": 15,
+        "cache_creation": 42686,
+        "cache_read": 342691,
+        "output": 7170,
+        "billed_input": 385392,
+        "peak_context": 57155
+      },
+      "cost_usd": 0.7775305000000001
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260820-222858-graph-codeview-implement-2",
+      "status": "completed",
+      "turns": 58,
+      "tokens": {
+        "input": 96,
+        "cache_creation": 78649,
+        "cache_read": 4054325,
+        "output": 18314,
+        "billed_input": 4133070,
+        "peak_context": 99535
+      },
+      "cost_usd": 3.2719825000000005
+    }
+  ],
+  "updated_at": "2026-08-20T22:47:42+09:00"
+}

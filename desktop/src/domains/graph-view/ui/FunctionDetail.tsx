@@ -1,4 +1,5 @@
 import type { JSX } from 'react'
+import type { CodeTarget } from '@domains/code-view/types'
 import type { GraphNodeDetail } from '@domains/graph-view/types'
 
 /**
@@ -10,19 +11,28 @@ import type { GraphNodeDetail } from '@domains/graph-view/types'
  * can tell a complete spec from a partial one at a glance.
  *
  * Callers and calls are buttons: the panel is also the way around the graph.
+ * v0.2.7 makes each of them two moves at once — the selection follows the row,
+ * and so does the code viewer's aim. They are the same click because they are
+ * the same intent: go and look at that.
  *
- * @param detail    the loaded node, or null while it loads
- * @param loading   is a fetch in flight?
- * @param onSelect  move to another node
+ * @param detail      the loaded node, or null while it loads
+ * @param loading     is a fetch in flight?
+ * @param onSelect    move to another node
+ * @param onReveal    aim the code viewer at a coordinate, without opening it
+ * @param onOpenCode  open the code viewer there — the [코드 보기] button
  */
 export function FunctionDetail({
   detail,
   loading,
-  onSelect
+  onSelect,
+  onReveal,
+  onOpenCode
 }: {
   detail: GraphNodeDetail | null
   loading: boolean
   onSelect: (id: number) => void
+  onReveal: (target: CodeTarget) => void
+  onOpenCode: (target: CodeTarget) => void
 }): JSX.Element {
   if (!detail) {
     return (
@@ -44,11 +54,28 @@ export function FunctionDetail({
         <p className="truncate font-mono text-tiny text-fg" title={fn.qualname}>
           {fn.qualname}
         </p>
-        <p className="truncate font-mono text-micro text-fg-mute" title={fn.path}>
-          {fn.path}:{fn.lineno}
-          {fn.endLineno > fn.lineno ? `-${fn.endLineno}` : ''} · {fn.kind || fn.lang}
-          {fn.isTest ? ' · test' : ''}
-        </p>
+        <div className="flex items-center gap-2">
+          <p className="min-w-0 flex-1 truncate font-mono text-micro text-fg-mute" title={fn.path}>
+            {fn.path}:{fn.lineno}
+            {fn.endLineno > fn.lineno ? `-${fn.endLineno}` : ''} · {fn.kind || fn.lang}
+            {fn.isTest ? ' · test' : ''}
+          </p>
+          <button
+            type="button"
+            onClick={() =>
+              onOpenCode({
+                path: fn.path,
+                line: fn.lineno,
+                endLine: fn.endLineno || fn.lineno,
+                label: fn.qualname
+              })
+            }
+            title={`Open ${fn.path}:${fn.lineno}`}
+            className="shrink-0 rounded-sm border border-line px-1.5 py-0.5 text-micro text-fg-dim hover:bg-hover hover:text-fg"
+          >
+            코드 보기
+          </button>
+        </div>
       </div>
 
       <div className="px-2.5 py-2">
@@ -102,7 +129,21 @@ export function FunctionDetail({
               <li key={`${call.callLine}-${call.callee}-${i}`}>
                 <Row
                   enabled={call.targetId !== null}
-                  onClick={() => call.targetId !== null && onSelect(call.targetId)}
+                  onClick={() => {
+                    if (call.targetId === null) return
+                    onSelect(call.targetId)
+                    // The destination of a call is where the callee is
+                    // *defined* — that is the coordinate the row prints.
+                    if (call.targetPath !== null) {
+                      const line = call.targetLine ?? 1
+                      onReveal({
+                        path: call.targetPath,
+                        line,
+                        endLine: line,
+                        label: call.targetQualname ?? call.callee
+                      })
+                    }
+                  }}
                   title={call.raw || call.callee}
                   name={call.callee}
                   where={
@@ -129,7 +170,19 @@ export function FunctionDetail({
               <li key={`${caller.callerId}-${caller.callLine}-${i}`}>
                 <Row
                   enabled
-                  onClick={() => onSelect(caller.callerId)}
+                  onClick={() => {
+                    onSelect(caller.callerId)
+                    // The call *site*, not the caller's own first line: the row
+                    // shows `path:callLine`, so that is where the click lands.
+                    // An unresolved row moves too — the engine failed to pick a
+                    // target, which does not make the call site less real.
+                    onReveal({
+                      path: caller.path,
+                      line: caller.callLine,
+                      endLine: caller.callLine,
+                      label: caller.caller
+                    })
+                  }}
                   title={caller.caller}
                   name={caller.caller.split('.').pop() ?? caller.caller}
                   where={`${caller.path}:${caller.callLine}`}

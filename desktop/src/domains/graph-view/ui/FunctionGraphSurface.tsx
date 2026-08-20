@@ -66,6 +66,8 @@ import {
   type Offsets,
   type RowMark
 } from '@domains/graph-view/layout'
+import type { CodeTarget } from '@domains/code-view/types'
+import { CodeViewer } from '@domains/code-view/ui/CodeViewer'
 import { FunctionDetail } from '@domains/graph-view/ui/FunctionDetail'
 import { Minimap } from '@domains/graph-view/ui/Minimap'
 import { Icon } from '@renderer/components/Icon'
@@ -187,11 +189,13 @@ function takesSpace(target: EventTarget | null): boolean {
  * @param onZoomChange  change the scale — how a jump to one function brings the
  *                      level of detail it needs along with it
  * @flow  no index -> a reading state ; index not ok -> the reason and a way out
- *        -> otherwise the canvas, plus the detail panel for the selection,
- *        which folds away and comes back by itself when a row is picked
+ *        -> otherwise the canvas, plus the code viewer when a row was
+ *        double-clicked, plus the detail panel for the selection, which folds
+ *        away and comes back by itself when a row is picked
  * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
  * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그),
- * pan(진행 중인 팬), spaceHeld(스페이스 홀드 = 강제 팬), lod(이 줌이 그리는 레벨)
+ * pan(진행 중인 팬), spaceHeld(스페이스 홀드 = 강제 팬), lod(이 줌이 그리는 레벨),
+ * codeTarget/codeOpen(코드 뷰어의 좌표와 표시 여부)
  */
 export function FunctionGraphSurface({
   index,
@@ -214,6 +218,11 @@ export function FunctionGraphSurface({
 }): JSX.Element {
   const [detail, setDetail] = useState<GraphNodeDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  /** Where the code viewer is aimed, and whether it is on screen. Two states,
+   *  because a caller row moves the aim without summoning a panel nobody asked
+   *  for, and a double-click does both. */
+  const [codeTarget, setCodeTarget] = useState<CodeTarget | null>(null)
+  const [codeOpen, setCodeOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [hover, setHover] = useState<Hover>(NO_HOVER)
   const [offsets, setOffsets] = useState<Offsets>(NO_OFFSETS)
@@ -585,6 +594,54 @@ export function FunctionGraphSurface({
   )
 
   /**
+   * Move the code viewer's aim, and nothing else.
+   *
+   * A caller row is a coordinate, not a request for a panel: if the viewer is
+   * open it travels there, and if it is not, nothing pops up. `onOpenCode` and
+   * the double-click are the two things that actually summon it.
+   *
+   * @param next  where to look
+   */
+  const reveal = useCallback((next: CodeTarget): void => {
+    setCodeTarget(next)
+  }, [])
+
+  /**
+   * Summon the viewer at a coordinate — the node panel's [코드 보기].
+   *
+   * @param next  where to look
+   */
+  const openCode = useCallback((next: CodeTarget): void => {
+    setCodeTarget(next)
+    setCodeOpen(true)
+  }, [])
+
+  /**
+   * A row was double-clicked: select it *and* open its source.
+   *
+   * `useCallback` is not tidiness here. `FileBox` is memoised because 105 boxes
+   * and 1435 rows are reconciled otherwise, and a new function identity on
+   * every render would undo that on its own.
+   *
+   * @param fn  the function whose row was double-clicked
+   */
+  const openRow = useCallback(
+    (fn: GraphFunction): void => {
+      // A double-click is also a selection — the edges and the marks should
+      // land on the row the reader just went to.
+      onSelect(fn.id)
+      setCodeTarget({
+        path: fn.path,
+        line: fn.lineno,
+        endLine: fn.endLineno || fn.lineno,
+        label: fn.qualname
+      })
+      setCodeOpen(true)
+    },
+    [onSelect]
+  )
+
+  /**
    * The far view's way in: a file box is clicked, and the level that shows its
    * functions arrives with that file in the middle of it.
    *
@@ -757,10 +814,12 @@ export function FunctionGraphSurface({
   }, [])
 
   /**
-   * A drag that ends on a row must not also select it.
+   * A drag that ends on a row must not also select it — nor, since v0.2.7,
+   * open the code viewer on it: a box carried across the canvas and released
+   * emits a dblclick of its own.
    *
-   * @param event  the click that follows the pointer being released
-   * @flow  the capture phase is early enough to reach the row's own onClick
+   * @param event  the click or double-click that follows the pointer's release
+   * @flow  the capture phase is early enough to reach the row's own handler
    */
   const swallowClick = useCallback((event: ReactMouseEvent<SVGGElement>): void => {
     if (dragged.current) event.stopPropagation()
@@ -1010,6 +1069,7 @@ export function FunctionGraphSurface({
                     onPointerUp={endDrag}
                     onPointerCancel={endDrag}
                     onClickCapture={swallowClick}
+                    onDoubleClickCapture={swallowClick}
                     onMouseOver={(event) => enter(event.target, box.path)}
                     onMouseLeave={leave}
                   >
@@ -1021,6 +1081,7 @@ export function FunctionGraphSurface({
                       marks={marks.get(i) ?? NO_MARKS}
                       hot={hotBoxes.has(i)}
                       onSelect={pickRow}
+                      onOpenRow={openRow}
                       onPickFile={lod === 'file' ? pickFile : undefined}
                     />
                   </g>
@@ -1047,6 +1108,15 @@ export function FunctionGraphSurface({
           />
         </div>
 
+        {/* The summoned editor, between the canvas and the node panel. There is
+            no folded strip for it: [코드 보기] is the way back, and a permanent
+            vertical bar would only narrow the canvas for nothing. */}
+        {codeOpen ? (
+          <div className="flex w-[34rem] min-w-0 shrink-0 flex-col border-l border-line bg-panel">
+            <CodeViewer target={codeTarget} onClose={() => setCodeOpen(false)} />
+          </div>
+        ) : null}
+
         {detailOpen ? (
           <div className="flex w-80 shrink-0 flex-col border-l border-line bg-panel">
             <div className="flex h-7 shrink-0 items-center gap-1.5 border-b border-line px-2.5">
@@ -1063,7 +1133,13 @@ export function FunctionGraphSurface({
               <span className="panel-label truncate">Node</span>
             </div>
             <div className="min-h-0 flex-1">
-              <FunctionDetail detail={detail} loading={detailLoading} onSelect={pick} />
+              <FunctionDetail
+                detail={detail}
+                loading={detailLoading}
+                onSelect={pick}
+                onReveal={reveal}
+                onOpenCode={openCode}
+              />
             </div>
           </div>
         ) : (
@@ -1272,6 +1348,7 @@ const FileLinks = memo(function FileLinks({
  * @param marks       what each of this box's marked rows is to the pointer
  * @param hot         does the hovered file link to this one?
  * @param onSelect    focus a row, or unfocus it when it is already the one
+ * @param onOpenRow   a row was double-clicked: select it and summon its source
  * @param onPickFile  the far view only: go in to this file
  * @flow  the file level -> a two-line card and nothing else ; otherwise the
  *        header, one row per drawn function each drawn by its mark, and a last
@@ -1286,6 +1363,7 @@ const FileBox = memo(function FileBox({
   marks,
   hot,
   onSelect,
+  onOpenRow,
   onPickFile
 }: {
   box: GraphBox
@@ -1295,6 +1373,7 @@ const FileBox = memo(function FileBox({
   marks: ReadonlyMap<number, RowMark>
   hot: boolean
   onSelect: (id: number) => void
+  onOpenRow: (fn: GraphFunction) => void
   onPickFile?: (path: string) => void
 }): JSX.Element {
   const name = box.path.split('/').pop() ?? box.path
@@ -1381,7 +1460,15 @@ const FileBox = memo(function FileBox({
             key={fn.id}
             data-fn={fn.id}
             transform={`translate(0 ${y})`}
-            onClick={() => onSelect(fn.id)}
+            // A double-click arrives as click, click, dblclick — and `onSelect`
+            // unfocuses a row that is already the selection. Left alone, the
+            // second click would undo the first and the viewer would open with
+            // nothing selected. `detail > 1` is that second click, ignored.
+            onClick={(event) => {
+              if (event.detail > 1) return
+              onSelect(fn.id)
+            }}
+            onDoubleClick={() => onOpenRow(fn)}
             className="cursor-pointer"
           >
             <rect

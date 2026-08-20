@@ -115,4 +115,30 @@
   .rp-separator:active {
     background: var(--color-accent);
   }
+
+  /**
+   * The code viewer's function range. Monaco's decoration and the plain
+   * fallback share these two rules so the range looks the same either way.
+   */
+  .code-range {
+    background: var(--color-accent-soft);
+  }
+
+  .code-range-gutter {
+    border-left: 2px solid var(--color-accent);
+  }
+
+  /**
+   * Monaco measures its own layout and selects its own text; the two preflight
+   * rules above — `user-select: none` on body and `box-sizing: border-box` on
+   * everything — are both wrong inside it. Undone here and nowhere else.
+   */
+  .monaco-editor,
+  .monaco-editor * {
+    box-sizing: content-box;
+  }
+
+  .monaco-editor .view-lines {
+    user-select: text;
+  }
 }
