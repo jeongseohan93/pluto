@@ -28,6 +28,7 @@ import {
   NO_OFFSETS,
   ROW_H,
   ZOOM_DETAIL,
+  anchorScroll,
   boxCenter,
   buildAdjacency,
   callerCounts,
@@ -48,9 +49,12 @@ import {
   neighbourMarks,
   offsetOf,
   offsetsByBox,
+  panScroll,
+  pointAt,
   resolveAnchor,
   viewportOf,
   withOffset,
+  zoomBy,
   type FileLine,
   type GraphBox,
   type GraphLayout,
@@ -99,6 +103,32 @@ interface Dragging {
   base: Offset
 }
 
+/** A pan in progress: the pointer that owns it, and where the view was. */
+interface Panning {
+  pointerId: number
+  /** Where the pointer went down, in client pixels — the slop is measured here. */
+  startX: number
+  startY: number
+  /** The scroll position this pan started from. */
+  left: number
+  top: number
+}
+
+/**
+ * Is this something the space bar already belongs to?
+ *
+ * The search box and every toolbar button want a space of their own, and taking
+ * it from them to arm a pan would be a worse trade than the pan is worth.
+ *
+ * @param target  whatever had the keyboard when the key went down
+ */
+function takesSpace(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  const tag = target.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON'
+}
+
 /**
  * B — the Function DB on screen: files as boxes, functions as rows.
  *
@@ -134,6 +164,16 @@ interface Dragging {
  * are deliberately not stored anywhere: a rebuild or a reload is the way back
  * to the arrangement everybody else sees.
  *
+ * **Panning is scrolling, and zooming is about the cursor.** Dragging bare
+ * canvas moves the scroll container itself rather than a second transform layer,
+ * so the minimap, the scrollbars and `centerScroll` all keep their one shared
+ * idea of where the reader is. A drag that started on a box is that box's, as
+ * before; holding space makes the whole `<svg>` pointer-transparent, which is
+ * both the forced pan and the cursor in one property. The wheel changes the
+ * scale instead of the scroll, keeping the point under the pointer where it is —
+ * except across a level change, where the placement itself moves and the box
+ * under the pointer is centred instead.
+ *
  * @param index      the loaded index, or null while it loads
  * @param loading    is a read in flight?
  * @param selected   the focused function id, or null for the whole view
@@ -148,7 +188,7 @@ interface Dragging {
  *        which folds away and comes back by itself when a row is picked
  * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
  * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그),
- * lod(이 줌이 그리는 레벨)
+ * pan(진행 중인 팬), spaceHeld(스페이스 홀드 = 강제 팬), lod(이 줌이 그리는 레벨)
  */
 export function FunctionGraphSurface({
   index,
@@ -176,11 +216,18 @@ export function FunctionGraphSurface({
   const [offsets, setOffsets] = useState<Offsets>(NO_OFFSETS)
   const [detailOpen, setDetailOpen] = useState(true)
   const [mapOpen, setMapOpen] = useState(true)
+  // These two are state and not refs because the cursor and the svg's
+  // pointer-events are drawn from them. Each flips once per pan, never per
+  // frame: the pan itself moves `scrollLeft` and re-renders nothing at all.
+  const [panning, setPanning] = useState(false)
+  const [spaceHeld, setSpaceHeld] = useState(false)
   const canvas = useRef<HTMLDivElement>(null)
 
   // The drag itself is a ref, not state: a pointer move already re-renders
   // through `offsets`, and there is nothing to gain from a second one.
   const drag = useRef<Dragging | null>(null)
+  /** The pan in progress, for the same reason — and so a hover can tell. */
+  const pan = useRef<Panning | null>(null)
   /** Did the pointer sequence just ending actually move? A click reads this. */
   const dragged = useRef(false)
   const offsetsRef = useRef(offsets)
@@ -192,6 +239,11 @@ export function FunctionGraphSurface({
   const view = useRef<{ zoom: number; layout: GraphLayout } | null>(null)
   /** A file to land on at the next placement — the far view's way in. */
   const pendingPath = useRef<string | null>(null)
+  /** A point to keep still at the next placement, and where to keep it — the
+   *  wheel's anchor, and `pendingPath`'s sibling for a zoom inside one level. */
+  const pendingHold = useRef<{ point: { x: number; y: number }; at: { x: number; y: number } } | null>(
+    null
+  )
 
   const files = index?.ok ? index.files : NO_FILES
   // A string, so every zoom inside one band is the same dependency and the
@@ -291,6 +343,22 @@ export function FunctionGraphSurface({
     view.current = { zoom, layout }
     if (!node || !was || (was.zoom === zoom && was.layout === layout)) return
 
+    // The wheel already knows what it wants kept still and where, so it says so
+    // rather than being re-derived from a middle it was never aiming at.
+    const hold = pendingHold.current
+    pendingHold.current = null
+    if (hold) {
+      const to = anchorScroll(
+        hold.point,
+        hold.at,
+        zoom,
+        { width: node.clientWidth, height: node.clientHeight },
+        sizeRef.current
+      )
+      node.scrollTo({ left: to.left, top: to.top })
+      return
+    }
+
     const want = pendingPath.current
     pendingPath.current = null
     const port = viewportOf(
@@ -346,6 +414,72 @@ export function FunctionGraphSurface({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onSelect])
+
+  // Space held is "pan even over a box", the convention every canvas editor
+  // shares. Kept apart from the Escape listener above because it is a different
+  // question with a different guard list, and folding them would mean one
+  // handler that has to ask which key it is twice.
+  useEffect(() => {
+    const down = (event: KeyboardEvent): void => {
+      // `code`, not `key`: the space bar is the space bar on every layout.
+      if (event.code !== 'Space' || event.repeat) return
+      // Arming mid-drag would turn the svg pointer-transparent underneath a live
+      // capture; releasing the box first is cheaper than relying on what each
+      // engine does about that.
+      if (takesSpace(event.target) || drag.current) return
+      // Or the scroll container pages down for as long as the hold lasts.
+      event.preventDefault()
+      setSpaceHeld(true)
+    }
+    const up = (event: KeyboardEvent): void => {
+      if (event.code === 'Space') setSpaceHeld(false)
+    }
+    // Alt-tabbing away never sends the keyup, and a pan left armed forever is a
+    // canvas whose boxes have stopped moving for no reason anyone can see.
+    const off = (): void => setSpaceHeld(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', off)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+      window.removeEventListener('blur', off)
+    }
+  }, [])
+
+  // The wheel is the scale, centred on the pointer — with a pan on bare canvas
+  // there is another way to move, and there was no other way to zoom without
+  // reaching for the toolbar. A *native* listener with `passive: false`: React
+  // registers wheel passively at the root, so `preventDefault` inside an
+  // `onWheel` prop is a silent no-op and the canvas would scroll as well as
+  // zoom. Everything it reads is a ref that render keeps current, so it is
+  // subscribed once instead of re-bound on every notch.
+  const graphed = index?.ok === true
+  useEffect(() => {
+    const node = canvas.current
+    // No way to change the scale -> leave the wheel to its ordinary scrolling.
+    if (!node || !graphed || !onZoomChange) return
+    const onWheel = (event: WheelEvent): void => {
+      // Also at the ends of the range: otherwise the canvas scrolls at exactly
+      // the moment the zoom has stopped answering.
+      event.preventDefault()
+      const from = zoomRef.current
+      const next = zoomBy(from, event.deltaY, event.deltaMode)
+      if (next === from) return
+      const rect = node.getBoundingClientRect()
+      const at = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+      const point = pointAt({ left: node.scrollLeft, top: node.scrollTop }, at, from)
+      // Keeping a point still is only meaningful while the placement stays put.
+      // Across a level change every box moves, so the box under the pointer
+      // becomes the box in the middle instead — the same hand-over `pickFile`
+      // uses on its way in from the far view.
+      if (lodFor(next) === lodFor(from)) pendingHold.current = { point, at }
+      else pendingPath.current = nearestBoxPath(layoutRef.current, point)
+      onZoomChange(next)
+    }
+    node.addEventListener('wheel', onWheel, { passive: false })
+    return () => node.removeEventListener('wheel', onWheel)
+  }, [graphed, onZoomChange])
 
   const edges = useMemo(
     () => edgesFor(detail, layout, byId, byBox, lod),
@@ -537,6 +671,89 @@ export function FunctionGraphSurface({
   }, [])
 
   /**
+   * Take hold of the canvas itself. The hit test is one question — did this
+   * pointerdown come from inside a box? — asked of the DOM rather than of
+   * coordinates, so there is no second opinion about where the boxes are.
+   *
+   * Nothing is claimed here: no capture is taken until the pan is known to be
+   * one. A pointer that turns out to be a click has therefore been touched by
+   * none of this, and reaches the row or the background rect exactly as it did
+   * before there was a pan at all.
+   *
+   * @param event  the pointerdown on the scroll container
+   * @flow  anything but the primary button, a drag already under way, or a
+   *        pointer that started on a box is left alone ; while space is held the
+   *        svg is pointer-transparent, so nothing can ever be under it
+   */
+  const startPan = useCallback((event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (event.button !== 0 || pan.current || drag.current) return
+    if (event.target instanceof Element && event.target.closest('[data-box]')) return
+    // Otherwise the browser starts its own text selection across the canvas.
+    event.preventDefault()
+    // The svg's own capture-phase reset never fired if space is held.
+    dragged.current = false
+    pan.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      left: event.currentTarget.scrollLeft,
+      top: event.currentTarget.scrollTop
+    }
+  }, [])
+
+  /**
+   * Move the whole view with the hand.
+   *
+   * The capture is taken here rather than at the pointerdown, so that it lasts
+   * exactly as long as `panning` does. That equivalence is what keeps the svg's
+   * `pointer-events: none` from ever outliving the pan that asked for it — the
+   * browser guarantees a `lostpointercapture` for every capture it grants,
+   * however the pointer ends, and that is one of the three ways out below.
+   *
+   * @param event  a pointermove, captured back to the container once committed
+   * @flow  no pan or another pointer -> nothing ; still inside the slop -> this
+   *        is a click on bare canvas and the selection it clears
+   */
+  const movePan = useCallback((event: ReactPointerEvent<HTMLDivElement>): void => {
+    const at = pan.current
+    if (!at || at.pointerId !== event.pointerId) return
+    const mx = event.clientX - at.startX
+    const my = event.clientY - at.startY
+    if (!dragged.current && !isDrag(mx, my)) return
+    if (!dragged.current) {
+      dragged.current = true
+      event.currentTarget.setPointerCapture(event.pointerId)
+      setPanning(true)
+    }
+    const to = panScroll(at, { dx: mx, dy: my })
+    event.currentTarget.scrollLeft = to.left
+    event.currentTarget.scrollTop = to.top
+  }, [])
+
+  /**
+   * Let go. `dragged` stays set — the click right behind this one reads it.
+   *
+   * Three events arrive here and the first one wins: the pointerup that ends an
+   * ordinary pan, the cancel a touch gesture sends instead, and the lost capture
+   * that is the browser's own last word on a pointer — the one that fires even
+   * when the window never sees the release.
+   *
+   * @param event  whichever of the three ended this pointer
+   * @flow  no pan or another pointer -> nothing, which is also how the second
+   *        and third of the three find that the first has already been here ;
+   *        a capture still held is released, and one already lost is not
+   */
+  const endPan = useCallback((event: ReactPointerEvent<HTMLDivElement>): void => {
+    const at = pan.current
+    if (!at || at.pointerId !== event.pointerId) return
+    pan.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    setPanning(false)
+  }, [])
+
+  /**
    * A drag that ends on a row must not also select it.
    *
    * @param event  the click that follows the pointer being released
@@ -560,12 +777,18 @@ export function FunctionGraphSurface({
     setOffsets(NO_OFFSETS)
   }, [])
 
-  // One listener per box instead of one per row: 1435 row listeners is 1435
-  // closures rebuilt on every render, and the row is in the event anyway.
+  /**
+   * Light up the row under the pointer. One listener per box instead of one per
+   * row: 1435 row listeners is 1435 closures rebuilt on every render, and the
+   * row is in the event anyway.
+   *
+   * @param target  what the pointer is actually over, row or not
+   * @param path    the file whose box this listener belongs to
+   * @flow  a drag or a pan in progress -> nothing, or the marks flicker under a
+   *        moving canvas ; not on a row -> the file alone is hovered
+   */
   const enter = useCallback((target: EventTarget | null, path: string): void => {
-    // Hovering while dragging would set the marks flickering under the box the
-    // pointer is carrying.
-    if (drag.current) return
+    if (drag.current || pan.current) return
     const node = target instanceof Element ? target.closest('[data-fn]') : null
     const raw = node === null ? null : node.getAttribute('data-fn')
     const id = raw === null ? Number.NaN : Number(raw)
@@ -636,12 +859,35 @@ export function FunctionGraphSurface({
         {/* The legend and the minimap sit on a layer that does not scroll, so
             neither of them has to be pinned with a sticky trick. */}
         <div className="relative min-w-0 flex-1">
-          <div ref={canvas} className="h-full w-full overflow-auto bg-app">
+          <div
+            ref={canvas}
+            className={`h-full w-full overflow-auto bg-app ${
+              panning ? 'cursor-grabbing' : spaceHeld ? 'cursor-grab' : ''
+            }`}
+            onPointerDown={startPan}
+            onPointerMove={movePan}
+            onPointerUp={endPan}
+            onPointerCancel={endPan}
+            // The one end-of-pan the window cannot miss. Without it a capture
+            // lost some other way would leave `panning` set, and with it the
+            // whole graph pointer-transparent and unselectable for good.
+            onLostPointerCapture={endPan}
+          >
             <svg
               width={size.width * zoom}
               height={size.height * zoom}
               viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
               className="block select-none"
+              // The whole forced pan, and the whole cursor, in one property:
+              // hit-testing falls through to the container, so `startDrag` can
+              // never fire, no box can ever be found under the pointer, and no
+              // descendant's own cursor can beat the one below.
+              // `pointer-events` is inherited, so this turns off every box and
+              // every row at once — which is why both flags have to be certain
+              // to clear. `spaceHeld` has the keyup and the window blur;
+              // `panning` lasts exactly as long as the container's capture,
+              // whose loss `onLostPointerCapture` always hears.
+              style={{ pointerEvents: panning || spaceHeld ? 'none' : undefined }}
               onPointerDownCapture={clearDragFlag}
             >
               <defs>
@@ -673,11 +919,15 @@ export function FunctionGraphSurface({
                 </marker>
               </defs>
 
-              {/* Clicking bare canvas is the first way back to the whole view. */}
+              {/* Clicking bare canvas is the first way back to the whole view,
+                  and dragging it is the pan — so it says it can be grabbed.
+                  During a pan the svg is transparent and the container's own
+                  `grabbing` is what shows through. */}
               <rect
                 width={Math.max(1, size.width)}
                 height={Math.max(1, size.height)}
                 fill="transparent"
+                className="cursor-grab"
                 onClick={clearSelection}
               />
 
@@ -711,6 +961,9 @@ export function FunctionGraphSurface({
                 return (
                   <g
                     key={box.path}
+                    // What "empty space" means, asked of the DOM: a pointerdown
+                    // that finds this above it is a node's, not the canvas's.
+                    data-box={box.path}
                     transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
                     opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
                     className="cursor-grab"

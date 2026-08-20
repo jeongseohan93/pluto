@@ -26,7 +26,10 @@ import {
   MINIMAP_W,
   NO_OFFSETS,
   ROW_H,
+  ZOOM_MAX,
+  ZOOM_MIN,
   ZOOM_STEPS,
+  anchorScroll,
   boxAnchor,
   boxCenter,
   boxHeight,
@@ -51,11 +54,14 @@ import {
   neighbourMarks,
   offsetOf,
   offsetsByBox,
+  panScroll,
+  pointAt,
   resolveAnchor,
   shiftAnchor,
   viewportOf,
   visibleRows,
   withOffset,
+  zoomBy,
   zoomIn,
   zoomOut,
   type Offset,
@@ -754,6 +760,142 @@ describe('minimapFit', () => {
     const fit = minimapFit({ width: 0, height: 0 })
     assert.deepEqual(fit, { scale: 0, width: 0, height: 0 })
     assert.ok(Number.isFinite(minimapFit({ width: 100, height: 0 }).scale))
+  })
+})
+
+// ---------------------------------------------------- panning and the wheel
+
+describe('panScroll', () => {
+  test('the canvas follows the hand: dragging right shows what is on the left', () => {
+    const at = panScroll({ left: 300, top: 200 }, { dx: 40, dy: 25 })
+    assert.deepEqual(at, { left: 260, top: 175 })
+  })
+
+  test('a pan that has not moved is where it began', () => {
+    assert.deepEqual(panScroll({ left: 300, top: 200 }, { dx: 0, dy: 0 }), { left: 300, top: 200 })
+  })
+
+  test('client pixels on both sides — the zoom is not in this sum', () => {
+    // Whatever the scale, one pixel of hand is one pixel of scroll; it is the
+    // *contents* that are already drawn at the zoom.
+    assert.deepEqual(panScroll({ left: 0, top: 0 }, { dx: -100, dy: -50 }), { left: 100, top: 50 })
+  })
+})
+
+describe('pointAt', () => {
+  test('what is under the pointer is the scroll plus the offset, in user units', () => {
+    assert.deepEqual(pointAt({ left: 200, top: 100 }, { x: 50, y: 20 }, 1), { x: 250, y: 120 })
+  })
+
+  test('half the zoom is twice the distance into the canvas', () => {
+    assert.deepEqual(pointAt({ left: 200, top: 100 }, { x: 50, y: 20 }, 0.5), { x: 500, y: 240 })
+  })
+
+  test('a zoom of zero is read as one rather than dividing by it', () => {
+    assert.deepEqual(pointAt({ left: 10, top: 20 }, { x: 1, y: 2 }, 0), { x: 11, y: 22 })
+  })
+})
+
+describe('anchorScroll', () => {
+  const view = { width: 800, height: 600 }
+  const size = { width: 4000, height: 3000 }
+
+  test('the point asked for lands where it was asked to land', () => {
+    const at = anchorScroll({ x: 1000, y: 900 }, { x: 120, y: 400 }, 1, view, size)
+    assert.equal(at.left + 120, 1000)
+    assert.equal(at.top + 400, 900)
+  })
+
+  test('the top left corner does not scroll to a negative place', () => {
+    assert.deepEqual(anchorScroll({ x: 0, y: 0 }, { x: 700, y: 500 }, 1, view, size), {
+      left: 0,
+      top: 0
+    })
+  })
+
+  test('the far corner does not scroll past what there is', () => {
+    const at = anchorScroll({ x: 99999, y: 99999 }, { x: 10, y: 10 }, 1, view, size)
+    assert.equal(at.left, size.width - view.width)
+    assert.equal(at.top, size.height - view.height)
+  })
+
+  test('a canvas smaller than the window has nowhere to go', () => {
+    const at = anchorScroll({ x: 50, y: 50 }, { x: 0, y: 0 }, 1, view, { width: 100, height: 80 })
+    assert.deepEqual(at, { left: 0, top: 0 })
+  })
+
+  test('centerScroll is this, anchored at the middle', () => {
+    for (const point of [
+      { x: 1000, y: 900 },
+      { x: 0, y: 0 },
+      { x: 99999, y: 99999 }
+    ]) {
+      for (const zoom of [0.4, 1, 1.8]) {
+        assert.deepEqual(
+          centerScroll(point, zoom, view, size),
+          anchorScroll(point, { x: view.width / 2, y: view.height / 2 }, zoom, view, size)
+        )
+      }
+    }
+  })
+
+  test('reading a point and asking for it back is the scroll it came from', () => {
+    // The zoom-about-a-point invariant, away from the clamps: this is what makes
+    // a wheel notch keep what is under the cursor under the cursor.
+    const scroll = { left: 900, top: 700 }
+    const at = { x: 320, y: 240 }
+    const point = pointAt(scroll, at, 1.25)
+    assert.deepEqual(anchorScroll(point, at, 1.25, view, size), scroll)
+  })
+})
+
+describe('zoomBy', () => {
+  test('a notch up zooms in and a notch down zooms out', () => {
+    assert.ok(zoomBy(1, -100) > 1)
+    assert.ok(zoomBy(1, 100) < 1)
+  })
+
+  test('a notch is the same proportion wherever the ladder is standing', () => {
+    const near = zoomBy(1, -100) / 1
+    const far = zoomBy(0.5, -100) / 0.5
+    assert.ok(Math.abs(near - far) < 1e-9, `${near} is not ${far}`)
+  })
+
+  test('a hundred notches either way stay inside the ladder', () => {
+    let up = 1
+    let down = 1
+    for (let i = 0; i < 100; i++) {
+      up = zoomBy(up, -100)
+      down = zoomBy(down, 100)
+    }
+    assert.equal(up, ZOOM_MAX)
+    assert.equal(down, ZOOM_MIN)
+    assert.equal(ZOOM_MIN, ZOOM_STEPS[0])
+    assert.equal(ZOOM_MAX, ZOOM_STEPS[ZOOM_STEPS.length - 1])
+  })
+
+  test('a zoom already off the ladder is brought back onto it', () => {
+    assert.equal(zoomBy(9, 0), ZOOM_MAX)
+    assert.equal(zoomBy(0.01, 0), ZOOM_MIN)
+  })
+
+  test('lines and pages move further than pixels do', () => {
+    assert.ok(zoomBy(1, -3, 1) > zoomBy(1, -3, 0))
+    assert.ok(zoomBy(1, -3, 2) > zoomBy(1, -3, 1))
+  })
+
+  test('a delta that is not a number is the zoom it was', () => {
+    assert.equal(zoomBy(1, Number.NaN), 1)
+    assert.equal(zoomBy(1, Number.POSITIVE_INFINITY), 1)
+  })
+
+  test('the far view is reachable by wheel, in numbers', () => {
+    // Six notches out of 100% crosses LOD_FILE_MAX — the level change is
+    // something the wheel can actually get to, not only the buttons.
+    let zoom = 1
+    for (let i = 0; i < 6; i++) zoom = zoomBy(zoom, 100)
+    assert.ok(zoom <= LOD_FILE_MAX, `${zoom} never got past ${LOD_FILE_MAX}`)
+    assert.equal(lodFor(zoom), 'file')
   })
 })
 

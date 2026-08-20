@@ -1,8 +1,7 @@
----
+﻿---
 approval: plan
-max_turns: implement=120
-setup: npm ci --prefix desktop
-test_commands: npm run typecheck --prefix desktop
+max_turns: implement=60
+test_commands: npx --prefix desktop tsc --noEmit -p desktop
 ---
 # Graph 탭 — 캔버스 팬 (빈 공간 드래그 이동)
 
