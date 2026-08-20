@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260820-graph-lod",
+  "status": "pending",
+  "branch": "slice/20260820-graph-lod",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "4dad8ad770aec755deedfe370553734f2c79132b",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-20T18:04:29+09:00"
+}
