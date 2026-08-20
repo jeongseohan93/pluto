@@ -2,7 +2,7 @@
 approval: plan
 max_turns: implement=120
 setup: npm ci --prefix desktop
-test_commands: npx --prefix desktop tsc --noEmit -p desktop
+test_commands: npm test --prefix desktop
 ---
 # Graph 탭 — 엣지 색·스타일 복구 (회귀 수정)
 
