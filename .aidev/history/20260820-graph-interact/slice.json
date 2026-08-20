@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260820-graph-interact",
+  "status": "pending",
+  "branch": "slice/20260820-graph-interact",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "e45abd20db6169c21af166d1b09ffa13d514b353",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-20T15:34:57+09:00"
+}
