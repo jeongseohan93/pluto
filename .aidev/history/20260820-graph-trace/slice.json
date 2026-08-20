@@ -44,8 +44,8 @@
       "commit": "7a3986841ac17ddb5a97bccee1b43fadb8c75ac8"
     },
     "test": {
-      "status": "pending",
-      "verdict": "fail"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -130,5 +130,5 @@
       "cost_usd": 2.313185
     }
   ],
-  "updated_at": "2026-08-21T00:31:46+09:00"
+  "updated_at": "2026-08-21T00:31:49+09:00"
 }
