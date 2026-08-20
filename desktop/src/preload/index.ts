@@ -55,6 +55,9 @@ const aidev: AidevBridge = {
   // -- v0.2.6 the Function DB, read-only
   getGraphIndex: () => ipcRenderer.invoke(IPC.graphIndex),
   getGraphNode: (id) => ipcRenderer.invoke(IPC.graphNode, id),
+  // v0.2.8's third question of the same DB, not a new capability: a call chain
+  // out of one function. Main clamps the depth and forces the direction.
+  getGraphTrace: (request) => ipcRenderer.invoke(IPC.graphTrace, request),
 
   // -- v0.2.7 one source file, read-only.
   // This is not the `readFile(anyPath)` line 10 rules out. Main resolves the

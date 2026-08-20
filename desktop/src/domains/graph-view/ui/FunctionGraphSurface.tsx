@@ -10,13 +10,19 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent
 } from 'react'
-import type {
-  GraphEdge,
-  GraphFileEdge,
-  GraphFileGroup,
-  GraphFunction,
-  GraphIndexResult,
-  GraphNodeDetail
+import {
+  TRACE_DEPTH_DEFAULT,
+  TRACE_DEPTH_MAX,
+  TRACE_DEPTH_MIN,
+  clampTraceDepth,
+  type GraphEdge,
+  type GraphFileEdge,
+  type GraphFileGroup,
+  type GraphFunction,
+  type GraphIndexResult,
+  type GraphNodeDetail,
+  type GraphTrace,
+  type TraceDirection
 } from '@domains/graph-view/types'
 import {
   EDGE_STYLES,
@@ -28,6 +34,7 @@ import {
   MAX_FILE_EDGES,
   NO_OFFSETS,
   ROW_H,
+  TRACE_BREAK_STYLE,
   ZOOM_DETAIL,
   anchorScroll,
   boxCenter,
@@ -55,6 +62,9 @@ import {
   panScroll,
   pointAt,
   resolveAnchor,
+  traceLines,
+  traceMarks,
+  traceOpacity,
   viewportOf,
   withOffset,
   zoomBy,
@@ -64,7 +74,8 @@ import {
   type Lod,
   type Offset,
   type Offsets,
-  type RowMark
+  type RowMark,
+  type TraceDrawing
 } from '@domains/graph-view/layout'
 import type { CodeTarget } from '@domains/code-view/types'
 import { CodeViewer } from '@domains/code-view/ui/CodeViewer'
@@ -169,6 +180,16 @@ function takesSpace(target: EventTarget | null): boolean {
  * are deliberately not stored anywhere: a rebuild or a reload is the way back
  * to the arrangement everybody else sees.
  *
+ * **Trace is one layer over the selection.** [Trace] follows the picked
+ * function's call chain N rings out — `calls` for what it reaches, `callers` for
+ * who reaches it — and the chain comes from the DB rather than from
+ * `index.edges`, because that list has already dropped every unresolved call and
+ * so could never say where the chain *stops*. Those stops are drawn as short
+ * dashed stubs beside the node they hang on. Nothing about the picture is
+ * replaced while it is on: the chain only changes where `focusMarks` comes from,
+ * so the dimming that was already there follows it, and turning the mode off is
+ * the whole of going back — there is no restore path to keep correct.
+ *
  * **Panning is scrolling, and zooming is about the cursor.** Dragging bare
  * canvas moves the scroll container itself rather than a second transform layer,
  * so the minimap, the scrollbars and `centerScroll` all keep their one shared
@@ -195,7 +216,9 @@ function takesSpace(target: EventTarget | null): boolean {
  * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
  * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그),
  * pan(진행 중인 팬), spaceHeld(스페이스 홀드 = 강제 팬), lod(이 줌이 그리는 레벨),
- * codeTarget/codeOpen(코드 뷰어의 좌표와 표시 여부)
+ * codeTarget/codeOpen(코드 뷰어의 좌표와 표시 여부),
+ * traceOn/traceDir/traceDepth(추적 설정), trace(DB가 답한 사슬 — null이면 이
+ * 모드가 없던 때와 같은 화면)
  */
 export function FunctionGraphSurface({
   index,
@@ -233,6 +256,14 @@ export function FunctionGraphSurface({
   // frame: the pan itself moves `scrollLeft` and re-renders nothing at all.
   const [panning, setPanning] = useState(false)
   const [spaceHeld, setSpaceHeld] = useState(false)
+  // Trace is one layer *over* the selection, never a replacement for it: with
+  // `trace` null the canvas is byte-for-byte what it was before this mode
+  // existed, which is what makes "해제 시 원상복귀" a fact about the code rather
+  // than a restore path somebody has to keep correct.
+  const [traceOn, setTraceOn] = useState(false)
+  const [traceDir, setTraceDir] = useState<TraceDirection>('calls')
+  const [traceDepth, setTraceDepth] = useState(TRACE_DEPTH_DEFAULT)
+  const [trace, setTrace] = useState<GraphTrace | null>(null)
   const canvas = useRef<HTMLDivElement>(null)
 
   // The drag itself is a ref, not state: a pointer move already re-renders
@@ -247,6 +278,12 @@ export function FunctionGraphSurface({
 
   /** The last selection this surface already answered by moving the scale. */
   const jumped = useRef<number | null>(null)
+  /** 이 요청보다 늦게 도착한 응답은 남의 것이다 — 깊이 버튼을 연달아 누를 때
+   *  순서가 뒤바뀐 답이 화면에 남지 않도록. */
+  const traceToken = useRef(0)
+  /** Read by the Escape handler, which must not re-subscribe per toggle. */
+  const traceOnRef = useRef(traceOn)
+  traceOnRef.current = traceOn
   /** The zoom and placement the current scroll position was measured against. */
   const view = useRef<{ zoom: number; layout: GraphLayout } | null>(null)
   /** A file to land on at the next placement — the far view's way in. */
@@ -314,6 +351,27 @@ export function FunctionGraphSurface({
       alive = false
     }
   }, [selected])
+
+  // The chain, asked of the DB rather than walked in memory: `index.edges` has
+  // already dropped every unresolved call, so a chain computed here could not
+  // say where it stops. `index` is a dependency because a rebuild reissues every
+  // `functions.id` (`db.py` replace_file drops and re-inserts) — an old chain's
+  // ids would light up whichever functions inherited them.
+  useEffect(() => {
+    if (!traceOn || selected === null) {
+      setTrace(null)
+      return
+    }
+    const token = ++traceToken.current
+    // The previous chain is left on screen while this one loads: stepping the
+    // depth up a ring should not blink the whole canvas back to nothing.
+    window.aidev
+      .getGraphTrace({ id: selected, direction: traceDir, depth: clampTraceDepth(traceDepth) })
+      .then((next) => {
+        if (token !== traceToken.current) return
+        setTrace(next)
+      })
+  }, [traceOn, selected, traceDir, traceDepth, index])
 
   // A selection nobody can see is a selection nobody made: the panel comes back
   // by itself rather than leaving a picked row with nothing said about it.
@@ -414,13 +472,18 @@ export function FunctionGraphSurface({
     node.scrollTo({ left: to.left, top: to.top, behavior: 'smooth' })
   }, [selected, layout])
 
-  // Escape is the third way back to the whole view. The search box keeps its
-  // own Escape — clearing what you typed comes before clearing the selection.
+  // Escape is the third way back to the whole view, and since v0.2.8 it peels
+  // one layer at a time: the trace first, then the selection. The search box
+  // keeps its own Escape — clearing what you typed comes before either.
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
       const target = event.target as HTMLElement | null
       if (target && target.tagName === 'INPUT') return
+      if (traceOnRef.current) {
+        setTraceOn(false)
+        return
+      }
       onSelect(null)
     }
     window.addEventListener('keydown', onKey)
@@ -493,15 +556,26 @@ export function FunctionGraphSurface({
     return () => node.removeEventListener('wheel', onWheel)
   }, [graphed, onZoomChange])
 
-  const edges = useMemo(
-    () => edgesFor(detail, layout, byId, byBox, lod),
-    [detail, layout, byId, byBox, lod]
+  const traced: TraceDrawing | null = useMemo(
+    () => (trace ? traceLines(trace, layout, byId, byBox, lod) : null),
+    [trace, layout, byId, byBox, lod]
+  )
+
+  // While a trace is up, the selection's own edges are not also drawn: the first
+  // ring already is them, and laying the opposite direction over the chain would
+  // blur what "추적" is showing.
+  const edges = useMemo<DrawnEdge[]>(
+    () => (trace ? [] : edgesFor(detail, layout, byId, byBox, lod)),
+    [trace, detail, layout, byId, byBox, lod]
   )
 
   // What the selection marks: itself, what it calls, what calls it. Read off
   // the drawn edges rather than the adjacency, so an unresolved call site is
-  // marked in exactly the place it is drawn.
+  // marked in exactly the place it is drawn. A trace only changes where this
+  // comes from — the dimming below reads it unchanged and so follows the chain
+  // by itself, which is the whole of "기존 디밍 인프라 재사용".
   const focusMarks = useMemo(() => {
+    if (trace) return traceMarks(trace)
     if (selected === null) return NO_MARKS
     const outs = new Map<number, RowMark>()
     const ins = new Map<number, RowMark>()
@@ -511,7 +585,7 @@ export function FunctionGraphSurface({
     }
     const self = new Map<number, RowMark>([[selected, 'selected']])
     return mergeMarks(mergeMarks(outs, ins), self)
-  }, [selected, edges])
+  }, [trace, selected, edges])
 
   const hoverMarks = useMemo(
     () => (hover.fn === null ? NO_MARKS : neighbourMarks(adjacency, hover.fn)),
@@ -662,6 +736,38 @@ export function FunctionGraphSurface({
   const toggleMap = useCallback((): void => {
     setMapOpen((prev) => !prev)
   }, [])
+
+  /** Follow the chain out of the selection, or stop following it. Takes no
+   *  arguments — turning it off is the whole of "해제", and there is nothing to
+   *  restore because nothing was replaced. */
+  const toggleTrace = useCallback((): void => {
+    setTraceOn((prev) => !prev)
+  }, [])
+
+  /**
+   * How far to follow. The buttons already stop at the ends; the clamp is here
+   * as well so that one function decides the range and not three.
+   *
+   * @param next  the depth the −/+ pair is asking for
+   */
+  const changeDepth = useCallback((next: number): void => {
+    setTraceDepth(clampTraceDepth(next))
+  }, [])
+
+  /** Everything the trace toolbar needs, in one object so `FreshnessBar` keeps
+   *  its one-prop-per-thing shape instead of growing six. */
+  const traceUi = useMemo<TraceUi>(
+    () => ({
+      on: traceOn,
+      direction: traceDir,
+      depth: traceDepth,
+      ready: selected !== null,
+      onToggle: toggleTrace,
+      onDirection: setTraceDir,
+      onDepth: changeDepth
+    }),
+    [traceOn, traceDir, traceDepth, selected, toggleTrace, changeDepth]
+  )
 
   /** A new pointer sequence has begun: whatever the last one was, it is over. */
   const clearDragFlag = useCallback((): void => {
@@ -884,6 +990,7 @@ export function FunctionGraphSurface({
           loading={loading}
           moved={offsets.size}
           onReset={resetOffsets}
+          trace={traceUi}
         />
         <div className="min-h-0 flex-1">
           <EmptyState title={problemTitle(index)} hint={index.detail ?? ''}>
@@ -915,6 +1022,7 @@ export function FunctionGraphSurface({
         loading={loading}
         moved={offsets.size}
         onReset={resetOffsets}
+        trace={traceUi}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -1047,6 +1155,53 @@ export function FunctionGraphSurface({
                 })}
               </g>
 
+              {/* LOD, level two and a half: the traced chain, and the places it
+                  stops. Drawn outside the boxes rather than inside a row, so
+                  `FileBox`'s memo — 105 boxes and 1435 rows — is untouched by
+                  this whole mode. */}
+              {traced && trace ? (
+                <g pointerEvents="none">
+                  {traced.lines.map((line) => {
+                    // The style is the direction's, but the arrow is the call's:
+                    // caller -> callee, whichever way we walked to find it.
+                    const style = edgeStyle(trace.direction === 'callers')
+                    return (
+                      <path
+                        key={line.key}
+                        d={line.d}
+                        fill="none"
+                        stroke={style.stroke}
+                        strokeWidth={1.4}
+                        strokeDasharray={style.dash ?? undefined}
+                        strokeOpacity={traceOpacity(line.depth, trace.depth)}
+                        markerEnd={`url(#${style.marker})`}
+                      />
+                    )
+                  })}
+                  {/* The stubs take their pointer events back for the tooltip.
+                      They carry no `data-box`, so `startPan` still reads them as
+                      bare canvas and a drag begun on one still pans. */}
+                  {traced.stubs.map((stub) => (
+                    <g key={stub.key} pointerEvents="auto">
+                      <path
+                        d={stub.d}
+                        fill="none"
+                        stroke={TRACE_BREAK_STYLE.stroke}
+                        strokeWidth={1.4}
+                        strokeDasharray={TRACE_BREAK_STYLE.dash ?? undefined}
+                      />
+                      <path
+                        d={stub.tick}
+                        fill="none"
+                        stroke={TRACE_BREAK_STYLE.stroke}
+                        strokeWidth={1.4}
+                      />
+                      <title>{stub.label}</title>
+                    </g>
+                  ))}
+                </g>
+              ) : null}
+
               {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
                   one attribute changes, so the rows inside are not re-rendered
                   even once while the box is being carried across the canvas. */}
@@ -1096,6 +1251,7 @@ export function FunctionGraphSurface({
             lod={lod}
             boxes={layout.boxes.length}
             rows={layout.anchors.size}
+            trace={trace && traced ? { trace, drawing: traced } : null}
           />
           <Minimap
             scrollRef={canvas}
@@ -1172,6 +1328,7 @@ export function FunctionGraphSurface({
  * @param loading  a read is in flight
  * @param moved    how many boxes have been dragged out of place
  * @param onReset  put every dragged box back where the layout placed it
+ * @param trace    the trace mode's own controls
  * @flow  meta -> the commit/branch/times line, with dirty and stale called out
  *        ; a box has been dragged -> the way back out of that arrangement
  */
@@ -1185,7 +1342,8 @@ function FreshnessBar({
   busy,
   loading,
   moved,
-  onReset
+  onReset,
+  trace
 }: {
   index: GraphIndexResult
   query: string
@@ -1197,6 +1355,7 @@ function FreshnessBar({
   loading: boolean
   moved: number
   onReset: () => void
+  trace: TraceUi
 }): JSX.Element {
   const meta = index.meta
   return (
@@ -1236,6 +1395,7 @@ function FreshnessBar({
             Reset positions
           </button>
         ) : null}
+        <TraceControls trace={trace} />
         <input
           value={query}
           onChange={(event) => onQuery(event.target.value)}
@@ -1283,6 +1443,157 @@ function FreshnessBar({
         </ul>
       ) : null}
     </div>
+  )
+}
+
+/** The trace mode as the toolbar sees it: three settings and three ways to
+ *  change them. Held as one object so `FreshnessBar` gains one prop, not six. */
+interface TraceUi {
+  on: boolean
+  direction: TraceDirection
+  depth: number
+  /** 노드가 선택되어 있는가 — 없으면 따라갈 뿌리가 없으므로 토글은 비활성이다. */
+  ready: boolean
+  onToggle: () => void
+  onDirection: (direction: TraceDirection) => void
+  onDepth: (depth: number) => void
+}
+
+/**
+ * [Trace], and — only once it is on — the direction and the depth.
+ *
+ * 꺼져 있을 때 버튼 하나만 보이는 것이 설계다: 이 모드를 쓰지 않는 사람의
+ * 툴바가 지금보다 붐비지 않아야 한다.
+ *
+ * @param trace  the mode's settings and the three ways to change them
+ * @flow  뿌리가 없으면 토글은 비활성 ; 켜져 있을 때만 방향 세그먼트와 깊이
+ *        −/+ 가 나타나고, 각 끝에서 해당 버튼이 비활성이 된다
+ */
+function TraceControls({ trace }: { trace: TraceUi }): JSX.Element {
+  return (
+    <div className="flex shrink-0 items-center gap-1 font-mono text-micro">
+      <button
+        type="button"
+        disabled={!trace.ready}
+        onClick={trace.onToggle}
+        aria-pressed={trace.on}
+        title={
+          trace.ready
+            ? '선택한 함수에서 호출 사슬을 따라간다'
+            : '먼저 함수를 하나 고른다'
+        }
+        className={`rounded-sm border px-1.5 py-0.5 disabled:opacity-40 ${
+          trace.on
+            ? 'border-accent text-accent'
+            : 'border-line text-fg-dim hover:bg-hover hover:text-fg'
+        }`}
+      >
+        Trace
+      </button>
+      {trace.on ? (
+        <>
+          {/* 두 칸짜리 세그먼트 — 어느 쪽을 보고 있는지가 언제나 화면에 있다. */}
+          <div className="flex overflow-hidden rounded-sm border border-line" role="group">
+            <SegButton
+              on={trace.direction === 'calls'}
+              onClick={() => trace.onDirection('calls')}
+              label="calls"
+              title="이 함수가 부르는 쪽"
+            />
+            <SegButton
+              on={trace.direction === 'callers'}
+              onClick={() => trace.onDirection('callers')}
+              label="callers"
+              title="누가 여기까지 오나"
+            />
+          </div>
+          <div className="flex items-center gap-0.5">
+            <StepButton
+              label="−"
+              title="한 고리 덜"
+              disabled={trace.depth <= TRACE_DEPTH_MIN}
+              onClick={() => trace.onDepth(trace.depth - 1)}
+            />
+            <span
+              className="w-6 text-center text-fg-dim"
+              title={`추적 깊이 ${TRACE_DEPTH_MIN}..${TRACE_DEPTH_MAX}`}
+            >
+              d{trace.depth}
+            </span>
+            <StepButton
+              label="+"
+              title="한 고리 더"
+              disabled={trace.depth >= TRACE_DEPTH_MAX}
+              onClick={() => trace.onDepth(trace.depth + 1)}
+            />
+          </div>
+        </>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * One half of the direction segment.
+ *
+ * @param on       is this the direction being followed?
+ * @param onClick  follow this one instead
+ * @param label    what it says
+ * @param title    what it means, at rest
+ */
+function SegButton({
+  on,
+  onClick,
+  label,
+  title
+}: {
+  on: boolean
+  onClick: () => void
+  label: string
+  title: string
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={on}
+      className={`px-1.5 py-0.5 ${on ? 'bg-hover text-fg' : 'text-fg-mute hover:text-fg-dim'}`}
+    >
+      {label}
+    </button>
+  )
+}
+
+/**
+ * One rung of the depth, either way.
+ *
+ * @param label     the glyph
+ * @param title     what this rung does
+ * @param disabled  is the depth already at this end of its range?
+ * @param onClick   move it
+ */
+function StepButton({
+  label,
+  title,
+  disabled,
+  onClick
+}: {
+  label: string
+  title: string
+  disabled: boolean
+  onClick: () => void
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      disabled={disabled}
+      className="rounded-sm border border-line px-1 py-0.5 text-fg-dim hover:bg-hover hover:text-fg disabled:opacity-30"
+    >
+      {label}
+    </button>
   )
 }
 
@@ -1665,23 +1976,27 @@ function truncate(text: string, max: number): string {
  * @param lod    what this zoom draws
  * @param boxes  how many file boxes are placed
  * @param rows   how many function rows are placed
- * @flow  says "top N of M" only where the list was really cut
+ * @param trace  the chain on screen and its drawing, or null when there is none
+ * @flow  says "top N of M" only where the list was really cut ; a trace adds its
+ *        own two segments, which are where every one of its counts is printed
  */
 function Legend({
   shown,
   total,
   lod,
   boxes,
-  rows
+  rows,
+  trace
 }: {
   shown: number
   total: number
   lod: Lod
   boxes: number
   rows: number
+  trace: { trace: GraphTrace; drawing: TraceDrawing } | null
 }): JSX.Element {
   return (
-    <div className="pointer-events-none absolute bottom-2 left-2 inline-flex items-center gap-3 rounded-sm border border-line bg-panel/90 px-2 py-1 text-micro text-fg-mute">
+    <div className="pointer-events-none absolute bottom-2 left-2 flex max-w-[calc(100%-1rem)] flex-wrap items-center gap-x-3 gap-y-1 rounded-sm border border-line bg-panel/90 px-2 py-1 text-micro text-fg-mute">
       <span className="flex items-center gap-1.5">
         <svg width="18" height="6" aria-hidden="true">
           <line x1="0" y1="3" x2="18" y2="3" stroke={EDGE_STYLES.calls.stroke} strokeWidth="1.4" />
@@ -1721,6 +2036,66 @@ function Legend({
             ? `top ${KEY_FN_PER_FILE} fn per file · ${rows} rows`
             : `all ${rows} fn`}
       </span>
+      {trace ? <TraceLegend trace={trace.trace} drawing={trace.drawing} lod={lod} /> : null}
     </div>
+  )
+}
+
+/**
+ * The chain's own numbers: how far it went, how much of it is drawn, and both
+ * kinds of thing it could not follow.
+ *
+ * The depth is printed even when nothing was cut, and that sentence is the point
+ * of this whole component: a node at the last ring has no stub beside it, and
+ * without this line the absence would read as "the chain ends here" instead of
+ * "we stopped looking here".
+ *
+ * @param trace    the chain the DB answered with
+ * @param drawing  where it landed on this canvas
+ * @param lod      what this zoom draws
+ * @flow  a cut curve list says "top N of M", cut nodes say how many were left
+ *        out, breaks and external are counted apart because they mean different
+ *        things ; the far view says the curves are gone rather than absent
+ */
+function TraceLegend({
+  trace,
+  drawing,
+  lod
+}: {
+  trace: GraphTrace
+  drawing: TraceDrawing
+  lod: Lod
+}): JSX.Element {
+  const stops = trace.breaks.reduce((sum, stop) => sum + stop.count, 0)
+  return (
+    <>
+      {stops > 0 ? (
+        <span className="flex items-center gap-1.5">
+          <svg width="18" height="6" aria-hidden="true">
+            <line
+              x1="0"
+              y1="3"
+              x2="18"
+              y2="3"
+              stroke={TRACE_BREAK_STYLE.stroke}
+              strokeWidth="1.4"
+              strokeDasharray={TRACE_BREAK_STYLE.dash ?? undefined}
+            />
+          </svg>
+          trace stops here ({stops})
+        </span>
+      ) : null}
+      <span className="text-fg-dim">
+        trace: {trace.direction} · depth {trace.depth} — nothing past this ring was followed ·{' '}
+        {trace.nodes.length} fn
+        {trace.truncated > 0 ? ` (+${trace.truncated} not drawn)` : ''} ·{' '}
+        {lod === 'file'
+          ? 'files only — the chain shows as lit boxes'
+          : drawing.shown < drawing.total
+            ? `top ${drawing.shown} of ${drawing.total} calls`
+            : `${drawing.total} calls`}
+        {trace.external > 0 ? ` · ${trace.external} outside the repository` : ''}
+      </span>
+    </>
   )
 }

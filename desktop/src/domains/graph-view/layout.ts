@@ -18,7 +18,13 @@
  * Pure and deterministic, so `layout.test.ts` can assert that 78 boxes do not
  * overlap without a browser.
  */
-import type { GraphEdge, GraphFileEdge, GraphFileGroup, GraphFunction } from './types'
+import type {
+  GraphEdge,
+  GraphFileEdge,
+  GraphFileGroup,
+  GraphFunction,
+  GraphTrace
+} from './types'
 
 export const BOX_W = 268
 export const HEADER_H = 30
@@ -1036,6 +1042,196 @@ export function markColour(mark: RowMark): string {
   if (mark === 'callers') return EDGE_STYLES.callers.stroke
   if (mark === 'hover') return 'var(--color-fg-dim)'
   return 'var(--color-fg-mute)'
+}
+
+// ------------------------------------------------------------------- trace
+//
+// A chain and the places it stops. The chain itself is the DB's answer
+// (`readGraphTrace`); everything here is only where it lands on this canvas, so
+// it lives beside the placement rather than in the component — `ui/` is the one
+// directory `tsconfig.test.json` excludes, and a decision nobody can test is a
+// decision that drifts.
+//
+// Nothing new is invented for the colours: a `calls` trace is the same blue the
+// legend already promises for "what this calls", and a `callers` trace the same
+// green. That is why no `RowMark` is added and `FileBox` is not touched at all.
+
+/** 추적이 끊긴 자리. 색만이 유일한 차이가 되지 않도록 파선을 함께 쓴다 —
+ *  EDGE_STYLES가 세운 규칙 그대로. */
+export const TRACE_BREAK_STYLE: Readonly<EdgeStyle> = {
+  stroke: 'var(--color-warn)',
+  dash: '2 2',
+  marker: ''
+}
+
+/** 끊김 스텁이 노드 옆으로 뻗는 길이, user unit. */
+export const TRACE_STUB_LEN = 26
+/** 스텁 끝의 십자 틱이 위아래로 뻗는 길이 — "여기서 끝"의 선 끝 모양. */
+export const TRACE_TICK_H = 4
+/** 한 트레이스가 그리는 곡선의 상한. 넘으면 얕은 고리부터 남기고 범례가 센다. */
+export const MAX_TRACE_EDGES = 500
+/** 가장 먼 고리가 내려가는 농도. 0이 아닌 것이 요점이다 — 마지막 고리도 보인다. */
+export const TRACE_FAR = 0.45
+
+/**
+ * 사슬이 칠하는 행들 — 방향이 곧 색이다.
+ *
+ * 새 `RowMark`를 만들지 않는다: calls 방향의 사슬은 전부 "이 함수가 부르는 것"
+ * 이고 callers 방향은 전부 "이 함수를 부르는 것"이므로, 범례가 이미 약속한 두
+ * 색이 그대로 맞는 말이다. 그래서 `FileBox`도 `markColour`도 손대지 않는다.
+ *
+ * @param trace  DB가 답한 사슬
+ * @flow  루트는 'selected' ; 나머지 노드는 방향에 따라 'calls' 또는 'callers'
+ */
+export function traceMarks(trace: GraphTrace): Map<number, RowMark> {
+  const marks = new Map<number, RowMark>()
+  const ring: RowMark = trace.direction === 'callers' ? 'callers' : 'calls'
+  for (const node of trace.nodes) marks.set(node.id, node.id === trace.rootId ? 'selected' : ring)
+  marks.set(trace.rootId, 'selected')
+  return marks
+}
+
+/**
+ * 깊이가 멀수록 옅게. 사슬의 방향을 색이 아니라 농도로 한 번 더 말한다.
+ *
+ * @param depth  이 걸음이 닿은 깊이
+ * @param max    이 트레이스의 깊이
+ * @flow  1이 가장 진하고 최대 깊이가 TRACE_FAR까지 내려간다 ; 깊이 1짜리
+ *        트레이스는 나눌 것이 없으므로 언제나 1
+ */
+export function traceOpacity(depth: number, max: number): number {
+  if (!(max > 1)) return 1
+  const t = Math.min(1, Math.max(0, (depth - 1) / (max - 1)))
+  // Interpolated rather than subtracted from 1, so the last ring lands on
+  // TRACE_FAR exactly instead of a float a hair below it.
+  return (1 - t) + TRACE_FAR * t
+}
+
+/** 사슬이 실제로 따라간 호출 하나, 지금 상자들이 있는 자리에서. */
+export interface TraceLine {
+  key: string
+  d: string
+  fromId: number
+  toId: number
+  /** 바깥쪽 끝의 깊이 — 이 선이 얼마나 옅게 그려지는지의 근거. */
+  depth: number
+}
+
+/** 한 노드가 따라가지 못한 호출부들을, 하나의 짧은 점선으로. */
+export interface TraceStub {
+  key: string
+  /** 점선 본체. */
+  d: string
+  /** 그 끝의 십자 틱 — "여기서 끝"을 선의 끝 모양으로 말한다. */
+  tick: string
+  atId: number
+  /** 이 노드가 따라가지 못한 호출부의 총 개수. */
+  count: number
+  /** 툴팁 한 줄: "3 call sites could not be followed: foo, bar, …" */
+  label: string
+}
+
+export interface TraceDrawing {
+  lines: TraceLine[]
+  stubs: TraceStub[]
+  /** 그린 곡선 수와 사슬이 가진 곡선 수. 범례가 둘 다 인쇄한다. */
+  shown: number
+  total: number
+}
+
+/** How many names one stub's tooltip spells before it says "…". */
+const STUB_NAMES = 3
+
+/**
+ * 사슬을 곡선으로, 끊김을 스텁으로 — 지금 상자들이 있는 자리에서.
+ *
+ * 곡선은 언제나 `edgePath(caller, callee)`다. 역방향 추적이라고 화살표를
+ * 뒤집으면 그림이 호출 방향에 대해 거짓말을 한다 — 따라간 순서와 부르는 방향은
+ * 다른 사실이고, 화면이 말하는 쪽은 후자다.
+ *
+ * @param trace   DB가 답한 사슬
+ * @param layout  이 레벨의 배치
+ * @param byId    인덱스의 모든 함수, id별
+ * @param byBox   끌어다 놓은 상자들의 이동량, 상자 index별
+ * @param lod     이 줌이 그리는 레벨
+ * @param limit   곡선 상한
+ * @flow  파일 레벨은 함수 곡선을 그리지 않는다(원경이 읽히는 이유가 그것이다) ->
+ *        깊이 얕은 것부터 정렬해 limit까지 -> 양 끝의 앵커를 지금 자리에서 읽어
+ *        곡선 -> 끊김은 노드당 하나로 접어 스텁 하나 + 십자 틱
+ * 주요 내부 변수: byNode(노드별로 접은 끊김), outward(스텁이 뻗는 방향)
+ */
+export function traceLines(
+  trace: GraphTrace,
+  layout: GraphLayout,
+  byId: Map<number, GraphFunction>,
+  byBox: Map<number, Offset>,
+  lod: Lod,
+  limit = MAX_TRACE_EDGES
+): TraceDrawing {
+  const total = trace.edges.length
+  // The far view keeps the file links and drops every function curve, exactly as
+  // `edgesFor` does. `total` is still reported, so the legend can say the chain
+  // is there and merely not drawn at this scale.
+  if (lod === 'file') return { lines: [], stubs: [], shown: 0, total }
+
+  const ordered = trace.edges
+    .slice()
+    .sort((a, b) =>
+      a.depth !== b.depth
+        ? a.depth - b.depth
+        : a.from !== b.from
+          ? a.from - b.from
+          : a.to - b.to
+    )
+  const lines: TraceLine[] = []
+  for (const edge of ordered) {
+    if (lines.length >= Math.max(0, limit)) break
+    const from = resolveAnchor(layout, byId, byBox, edge.from)
+    const to = resolveAnchor(layout, byId, byBox, edge.to)
+    if (!from || !to) continue
+    lines.push({
+      key: `t${edge.from}->${edge.to}`,
+      d: edgePath(from, to),
+      fromId: edge.from,
+      toId: edge.to,
+      depth: edge.depth
+    })
+  }
+
+  // Folded per node: a function with twelve unfollowable names would otherwise
+  // get twelve stubs drawn on top of each other, which says nothing at all.
+  const byNode = new Map<number, { count: number; names: string[] }>()
+  for (const stop of trace.breaks) {
+    const had = byNode.get(stop.atId)
+    if (had) {
+      had.count += stop.count
+      if (!had.names.includes(stop.callee)) had.names.push(stop.callee)
+      continue
+    }
+    byNode.set(stop.atId, { count: stop.count, names: [stop.callee] })
+  }
+
+  const outward = trace.direction === 'callers' ? -1 : 1
+  const stubs: TraceStub[] = []
+  for (const [atId, stop] of byNode) {
+    const at = resolveAnchor(layout, byId, byBox, atId)
+    if (!at) continue
+    const root = trace.direction === 'callers' ? at.left : at.right
+    const tip = root + outward * TRACE_STUB_LEN
+    const named = stop.names.slice(0, STUB_NAMES).join(', ')
+    const rest = stop.names.length > STUB_NAMES ? ', …' : ''
+    const sites = `${stop.count} call site${stop.count === 1 ? '' : 's'}`
+    stubs.push({
+      key: `b${atId}`,
+      d: `M ${root} ${at.y} L ${tip} ${at.y}`,
+      tick: `M ${tip} ${at.y - TRACE_TICK_H} L ${tip} ${at.y + TRACE_TICK_H}`,
+      atId,
+      count: stop.count,
+      label: `${sites} could not be followed: ${named}${rest}`
+    })
+  }
+
+  return { lines, stubs, shown: lines.length, total }
 }
 
 /**

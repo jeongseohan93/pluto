@@ -1,0 +1,134 @@
+{
+  "slice_id": "20260820-graph-trace",
+  "status": "running:implement",
+  "branch": "slice/20260820-graph-trace",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "f08455aeeeaf60a615e5b73fddcd647ea3a4b693",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 34,
+    "test_files": 6,
+    "budget": 80,
+    "warn": true
+  },
+  "amends": null,
+  "repairs": [
+    {
+      "n": 1,
+      "grade": "large",
+      "at": "2026-08-21T00:16:41+09:00",
+      "failed": 0,
+      "spec_violations": 0,
+      "diagnosis": true
+    }
+  ],
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260820-231415-graph-trace-plan",
+      "attempts": 1,
+      "commit": "4dcbabc44632607a805c4c350e411800a8a71980"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260821-001642-graph-trace-implement-3",
+      "attempts": 3,
+      "commit": "7a3986841ac17ddb5a97bccee1b43fadb8c75ac8"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-231415-graph-trace-plan",
+      "status": "completed",
+      "turns": 42,
+      "tokens": {
+        "input": 60,
+        "cache_creation": 155540,
+        "cache_read": 3514966,
+        "output": 48273,
+        "billed_input": 3670566,
+        "peak_context": 170009
+      },
+      "cost_usd": 4.520008
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-235959-graph-trace-implement",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 150,
+        "cache_creation": 192967,
+        "cache_read": 13341700,
+        "output": 58738,
+        "billed_input": 13534817,
+        "peak_context": 213853
+      },
+      "cost_usd": 10.069720000000002
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260821-001210-graph-trace-implement-2",
+      "status": "completed",
+      "turns": 10,
+      "tokens": {
+        "input": 18,
+        "cache_creation": 246268,
+        "cache_read": 2333747,
+        "output": 7176,
+        "billed_input": 2580033,
+        "peak_context": 267153
+      },
+      "cost_usd": 3.8090435
+    },
+    {
+      "stage": "diagnose",
+      "attempt": 1,
+      "run_id": "20260821-001412-graph-trace-diagnose",
+      "status": "completed",
+      "turns": 19,
+      "tokens": {
+        "input": 25,
+        "cache_creation": 51734,
+        "cache_read": 669728,
+        "output": 10167,
+        "billed_input": 721487,
+        "peak_context": 66203
+      },
+      "cost_usd": 1.106504
+    },
+    {
+      "stage": "implement",
+      "attempt": 3,
+      "run_id": "20260821-001642-graph-trace-implement-3",
+      "status": "completed",
+      "turns": 42,
+      "tokens": {
+        "input": 65,
+        "cache_creation": 70324,
+        "cache_read": 2603190,
+        "output": 12321,
+        "billed_input": 2673579,
+        "peak_context": 91210
+      },
+      "cost_usd": 2.313185
+    }
+  ],
+  "updated_at": "2026-08-21T00:31:49+09:00"
+}

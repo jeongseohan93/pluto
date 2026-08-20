@@ -29,6 +29,9 @@ import {
   MINIMAP_W,
   NO_OFFSETS,
   ROW_H,
+  TRACE_BREAK_STYLE,
+  TRACE_FAR,
+  TRACE_STUB_LEN,
   ZOOM_MAX,
   ZOOM_MIN,
   ZOOM_STEPS,
@@ -63,17 +66,27 @@ import {
   pointAt,
   resolveAnchor,
   shiftAnchor,
+  traceLines,
+  traceMarks,
+  traceOpacity,
   viewportOf,
   visibleRows,
   withOffset,
   zoomBy,
   zoomIn,
   zoomOut,
+  type Anchor,
   type Offset,
   type Offsets,
   type RowMark
 } from './layout'
-import type { GraphEdge, GraphFileEdge, GraphFileGroup, GraphFunction } from './types'
+import type {
+  GraphEdge,
+  GraphFileEdge,
+  GraphFileGroup,
+  GraphFunction,
+  GraphTrace
+} from './types'
 
 let nextId = 1
 
@@ -1200,8 +1213,252 @@ describe('edge style, one table for the edges, the row marks and the legend', ()
     const marks: RowMark[] = ['selected', 'calls', 'callers', 'both', 'hover', 'near']
     assert.ok(defined(EDGE_STYLES.calls.stroke))
     assert.ok(defined(EDGE_STYLES.callers.stroke))
+    assert.ok(defined(TRACE_BREAK_STYLE.stroke))
     for (const mark of marks) {
       assert.ok(defined(markColour(mark)), mark + ' asks for a token theme.css does not define')
     }
+  })
+
+  test('a broken chain is told apart by more than its colour', () => {
+    // The same lock EDGE_STYLES carries: a reader who cannot see the hue still
+    // has the dash. And no arrowhead — there is nothing for it to point at.
+    assert.ok(TRACE_BREAK_STYLE.dash)
+    assert.notEqual(TRACE_BREAK_STYLE.stroke, EDGE_STYLES.calls.stroke)
+    assert.notEqual(TRACE_BREAK_STYLE.stroke, EDGE_STYLES.callers.stroke)
+    assert.equal(TRACE_BREAK_STYLE.marker, '')
+  })
+})
+
+/**
+ * A chain shaped like one `readGraphTrace` would answer with.
+ *
+ * @param overrides  whatever this test is actually about
+ */
+function traceOf(overrides: Partial<GraphTrace> = {}): GraphTrace {
+  return {
+    rootId: 1,
+    direction: 'calls',
+    depth: 3,
+    nodes: [],
+    edges: [],
+    breaks: [],
+    external: 0,
+    truncated: 0,
+    ...overrides
+  }
+}
+
+describe('traceMarks', () => {
+  test('the root is the selection and the rest is the direction', () => {
+    const marks = traceMarks(
+      traceOf({
+        rootId: 7,
+        nodes: [
+          { id: 7, depth: 0 },
+          { id: 8, depth: 1 },
+          { id: 9, depth: 2 }
+        ]
+      })
+    )
+    assert.equal(marks.get(7), 'selected')
+    assert.equal(marks.get(8), 'calls')
+    assert.equal(marks.get(9), 'calls')
+  })
+
+  test('walking back paints the colour the legend already promised for it', () => {
+    const marks = traceMarks(
+      traceOf({
+        rootId: 7,
+        direction: 'callers',
+        nodes: [
+          { id: 7, depth: 0 },
+          { id: 8, depth: 1 }
+        ]
+      })
+    )
+    assert.equal(marks.get(7), 'selected')
+    assert.equal(marks.get(8), 'callers')
+  })
+
+  test('a chain of nothing still knows its own root', () => {
+    const marks = traceMarks(traceOf({ rootId: 3, nodes: [] }))
+    assert.deepEqual([...marks], [[3, 'selected']])
+  })
+})
+
+describe('traceOpacity', () => {
+  test('the first ring is full strength and the last is TRACE_FAR', () => {
+    assert.equal(traceOpacity(1, 3), 1)
+    assert.equal(traceOpacity(3, 3), TRACE_FAR)
+  })
+
+  test('it only ever fades outwards', () => {
+    let last = traceOpacity(1, 5)
+    for (let depth = 2; depth <= 5; depth++) {
+      const now = traceOpacity(depth, 5)
+      assert.ok(now < last, `ring ${depth} is not fainter than the one inside it`)
+      last = now
+    }
+  })
+
+  test('a one-ring chain has nothing to divide by', () => {
+    assert.equal(traceOpacity(1, 1), 1)
+    assert.equal(traceOpacity(0, 1), 1)
+  })
+})
+
+describe('traceLines', () => {
+  const files = threeFiles()
+  const ids = flattenFunctions(files).map((each) => each.id)
+  const byId = new Map(flattenFunctions(files).map((each) => [each.id, each]))
+  const noBox = new Map<number, Offset>()
+  const chain = traceOf({
+    rootId: ids[0],
+    nodes: [
+      { id: ids[0], depth: 0 },
+      { id: ids[1], depth: 1 },
+      { id: ids[2], depth: 2 }
+    ],
+    edges: [
+      { from: ids[0], to: ids[1], depth: 1 },
+      { from: ids[1], to: ids[2], depth: 2 }
+    ]
+  })
+
+  test('each curve leaves one row and reaches the other', () => {
+    const layout = layoutGraph(files, 'full')
+    const drawn = traceLines(chain, layout, byId, noBox, 'full')
+    assert.equal(drawn.shown, 2)
+    assert.equal(drawn.total, 2)
+    assert.equal(
+      drawn.lines[0].d,
+      edgePath(
+        layout.anchors.get(ids[0]) as Anchor,
+        layout.anchors.get(ids[1]) as Anchor
+      )
+    )
+    assert.equal(drawn.lines[0].depth, 1)
+  })
+
+  test('the far view draws no curve, and still says how many there are', () => {
+    const drawn = traceLines(chain, layoutGraph(files, 'file'), byId, noBox, 'file')
+    assert.deepEqual(drawn.lines, [])
+    assert.deepEqual(drawn.stubs, [])
+    assert.equal(drawn.shown, 0)
+    // The legend has to be able to say "not drawn at this scale" rather than
+    // "there is nothing here".
+    assert.equal(drawn.total, 2)
+  })
+
+  test('past the cap the shallow rings are the ones kept', () => {
+    const drawn = traceLines(chain, layoutGraph(files, 'full'), byId, noBox, 'full', 1)
+    assert.equal(drawn.shown, 1)
+    assert.equal(drawn.total, 2)
+    assert.equal(drawn.lines[0].depth, 1)
+  })
+
+  test('a stop reaches out of the row it hangs on, and ends in a tick', () => {
+    const layout = layoutGraph(files, 'full')
+    const drawn = traceLines(
+      traceOf({
+        rootId: ids[0],
+        nodes: [{ id: ids[0], depth: 0 }],
+        breaks: [{ atId: ids[0], depth: 0, callee: 'say', count: 1, candidates: 2 }]
+      }),
+      layout,
+      byId,
+      noBox,
+      'full'
+    )
+    const at = layout.anchors.get(ids[0]) as Anchor
+    assert.equal(drawn.stubs.length, 1)
+    assert.equal(drawn.stubs[0].d, `M ${at.right} ${at.y} L ${at.right + TRACE_STUB_LEN} ${at.y}`)
+    // The tick crosses the line's own end: "this stops" said as a shape.
+    assert.ok(drawn.stubs[0].tick.startsWith(`M ${at.right + TRACE_STUB_LEN} `))
+    assert.match(drawn.stubs[0].label, /1 call site could not be followed: say/)
+  })
+
+  test('a function this index never had is skipped without a word', () => {
+    const drawn = traceLines(
+      traceOf({
+        rootId: ids[0],
+        nodes: [{ id: ids[0], depth: 0 }],
+        edges: [{ from: ids[0], to: 999999, depth: 1 }],
+        breaks: [{ atId: 999999, depth: 1, callee: 'nobody', count: 1, candidates: 1 }]
+      }),
+      layoutGraph(files, 'full'),
+      byId,
+      noBox,
+      'full'
+    )
+    assert.deepEqual(drawn.lines, [])
+    assert.deepEqual(drawn.stubs, [])
+    assert.equal(drawn.total, 1)
+  })
+
+  test('every unfollowable call of one node is one stub, counted', () => {
+    const drawn = traceLines(
+      traceOf({
+        rootId: ids[0],
+        nodes: [{ id: ids[0], depth: 0 }],
+        breaks: [
+          { atId: ids[0], depth: 0, callee: 'say', count: 2, candidates: 2 },
+          { atId: ids[0], depth: 0, callee: 'run', count: 1, candidates: 3 }
+        ]
+      }),
+      layoutGraph(files, 'full'),
+      byId,
+      noBox,
+      'full'
+    )
+    assert.equal(drawn.stubs.length, 1)
+    assert.equal(drawn.stubs[0].count, 3)
+    assert.match(drawn.stubs[0].label, /3 call sites could not be followed: say, run/)
+  })
+
+  test('walking back, the stub reaches out of the left-hand side', () => {
+    const layout = layoutGraph(files, 'full')
+    const drawn = traceLines(
+      traceOf({
+        rootId: ids[0],
+        direction: 'callers',
+        nodes: [{ id: ids[0], depth: 0 }],
+        breaks: [{ atId: ids[0], depth: 0, callee: 'a_one', count: 1, candidates: 2 }]
+      }),
+      layout,
+      byId,
+      noBox,
+      'full'
+    )
+    const at = layout.anchors.get(ids[0]) as Anchor
+    assert.equal(drawn.stubs[0].d, `M ${at.left} ${at.y} L ${at.left - TRACE_STUB_LEN} ${at.y}`)
+    assert.ok(drawn.stubs[0].tick.startsWith(`M ${at.left - TRACE_STUB_LEN} `))
+  })
+
+  test('a dragged box takes the chain and its stubs with it', () => {
+    const layout = layoutGraph(files, 'full')
+    const at = layout.boxOf.get('a.py') as number
+    const byBox = new Map<number, Offset>([[at, { dx: 40, dy: -12 }]])
+    const asked = traceOf({
+      rootId: ids[0],
+      nodes: chain.nodes,
+      edges: chain.edges,
+      breaks: [{ atId: ids[0], depth: 0, callee: 'say', count: 1, candidates: 2 }]
+    })
+    const still = traceLines(asked, layout, byId, noBox, 'full')
+    const moved = traceLines(asked, layout, byId, byBox, 'full')
+    assert.notEqual(moved.lines[0].d, still.lines[0].d)
+    const anchor = layout.anchors.get(ids[0]) as Anchor
+    assert.equal(
+      moved.stubs[0].d,
+      `M ${anchor.right + 40} ${anchor.y - 12} L ${anchor.right + 40 + TRACE_STUB_LEN} ${anchor.y - 12}`
+    )
+  })
+
+  test('nothing to draw is an empty answer, not a crash', () => {
+    const drawn = traceLines(traceOf(), layoutGraph([]), new Map(), noBox, 'full')
+    assert.deepEqual(drawn.lines, [])
+    assert.deepEqual(drawn.stubs, [])
+    assert.equal(drawn.total, 0)
   })
 })

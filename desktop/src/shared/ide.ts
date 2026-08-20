@@ -280,6 +280,10 @@ export interface ApprovalResult {
  * v0.2.7 adds the code half, which is the one place the renderer does name a
  * path — and the only one it can, because main answers nothing that this
  * repository's graph did not already put on the screen.
+ *
+ * v0.2.8 adds one more question to the graph half — a call chain — and it is
+ * still only a question: the trace reads the same read-only handle every other
+ * graph channel does.
  */
 export interface AidevBridge extends PipelineBridge, GraphBridge, CodeViewBridge {
   getProject(): Promise<ProjectInfo>
@@ -335,5 +339,9 @@ export const IPC = {
 
   /** v0.2.7 — one text file out of the open repository, and only one the
    *  graph already knows about. */
-  sourceFile: 'aidev:get-source-file'
+  sourceFile: 'aidev:get-source-file',
+
+  /** v0.2.8 — one function's call chain, N rings out. Read-only, like the two
+   *  graph channels above it. */
+  graphTrace: 'aidev:get-graph-trace'
 } as const

@@ -16,7 +16,15 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { graphPaths, hasSqlite, pathInGraph, readGraphIndex, readGraphNode } from './graph-store'
+import {
+  graphPaths,
+  hasSqlite,
+  pathInGraph,
+  readGraphIndex,
+  readGraphNode,
+  readGraphTrace
+} from './graph-store'
+import { clampTraceDepth } from '../types'
 
 /** The fixture is written with the same driver the reader reads it with. */
 const nodeRequire = createRequire(join(process.cwd(), 'graph-store.test.cjs'))
@@ -246,6 +254,179 @@ describe('readGraphNode', { skip: !available }, () => {
     assert.equal(readGraphNode(root, -1), null)
     assert.equal(readGraphNode(root, 1.5), null)
     assert.equal(readGraphNode(tempRoot(), 1), null)
+  })
+})
+
+/**
+ * A repository whose one call names something the repository does not define.
+ *
+ * `len` and `print` are the ordinary case in a real graph, and they are not a
+ * broken chain — they are where the repository ends. Kept apart from
+ * `repoWithGraph` so that fixture's counts, which several tests above spell out,
+ * stay exactly as they were.
+ */
+function repoWithOutsideCall(): string {
+  const root = tempRoot()
+  const paths = graphPaths(root)
+  mkdirSync(paths.dir, { recursive: true })
+
+  const Ctor = (nodeRequire('node:sqlite') as { DatabaseSync: new (p: string) => WritableDb })
+    .DatabaseSync
+  const db = new Ctor(paths.db)
+  db.exec(SCHEMA)
+  db.exec(`
+    INSERT INTO meta (key, value) VALUES ('schema', '1');
+    INSERT INTO files (path, lang, parsed, funcs) VALUES ('aidev/x.py', 'py', 1, 1);
+    INSERT INTO functions (id, qualname, name, path, lang, lineno, end_lineno, signature, kind,
+                           summary, has_spec, is_test) VALUES
+      (1, 'counts', 'counts', 'aidev/x.py', 'py', 1, 5, 'counts(xs)', 'function', 'how many', 1, 0);
+    INSERT INTO calls (id, caller_id, callee_name, callee_raw, lineno, resolved_id) VALUES
+      (1, 1, 'len', 'len', 2, NULL),
+      (2, 1, 'print', 'print', 3, NULL);
+  `)
+  db.close()
+  return root
+}
+
+describe('readGraphTrace', { skip: !available }, () => {
+  test('one ring out is the root and what it calls', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'calls', 1)
+    assert.ok(trace)
+    assert.equal(trace.rootId, 1)
+    assert.equal(trace.direction, 'calls')
+    assert.deepEqual(trace.nodes, [
+      { id: 1, depth: 0 },
+      { id: 2, depth: 1 }
+    ])
+    assert.deepEqual(trace.edges, [{ from: 1, to: 2, depth: 1 }])
+    assert.equal(trace.truncated, 0)
+  })
+
+  test('three rings reach main, and the cycle back does not recurse forever', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'calls', 3)
+    assert.ok(trace)
+    // run_pipeline -> say -> main -> run_pipeline. The root is reached again at
+    // depth 3 and stays 0, because a node's depth is its *shortest* one.
+    assert.deepEqual(trace.nodes, [
+      { id: 1, depth: 0 },
+      { id: 2, depth: 1 },
+      { id: 3, depth: 2 }
+    ])
+    const pairs = trace.edges.map((e) => `${e.from}->${e.to}`).sort()
+    // say -> main is written twice in `calls` and is one curve. 3 -> 1 closes
+    // the cycle and is drawn, because 3 was expanded.
+    assert.deepEqual(pairs, ['1->2', '2->3', '3->1'])
+  })
+
+  test('a node at the last ring has no curve leaving it', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'calls', 2)
+    assert.ok(trace)
+    // 3 is at depth 2 = the limit, so 3 -> 1 was never followed and is not drawn.
+    assert.deepEqual(
+      trace.edges.map((e) => `${e.from}->${e.to}`).sort(),
+      ['1->2', '2->3']
+    )
+  })
+
+  test('a call the engine would not aim is where the chain stops', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'calls', 3)
+    assert.ok(trace)
+    // say's `other.run_pipeline` resolves to id 999, which is nobody.
+    assert.deepEqual(trace.breaks, [
+      { atId: 2, depth: 1, callee: 'run_pipeline', count: 1, candidates: 1 }
+    ])
+    assert.equal(trace.external, 0)
+  })
+
+  test('a node the chain only reached is not asked what it could not follow', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'calls', 1)
+    // say is at depth 1 = the limit: it was never expanded, so its unfollowable
+    // call is not a stop of *this* chain.
+    assert.deepEqual(trace?.breaks, [])
+  })
+
+  test('a call to something this repository does not define is not a break', () => {
+    const trace = readGraphTrace(repoWithOutsideCall(), 1, 'calls', 3)
+    assert.ok(trace)
+    assert.deepEqual(trace.breaks, [])
+    // `len` and `print` — the edge of the repository, counted and not drawn.
+    assert.equal(trace.external, 2)
+  })
+
+  test('the other direction walks the callers', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'callers', 2)
+    assert.ok(trace)
+    assert.deepEqual(trace.nodes, [
+      { id: 1, depth: 0 },
+      { id: 3, depth: 1 },
+      { id: 2, depth: 2 }
+    ])
+    // The arrows still point caller -> callee; only the walk was backwards.
+    assert.deepEqual(
+      trace.edges.map((e) => `${e.from}->${e.to}`).sort(),
+      ['2->3', '3->1']
+    )
+  })
+
+  test('walking back, an ambiguous call site is where it stops', () => {
+    const trace = readGraphTrace(repoWithGraph(), 1, 'callers', 1)
+    assert.ok(trace)
+    // Two call sites name run_pipeline without reaching it: the test's
+    // unresolved one, and say's, which points at an id that is not there.
+    assert.deepEqual(trace.breaks, [
+      { atId: 1, depth: 0, callee: 'run_pipeline', count: 2, candidates: 1 }
+    ])
+    // Walking back, every unfollowable site names something we know by
+    // definition, so there is nothing outside the repository to count.
+    assert.equal(trace.external, 0)
+  })
+
+  test('a function nothing resolves out of is a chain of one, not a null', () => {
+    const trace = readGraphTrace(repoWithGraph(), 4, 'calls', 3)
+    assert.ok(trace)
+    assert.deepEqual(trace.nodes, [{ id: 4, depth: 0 }])
+    assert.deepEqual(trace.edges, [])
+    assert.equal(trace.breaks.length, 1)
+    assert.equal(trace.breaks[0].atId, 4)
+  })
+
+  test('a depth outside the range is clamped rather than refused', () => {
+    const root = repoWithGraph()
+    assert.equal(readGraphTrace(root, 1, 'calls', 0)?.depth, 1)
+    assert.equal(readGraphTrace(root, 1, 'calls', 99)?.depth, 5)
+    assert.equal(readGraphTrace(root, 1, 'calls', Number.NaN)?.depth, 3)
+  })
+
+  test('an id that is not there, or not an id, is null', () => {
+    const root = repoWithGraph()
+    assert.equal(readGraphTrace(root, 9999, 'calls', 3), null)
+    assert.equal(readGraphTrace(root, -1, 'calls', 3), null)
+    assert.equal(readGraphTrace(root, 1.5, 'calls', 3), null)
+    assert.equal(readGraphTrace(tempRoot(), 1, 'calls', 3), null)
+  })
+})
+
+describe('clampTraceDepth', () => {
+  test('the range the UI offers is the range main allows', () => {
+    assert.equal(clampTraceDepth(1), 1)
+    assert.equal(clampTraceDepth(3), 3)
+    assert.equal(clampTraceDepth(5), 5)
+  })
+
+  test('past either end lands on that end', () => {
+    assert.equal(clampTraceDepth(0), 1)
+    assert.equal(clampTraceDepth(-1), 1)
+    assert.equal(clampTraceDepth(9), 5)
+  })
+
+  test('something that is not a number reads as the default', () => {
+    assert.equal(clampTraceDepth(Number.NaN), 3)
+    assert.equal(clampTraceDepth(Number.POSITIVE_INFINITY), 3)
+  })
+
+  test('a depth between two rings is one of them, not a fraction', () => {
+    assert.equal(clampTraceDepth(2.7), 3)
+    assert.equal(clampTraceDepth(2.2), 2)
   })
 })
 
