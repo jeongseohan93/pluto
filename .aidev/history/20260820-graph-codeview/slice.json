@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-codeview",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260820-graph-codeview",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "938c101d3aa49734de33a9fcb40af3b6d2529b8a",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 44,
+    "test_files": 7,
+    "budget": 120,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-215052-graph-codeview-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-20T21:50:44+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-215052-graph-codeview-plan",
+      "status": "completed",
+      "turns": 50,
+      "tokens": {
+        "input": 320,
+        "cache_creation": 121230,
+        "cache_read": 2117345,
+        "output": 41824,
+        "billed_input": 2238895,
+        "peak_context": 135699
+      },
+      "cost_usd": 3.3181724999999997
+    }
+  ],
+  "updated_at": "2026-08-20T22:00:56+09:00"
 }
