@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260820-graph-pan",
+  "status": "pending",
+  "branch": "slice/20260820-graph-pan",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9d81b7ad339ebe5a80713b6284cb0e74dd701381",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-20T18:54:55+09:00"
+}
