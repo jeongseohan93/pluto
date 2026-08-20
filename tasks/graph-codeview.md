@@ -1,7 +1,8 @@
 ---
 approval: plan
 max_turns: implement=180
-test_commands: npx --prefix desktop tsc --noEmit -p desktop
+setup: npm install --prefix desktop
+test_commands: npm test --prefix desktop
 ---
 # Graph ÅÇ ? ÄÚµå ºä¾î ¼ÒÈ¯ (Monaco, readonly)
 
