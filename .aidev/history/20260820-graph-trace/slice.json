@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-trace",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260820-graph-trace",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "f08455aeeeaf60a615e5b73fddcd647ea3a4b693",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 34,
+    "test_files": 6,
+    "budget": 80,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-231415-graph-trace-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-20T23:14:09+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-231415-graph-trace-plan",
+      "status": "completed",
+      "turns": 42,
+      "tokens": {
+        "input": 60,
+        "cache_creation": 155540,
+        "cache_read": 3514966,
+        "output": 48273,
+        "billed_input": 3670566,
+        "peak_context": 170009
+      },
+      "cost_usd": 4.520008
+    }
+  ],
+  "updated_at": "2026-08-20T23:25:51+09:00"
 }
