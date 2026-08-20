@@ -22,6 +22,17 @@ import type { GraphIndexResult } from '@domains/graph-view/types'
 /** Which sidebar views are served from `mock-data`, and so wear the badge. */
 const DEMO_VIEWS: ActivityId[] = ['workspaces', 'graph', 'changes', 'tests', 'telemetry']
 
+/**
+ * The left panel: whichever view the activity bar has open, under one header.
+ *
+ * Collapsing is one button here rather than one per view — every activity is
+ * the same panel, so folding it away folds all of them, and the activity bar
+ * next to it is what brings it back.
+ *
+ * @param props  the active activity and the data every view of it reads,
+ *               including `onCollapse` — fold this panel away
+ * @flow  the header, then the one view the activity names
+ */
 export function Sidebar(props: {
   activity: ActivityId
   pipeline: PipelineSidebarProps
@@ -40,6 +51,7 @@ export function Sidebar(props: {
   telemetry: TelemetrySnapshot
   selectedSymbolId: string | null
   onSelectSymbol: (id: string) => void
+  onCollapse: () => void
 }): JSX.Element {
   const titles: Record<ActivityId, string> = {
     pipeline: 'Pipeline',
@@ -59,6 +71,15 @@ export function Sidebar(props: {
         right={
           <>
             {demo ? <DemoBadge /> : null}
+            <button
+              type="button"
+              onClick={props.onCollapse}
+              title="Collapse panel"
+              aria-label="Collapse panel"
+              className="text-fg-mute hover:text-fg-dim"
+            >
+              <Icon name="chevron" size={13} className="rotate-180" />
+            </button>
             <Icon name="search" size={13} className="text-fg-mute hover:text-fg-dim" />
           </>
         }

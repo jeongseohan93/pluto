@@ -1,12 +1,26 @@
 import type { JSX, ReactNode } from 'react'
 import type { RunState } from '@shared/ide'
 
+/**
+ * One panel's title bar: a label, and whatever the panel puts either side.
+ *
+ * `left` sits before the title rather than after it because a collapsed panel
+ * is only 32px wide — the title truncates away and the leftmost control is the
+ * one still reachable, which is where a collapse toggle has to be.
+ *
+ * @param title      what this panel is
+ * @param left       controls before the title, kept when the title truncates
+ * @param right      controls after it
+ * @param className  extra classes for the bar itself
+ */
 export function PanelHeader({
   title,
+  left,
   right,
   className = ''
 }: {
   title: string
+  left?: ReactNode
   right?: ReactNode
   className?: string
 }): JSX.Element {
@@ -14,7 +28,8 @@ export function PanelHeader({
     <div
       className={`flex h-7 shrink-0 items-center justify-between gap-2 border-b border-line bg-panel px-2.5 ${className}`}
     >
-      <span className="panel-label truncate">{title}</span>
+      {left ? <div className="flex shrink-0 items-center gap-1.5">{left}</div> : null}
+      <span className="panel-label min-w-0 flex-1 truncate">{title}</span>
       {right ? <div className="flex shrink-0 items-center gap-1.5">{right}</div> : null}
     </div>
   )
