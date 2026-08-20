@@ -675,6 +675,11 @@ export function FunctionGraphSurface({
    * pointerdown come from inside a box? — asked of the DOM rather than of
    * coordinates, so there is no second opinion about where the boxes are.
    *
+   * Nothing is claimed here: no capture is taken until the pan is known to be
+   * one. A pointer that turns out to be a click has therefore been touched by
+   * none of this, and reaches the row or the background rect exactly as it did
+   * before there was a pan at all.
+   *
    * @param event  the pointerdown on the scroll container
    * @flow  anything but the primary button, a drag already under way, or a
    *        pointer that started on a box is left alone ; while space is held the
@@ -685,7 +690,6 @@ export function FunctionGraphSurface({
     if (event.target instanceof Element && event.target.closest('[data-box]')) return
     // Otherwise the browser starts its own text selection across the canvas.
     event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
     // The svg's own capture-phase reset never fired if space is held.
     dragged.current = false
     pan.current = {
@@ -700,7 +704,13 @@ export function FunctionGraphSurface({
   /**
    * Move the whole view with the hand.
    *
-   * @param event  a pointermove, captured back to the container
+   * The capture is taken here rather than at the pointerdown, so that it lasts
+   * exactly as long as `panning` does. That equivalence is what keeps the svg's
+   * `pointer-events: none` from ever outliving the pan that asked for it — the
+   * browser guarantees a `lostpointercapture` for every capture it grants,
+   * however the pointer ends, and that is one of the three ways out below.
+   *
+   * @param event  a pointermove, captured back to the container once committed
    * @flow  no pan or another pointer -> nothing ; still inside the slop -> this
    *        is a click on bare canvas and the selection it clears
    */
@@ -712,6 +722,7 @@ export function FunctionGraphSurface({
     if (!dragged.current && !isDrag(mx, my)) return
     if (!dragged.current) {
       dragged.current = true
+      event.currentTarget.setPointerCapture(event.pointerId)
       setPanning(true)
     }
     const to = panScroll(at, { dx: mx, dy: my })
@@ -722,7 +733,15 @@ export function FunctionGraphSurface({
   /**
    * Let go. `dragged` stays set — the click right behind this one reads it.
    *
-   * @param event  the pointerup, or the cancel a touch gesture sends instead
+   * Three events arrive here and the first one wins: the pointerup that ends an
+   * ordinary pan, the cancel a touch gesture sends instead, and the lost capture
+   * that is the browser's own last word on a pointer — the one that fires even
+   * when the window never sees the release.
+   *
+   * @param event  whichever of the three ended this pointer
+   * @flow  no pan or another pointer -> nothing, which is also how the second
+   *        and third of the three find that the first has already been here ;
+   *        a capture still held is released, and one already lost is not
    */
   const endPan = useCallback((event: ReactPointerEvent<HTMLDivElement>): void => {
     const at = pan.current
@@ -849,6 +868,10 @@ export function FunctionGraphSurface({
             onPointerMove={movePan}
             onPointerUp={endPan}
             onPointerCancel={endPan}
+            // The one end-of-pan the window cannot miss. Without it a capture
+            // lost some other way would leave `panning` set, and with it the
+            // whole graph pointer-transparent and unselectable for good.
+            onLostPointerCapture={endPan}
           >
             <svg
               width={size.width * zoom}
@@ -859,6 +882,11 @@ export function FunctionGraphSurface({
               // hit-testing falls through to the container, so `startDrag` can
               // never fire, no box can ever be found under the pointer, and no
               // descendant's own cursor can beat the one below.
+              // `pointer-events` is inherited, so this turns off every box and
+              // every row at once — which is why both flags have to be certain
+              // to clear. `spaceHeld` has the keyup and the window blur;
+              // `panning` lasts exactly as long as the container's capture,
+              // whose loss `onLostPointerCapture` always hears.
               style={{ pointerEvents: panning || spaceHeld ? 'none' : undefined }}
               onPointerDownCapture={clearDragFlag}
             >

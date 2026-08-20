@@ -16,7 +16,22 @@
     "budget": 60,
     "warn": true
   },
-  "amends": null,
+  "amends": [
+    {
+      "n": 1,
+      "instruction": "회귀 수정: 노드 선택 시 calls/callers 엣지 하이라이트(곡선 엣지+디밍)가 팬 구현 이후 동작하지 않는다. 팬의 히트 판정/이벤트 처리가 기존 클릭 선택 경로를 가로챈 것으로 추정 — 원인을 찾아 복구하라. 팬·드래그·줌 기능은 유지. 다른 변경 금지.",
+      "stages": [
+        "implement",
+        "test"
+      ],
+      "opened_at": "2026-08-20T19:48:32+09:00",
+      "previous_result": {
+        "stage": "implement",
+        "run_id": "20260820-191449-graph-pan-implement-2",
+        "summary": "Fixed. The failure was environmental, not code — no implementation file was touched.\n\n## What changed\n\n**`tasks/graph-pan.md`** — front matter only (in content terms):\n\n```\nsetup: npm ci --prefix desktop\ntest_commands: npm run typecheck --prefix desktop\n```\n\nreplacing `test_commands: npx --prefix desktop tsc --noEmit -p desktop`. The worktree carries no `desktop/node_modules`, so `npx` fell through to the registry decoy package named `tsc` and exited 1. `setup:` is the pipeline's own mechanism (`run_setup`, `aidev/pipeline.py:3199`) and auto-grants `Bash(npm ci:*)`. `npm run typecheck` resolves `tsc` from `desktop/node_modules/.bin` with cwd inside `desktop/`, and unlike `tsc -p desktop` (a solution file, `\"files\": []`) it actually checks `src/domains/**` and the `.tsx`.\n\n**Side effect I could not avoid, and you should know about:** that file was CP949-encoded (as every file in `tasks/` is). The Edit tool decodes as UTF-8, so a front-matter edit turned the Korean body into `U+FFFD`. I removed and rewrote the file whole, in UTF-8, with the requirement text restored verbatim from the slice's requirement. Net effect on the body: byte encoding changed CP949 → UTF-8, wording identical. This is also a fix rather than a regression — `start_slice` reads the requirement with `read_text(encoding=\"utf-8\")` strict (`aidev/pipeline.py:5308`), which the CP949 bytes would have raised on.\n\n## Verification\n\n| Command | Result |\n|---|---|\n| `npm ci --prefix desktop --no-audit --no-fund` | PASS 45.5s |\n| `npm run typecheck --prefix desktop` (the new declared command) | PASS 8.1s |\n| `npm test --prefix desktop` — typecheck + compiles and runs `layout.test.ts` | PASS 11.9s |\n| `npx --prefix desktop tsc --noEmit -p desktop` (the old declared command, still what this run's `AIDEV_VERIFY_COMMANDS` holds) | PASS 1.8s |\n\n`git status` is clean apart from `tasks/graph-pan.md` — `node_modules` stays untracked.\n\n## Two things worth flagging\n\n1. **How I installed the dependencies.** Plain `npm` i"
+      }
+    }
+  ],
   "repairs": [
     {
       "n": 1,
@@ -39,13 +54,13 @@
     },
     "implement": {
       "status": "done",
-      "run_id": "20260820-191449-graph-pan-implement-2",
-      "attempts": 2,
+      "run_id": "20260820-194833-graph-pan-implement-3",
+      "attempts": 3,
       "commit": "6377447c6e5a149b13555c77fed9a84b273e0832"
     },
     "test": {
-      "status": "done",
-      "verdict": "pass"
+      "status": "pending",
+      "commit": "52a777279eeb7356d00302cd019384526cff940c"
     }
   },
   "runs": [
@@ -112,7 +127,23 @@
         "peak_context": 86294
       },
       "cost_usd": 2.4710290000000006
+    },
+    {
+      "stage": "implement",
+      "attempt": 3,
+      "run_id": "20260820-194833-graph-pan-implement-3",
+      "status": "completed",
+      "turns": 58,
+      "tokens": {
+        "input": 1825,
+        "cache_creation": 128717,
+        "cache_read": 5807765,
+        "output": 65734,
+        "billed_input": 5938307,
+        "peak_context": 149603
+      },
+      "cost_usd": 5.8435274999999995
     }
   ],
-  "updated_at": "2026-08-20T19:31:51+09:00"
+  "updated_at": "2026-08-20T20:18:24+09:00"
 }
