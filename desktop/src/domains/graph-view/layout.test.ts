@@ -16,28 +16,49 @@ import {
   DRAG_SLOP,
   EDGE_W_MAX,
   EDGE_W_MIN,
+  FILE_BOX_H,
+  KEY_FN_PER_FILE,
   LANE_MAX,
+  LOD_FILE_MAX,
+  LOD_KEY_MAX,
   MAX_FILE_EDGES,
+  MINIMAP_H,
+  MINIMAP_W,
   NO_OFFSETS,
+  ROW_H,
+  ZOOM_STEPS,
   boxAnchor,
+  boxCenter,
   boxHeight,
   buildAdjacency,
+  callerCounts,
   canvasSize,
+  centerScroll,
   clampOffset,
   edgePath,
   edgeWidth,
   fileLines,
+  fitChars,
   flattenFunctions,
   groupMarks,
   isDrag,
   layoutGraph,
+  lodFor,
   matchFunctions,
   mergeMarks,
+  minimapFit,
+  nearestBoxPath,
   neighbourMarks,
   offsetOf,
   offsetsByBox,
+  resolveAnchor,
   shiftAnchor,
+  viewportOf,
+  visibleRows,
   withOffset,
+  zoomIn,
+  zoomOut,
+  type Offset,
   type Offsets,
   type RowMark
 } from './layout'
@@ -422,6 +443,357 @@ describe('at the size this repository actually is', () => {
     let counted = 0
     for (const [, rows] of grouped) counted += rows.size
     assert.equal(counted, marks.size)
+  })
+})
+
+// -------------------------------------------------------- scale of detail
+
+describe('lodFor', () => {
+  test('the thresholds are inclusive, and each band draws what it says', () => {
+    assert.equal(lodFor(0.4), 'file')
+    assert.equal(lodFor(LOD_FILE_MAX), 'file')
+    assert.equal(lodFor(0.7), 'key')
+    assert.equal(lodFor(LOD_KEY_MAX), 'key')
+    assert.equal(lodFor(LOD_KEY_MAX + 0.01), 'full')
+    assert.equal(lodFor(1), 'full')
+    assert.equal(lodFor(1.8), 'full')
+  })
+
+  test('a zoom that is not a number reads as the coarsest level, not a crash', () => {
+    assert.equal(lodFor(0), 'file')
+    assert.equal(lodFor(-1), 'file')
+    assert.equal(lodFor(Number.NaN), 'file')
+  })
+})
+
+describe('zoomIn / zoomOut', () => {
+  test('one rung at a time, and both ends hold', () => {
+    assert.equal(zoomIn(1), ZOOM_STEPS[ZOOM_STEPS.indexOf(1) + 1])
+    assert.equal(zoomOut(1), ZOOM_STEPS[ZOOM_STEPS.indexOf(1) - 1])
+    assert.equal(zoomIn(ZOOM_STEPS[ZOOM_STEPS.length - 1]), ZOOM_STEPS[ZOOM_STEPS.length - 1])
+    assert.equal(zoomOut(ZOOM_STEPS[0]), ZOOM_STEPS[0])
+  })
+
+  test('a zoom that is not on the ladder starts from the nearest rung', () => {
+    // 0.63 is nearer 0.7 than 0.5, so climbing from it lands above 0.7.
+    assert.equal(zoomIn(0.63), 0.85)
+    assert.equal(zoomOut(0.63), 0.5)
+  })
+
+  test('twice out of the whole view is the file view — the reason for the two new rungs', () => {
+    assert.equal(lodFor(1), 'full')
+    assert.equal(lodFor(zoomOut(1)), 'key')
+    assert.equal(lodFor(zoomOut(zoomOut(1))), 'key')
+    assert.equal(lodFor(zoomOut(zoomOut(zoomOut(1)))), 'file')
+  })
+})
+
+describe('callerCounts', () => {
+  test('each function is counted once per distinct caller', () => {
+    const counts = callerCounts([
+      { from: 1, to: 2 },
+      { from: 3, to: 2 },
+      { from: 1, to: 4 }
+    ])
+    assert.equal(counts.get(2), 2)
+    assert.equal(counts.get(4), 1)
+    // Nobody calls 1, and an id nobody calls is not a key at all.
+    assert.equal(counts.get(1), undefined)
+    assert.equal(counts.size, 2)
+  })
+
+  test('no edges is an empty count, not a crash', () => {
+    assert.equal(callerCounts([]).size, 0)
+  })
+})
+
+describe('visibleRows', () => {
+  const counts = new Map<number, number>()
+
+  test('the full level hands back the very array it was given', () => {
+    const rows = [fn('a', 'x.py'), fn('b', 'x.py')]
+    // Referential identity, not deep equality: this is what `FileBox`'s memo
+    // rests on, and a copy here would quietly wake a hundred boxes a frame.
+    assert.equal(visibleRows(rows, 'full', counts), rows)
+  })
+
+  test('the file level is always the same empty array', () => {
+    const first = visibleRows([fn('a', 'x.py')], 'file', counts)
+    const second = visibleRows([fn('b', 'y.py')], 'file', counts)
+    assert.equal(first.length, 0)
+    assert.equal(first, second)
+  })
+
+  test('a file shorter than the cut is handed straight back', () => {
+    const rows = Array.from({ length: KEY_FN_PER_FILE }, (_, i) => fn(`a${i}`, 'x.py'))
+    assert.equal(visibleRows(rows, 'key', counts), rows)
+  })
+
+  test('the middle level keeps the most-called, in the order they are written', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => fn(`a${i}`, 'x.py'))
+    const weights = new Map<number, number>()
+    // The last three are the busiest, in reverse order of appearance.
+    weights.set(rows[9].id, 30)
+    weights.set(rows[8].id, 20)
+    weights.set(rows[7].id, 10)
+    const kept = visibleRows(rows, 'key', weights, 3)
+    assert.equal(kept.length, 3)
+    assert.deepEqual(
+      kept.map((each) => each.name),
+      ['a7', 'a8', 'a9']
+    )
+  })
+
+  test('nobody calls anybody: the file’s own order decides', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => fn(`a${i}`, 'x.py'))
+    const kept = visibleRows(rows, 'key', counts, 3)
+    assert.deepEqual(
+      kept.map((each) => each.name),
+      ['a0', 'a1', 'a2']
+    )
+  })
+})
+
+describe('layoutGraph at each level', () => {
+  test('the file level places boxes and no rows at all', () => {
+    const files = bigRepo(105, 1435)
+    const layout = layoutGraph(files, 'file')
+    assert.equal(layout.boxes.length, 105)
+    // No anchors means no function edges to draw — the requirement, in numbers.
+    assert.equal(layout.anchors.size, 0)
+    for (const box of layout.boxes) {
+      assert.equal(box.height, FILE_BOX_H)
+      assert.equal(box.functions.length, 0)
+      assert.equal(box.hidden, box.total)
+    }
+    assert.equal(layout.boxOf.size, 105)
+  })
+
+  test('the counts a header prints are the file’s own, whatever the level', () => {
+    const files: GraphFileGroup[] = [
+      {
+        path: 'a.py',
+        lang: 'py',
+        functions: [
+          fn('one', 'a.py'),
+          fn('two', 'a.py', { hasSpec: false, summary: '' }),
+          fn('test_three', 'a.py', { isTest: true })
+        ]
+      }
+    ]
+    for (const lod of ['file', 'key', 'full'] as const) {
+      const box = layoutGraph(files, lod).boxes[0]
+      assert.equal(box.total, 3)
+      assert.equal(box.specTotal, 2)
+      assert.equal(box.specCovered, 1)
+    }
+  })
+
+  test('the middle level draws the cut rows and counts the rest', () => {
+    const files = bigRepo(105, 1435)
+    const counts = callerCounts([])
+    const layout = layoutGraph(files, 'key', counts)
+    for (const box of layout.boxes) {
+      assert.ok(box.functions.length <= KEY_FN_PER_FILE)
+      assert.equal(box.hidden, box.total - box.functions.length)
+    }
+    // Only the drawn rows have anchors; every file still has a box.
+    let drawn = 0
+    for (const box of layout.boxes) drawn += box.functions.length
+    assert.equal(layout.anchors.size, drawn)
+    assert.equal(layout.boxOf.size, files.length)
+    for (const file of files) assert.ok(layout.boxOf.has(file.path))
+  })
+
+  test('zooming out really does shrink the map — the whole point of the slice', () => {
+    const files = bigRepo(105, 1435)
+    const full = layoutGraph(files, 'full')
+    const file = layoutGraph(files, 'file')
+    assert.ok(
+      file.width * 3 < full.width,
+      `file view ${file.width} is not a third of ${full.width}`
+    )
+    assert.ok(file.height <= COLUMN_H, `file view is ${file.height} tall`)
+  })
+
+  test('the default arguments are the view that was there before', () => {
+    const files = bigRepo()
+    const before = layoutGraph(files)
+    assert.equal(before.anchors.size, flattenFunctions(files).length)
+    assert.equal(before.boxes[0].functions, files[0].functions)
+  })
+})
+
+describe('boxHeight at each level', () => {
+  test('the file level is one fixed card, however big the file', () => {
+    assert.equal(boxHeight(0, 'file'), FILE_BOX_H)
+    assert.equal(boxHeight(207, 'file', 207), FILE_BOX_H)
+  })
+
+  test('a cut list is one line taller, for the "+N more" it has to say', () => {
+    assert.equal(boxHeight(6, 'key', 0) + ROW_H, boxHeight(6, 'key', 40))
+  })
+
+  test('the old call is the old answer', () => {
+    assert.equal(boxHeight(400), 30 + 400 * 18 + 8)
+  })
+})
+
+describe('fitChars', () => {
+  test('a bigger label fits fewer characters', () => {
+    assert.ok(fitChars(BOX_W, 12) > fitChars(BOX_W, 30))
+  })
+
+  test('however narrow the box, a name is never cut to nothing', () => {
+    assert.equal(fitChars(0, 12), 4)
+    assert.equal(fitChars(BOX_W, 0), 4)
+    assert.ok(fitChars(20, 40) >= 4)
+  })
+})
+
+// ------------------------------------------------------------- the viewport
+
+describe('centerScroll', () => {
+  const view = { width: 800, height: 600 }
+  const size = { width: 4000, height: 3000 }
+
+  test('the point asked for ends up in the middle', () => {
+    const at = centerScroll({ x: 1000, y: 900 }, 1, view, size)
+    assert.equal(at.left + view.width / 2, 1000)
+    assert.equal(at.top + view.height / 2, 900)
+  })
+
+  test('the top left corner does not scroll to a negative place', () => {
+    const at = centerScroll({ x: 0, y: 0 }, 1, view, size)
+    assert.deepEqual(at, { left: 0, top: 0 })
+  })
+
+  test('the far corner does not scroll past what there is', () => {
+    const at = centerScroll({ x: 99999, y: 99999 }, 1, view, size)
+    assert.equal(at.left, size.width - view.width)
+    assert.equal(at.top, size.height - view.height)
+  })
+
+  test('a canvas smaller than the window has nowhere to scroll', () => {
+    const at = centerScroll({ x: 50, y: 50 }, 1, view, { width: 100, height: 80 })
+    assert.deepEqual(at, { left: 0, top: 0 })
+  })
+
+  test('the zoom is what user units are measured in', () => {
+    const at = centerScroll({ x: 1000, y: 900 }, 0.5, view, size)
+    assert.equal(at.left + view.width / 2, 500)
+  })
+})
+
+describe('viewportOf', () => {
+  test('half the zoom is twice the canvas on screen', () => {
+    const port = viewportOf({ left: 100, top: 50, width: 800, height: 600 }, 0.5)
+    assert.deepEqual(port, { x: 200, y: 100, w: 1600, h: 1200 })
+  })
+
+  test('a zoom of zero is read as one rather than dividing by it', () => {
+    const port = viewportOf({ left: 10, top: 20, width: 30, height: 40 }, 0)
+    assert.deepEqual(port, { x: 10, y: 20, w: 30, h: 40 })
+  })
+})
+
+describe('nearestBoxPath', () => {
+  test('the middle of a box is that box', () => {
+    const layout = layoutGraph(threeFiles())
+    for (const box of layout.boxes) {
+      assert.equal(nearestBoxPath(layout, boxCenter(box, { dx: 0, dy: 0 })), box.path)
+    }
+  })
+
+  test('a point off the canvas still names the box nearest to it', () => {
+    const layout = layoutGraph(threeFiles())
+    assert.equal(nearestBoxPath(layout, { x: -9999, y: -9999 }), layout.boxes[0].path)
+    const last = layout.boxes[layout.boxes.length - 1]
+    assert.equal(nearestBoxPath(layout, { x: 9999, y: 99999 }), last.path)
+  })
+
+  test('an empty canvas names nothing', () => {
+    assert.equal(nearestBoxPath(layoutGraph([]), { x: 0, y: 0 }), null)
+  })
+})
+
+describe('boxCenter', () => {
+  test('a dragged box’s middle moves with it', () => {
+    const box = layoutGraph(threeFiles()).boxes[0]
+    assert.deepEqual(boxCenter(box, { dx: 10, dy: 20 }), {
+      x: box.x + 10 + box.width / 2,
+      y: box.y + 20 + box.height / 2
+    })
+  })
+})
+
+describe('minimapFit', () => {
+  test('a wide canvas fits the width, a tall one the height', () => {
+    const wide = minimapFit({ width: 4000, height: 800 })
+    assert.equal(Math.round(wide.width), MINIMAP_W)
+    assert.ok(wide.height <= MINIMAP_H)
+
+    const tall = minimapFit({ width: 800, height: 6000 })
+    assert.equal(Math.round(tall.height), MINIMAP_H)
+    assert.ok(tall.width <= MINIMAP_W)
+  })
+
+  test('nothing ever leaves the box the map is allowed', () => {
+    for (const size of [
+      { width: 6808, height: 1400 },
+      { width: 2044, height: 1400 },
+      { width: 50, height: 20 }
+    ]) {
+      const fit = minimapFit(size)
+      assert.ok(fit.width <= MINIMAP_W + 0.001)
+      assert.ok(fit.height <= MINIMAP_H + 0.001)
+    }
+  })
+
+  test('an empty canvas is a zero-sized map, not a NaN', () => {
+    const fit = minimapFit({ width: 0, height: 0 })
+    assert.deepEqual(fit, { scale: 0, width: 0, height: 0 })
+    assert.ok(Number.isFinite(minimapFit({ width: 100, height: 0 }).scale))
+  })
+})
+
+describe('resolveAnchor', () => {
+  const files = threeFiles()
+  const byId = new Map(flattenFunctions(files).map((each) => [each.id, each]))
+  const noBox = new Map<number, Offset>()
+
+  test('a drawn row is its own row', () => {
+    const layout = layoutGraph(files, 'full')
+    const id = files[1].functions[0].id
+    const at = resolveAnchor(layout, byId, noBox, id)
+    assert.deepEqual(at, layout.anchors.get(id))
+  })
+
+  test('a row this level does not draw falls back to its file’s box', () => {
+    const layout = layoutGraph(files, 'file')
+    const id = files[1].functions[0].id
+    assert.equal(layout.anchors.has(id), false)
+    const box = layout.boxes[layout.boxOf.get('b.py') as number]
+    assert.deepEqual(resolveAnchor(layout, byId, noBox, id), boxAnchor(box))
+  })
+
+  test('a function this index never had is null, not a guess', () => {
+    const layout = layoutGraph(files, 'file')
+    assert.equal(resolveAnchor(layout, byId, noBox, 999999), null)
+  })
+
+  test('either way, a dragged box takes its anchor with it', () => {
+    const id = files[2].functions[0].id
+    for (const lod of ['full', 'file'] as const) {
+      const layout = layoutGraph(files, lod)
+      const at = layout.boxOf.get('c.py') as number
+      const byBox = new Map<number, Offset>([[at, { dx: 15, dy: -5 }]])
+      const moved = resolveAnchor(layout, byId, byBox, id)
+      const still = resolveAnchor(layout, byId, noBox, id)
+      assert.ok(moved && still)
+      assert.equal(moved.left, still.left + 15)
+      assert.equal(moved.y, still.y - 5)
+    }
   })
 })
 

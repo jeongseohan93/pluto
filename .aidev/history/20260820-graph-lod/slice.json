@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-lod",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260820-graph-lod",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "4dad8ad770aec755deedfe370553734f2c79132b",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260820-180435-graph-lod-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "ee0c8f4438b05ec360d2ad031c01d6f2aa381036"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-181731-graph-lod-implement",
+      "attempts": 1
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,23 @@
         "peak_context": 131517
       },
       "cost_usd": 3.066737
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-181731-graph-lod-implement",
+      "status": "completed",
+      "turns": 93,
+      "tokens": {
+        "input": 164,
+        "cache_creation": 176810,
+        "cache_read": 13310581,
+        "output": 71194,
+        "billed_input": 13487555,
+        "peak_context": 197696
+      },
+      "cost_usd": 10.2040605
     }
   ],
-  "updated_at": "2026-08-20T18:14:45+09:00"
+  "updated_at": "2026-08-20T18:50:01+09:00"
 }

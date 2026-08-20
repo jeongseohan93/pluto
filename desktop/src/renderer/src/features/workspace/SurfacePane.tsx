@@ -11,6 +11,7 @@ import type { SymbolLocation } from '@renderer/lib/graph-lookup'
 import { Icon } from '@renderer/components/Icon'
 import { DemoBadge } from '@shared/ui/DemoBadge'
 import { FunctionGraphSurface } from '@domains/graph-view/ui/FunctionGraphSurface'
+import { zoomIn, zoomOut } from '@domains/graph-view/layout'
 import type { GraphIndexResult } from '@domains/graph-view/types'
 
 export type SurfaceId = 'plan' | 'functions' | 'graph' | 'code' | 'test' | 'diff' | 'browser'
@@ -113,10 +114,12 @@ export function SurfacePane({
         right={
           <>
             {surface === 'graph' || surface === 'functions' ? (
+              // A ladder rather than ±0.2, so the two rungs below 60% — where
+              // the function graph switches to file boxes — can be reached.
               <div className="flex items-center gap-0.5 font-mono text-micro text-fg-mute">
-                <ZoomButton label="−" onClick={() => onZoomChange(Math.max(0.6, zoom - 0.2))} />
+                <ZoomButton label="−" onClick={() => onZoomChange(zoomOut(zoom))} />
                 <span className="w-9 text-center">{Math.round(zoom * 100)}%</span>
-                <ZoomButton label="+" onClick={() => onZoomChange(Math.min(1.8, zoom + 0.2))} />
+                <ZoomButton label="+" onClick={() => onZoomChange(zoomIn(zoom))} />
               </div>
             ) : null}
             {onToggleSplit ? (
@@ -146,6 +149,7 @@ export function SurfacePane({
             onBuild={data.functions.onBuild}
             busy={data.functions.busy}
             zoom={zoom}
+            onZoomChange={onZoomChange}
           />
         ) : surface === 'graph' ? (
           <GraphSurface
