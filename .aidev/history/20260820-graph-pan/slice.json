@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-pan",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260820-graph-pan",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9d81b7ad339ebe5a80713b6284cb0e74dd701381",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 19,
+    "test_files": 6,
+    "budget": 60,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-185502-graph-pan-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-20T18:54:55+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260820-185502-graph-pan-plan",
+      "status": "completed",
+      "turns": 34,
+      "tokens": {
+        "input": 331,
+        "cache_creation": 112586,
+        "cache_read": 2094776,
+        "output": 36080,
+        "billed_input": 2207693,
+        "peak_context": 127055
+      },
+      "cost_usd": 3.076903
+    }
+  ],
+  "updated_at": "2026-08-20T19:03:34+09:00"
 }
