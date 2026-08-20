@@ -1,20 +1,18 @@
 import type { JSX } from 'react'
-import type { ChangeSummary, CodeGraph, TestCase } from '@shared/ide'
 import { TabBar } from '@renderer/components/primitives'
-import { GraphSurface } from '@renderer/features/graph/GraphSurface'
-import { CodeSurface } from '@renderer/features/code/CodeSurface'
-import { TestSurface } from '@renderer/features/tests/TestSurface'
-import { DiffSurface } from '@renderer/features/diff/DiffSurface'
-import { BrowserSurface } from '@renderer/features/browser/BrowserSurface'
 import { PlanSurface, type PlanSurfaceProps } from '@renderer/features/pipeline/PlanSurface'
-import type { SymbolLocation } from '@renderer/lib/graph-lookup'
 import { Icon } from '@renderer/components/Icon'
-import { DemoBadge } from '@shared/ui/DemoBadge'
 import { FunctionGraphSurface } from '@domains/graph-view/ui/FunctionGraphSurface'
 import { zoomIn, zoomOut } from '@domains/graph-view/layout'
 import type { GraphIndexResult } from '@domains/graph-view/types'
 
-export type SurfaceId = 'plan' | 'functions' | 'graph' | 'code' | 'test' | 'diff' | 'browser'
+/**
+ * The surfaces the tab bar can open. The five mock screens
+ * (`features/graph|code|tests|diff|browser`) are still in the tree, but nothing
+ * routes to them any more: a tab bar that is half demo is a tab bar nobody can
+ * read. They come back by being finished, not by being listed.
+ */
+export type SurfaceId = 'plan' | 'functions'
 
 export interface SurfaceData {
   /** The real pipeline. */
@@ -30,18 +28,24 @@ export interface SurfaceData {
     busy: boolean
   }
   waitingCount: number
-  /** Mock from here down — every surface that shows these wears a [DEMO] badge. */
-  graph: CodeGraph | null
-  changes: ChangeSummary | null
-  tests: TestCase[] | null
-  location: SymbolLocation | null
-  selectedSymbolId: string | null
-  onSelectSymbol: (id: string) => void
 }
 
 /**
  * One work surface. The shell holds several of these side by side, so nothing
  * here assumes it owns the whole window.
+ *
+ * @param surface          which surface this pane is showing
+ * @param onSurfaceChange  a tab was pressed
+ * @param data             everything the two surfaces read
+ * @param zoom             the graph's scale, shared by every pane
+ * @param onZoomChange     change that scale
+ * @param onToggleSplit    open or close the shell's second pane
+ * @param splitOpen        is that second pane open?
+ * @param codeSplit        the share the code panel takes beside the graph, held
+ *                         by the shell so a trip to another tab does not lose it
+ * @param onCodeSplitChange  the graph/code divider was dragged
+ * @param onCodeSplitOpen  code appeared beside the graph — the shell's chance to
+ *                         make room for it
  */
 export function SurfacePane({
   surface,
@@ -50,7 +54,10 @@ export function SurfacePane({
   zoom,
   onZoomChange,
   onToggleSplit,
-  splitOpen
+  splitOpen,
+  codeSplit,
+  onCodeSplitChange,
+  onCodeSplitOpen
 }: {
   surface: SurfaceId
   onSurfaceChange: (id: SurfaceId) => void
@@ -59,9 +66,10 @@ export function SurfacePane({
   onZoomChange: (z: number) => void
   onToggleSplit?: () => void
   splitOpen?: boolean
+  codeSplit: number
+  onCodeSplitChange: (fraction: number) => void
+  onCodeSplitOpen?: () => void
 }): JSX.Element {
-  const failed = (data.tests ?? []).filter((t) => t.state === 'failed').length
-
   const tabs = [
     {
       id: 'plan' as const,
@@ -73,36 +81,10 @@ export function SurfacePane({
           </span>
         ) : undefined
     },
-    { id: 'functions' as const, label: 'Function graph' },
-    { id: 'graph' as const, label: 'Graph', badge: <DemoBadge /> },
-    { id: 'code' as const, label: 'Code', badge: <DemoBadge /> },
-    {
-      id: 'test' as const,
-      label: 'Test',
-      badge: (
-        <>
-          {failed > 0 ? (
-            <span className="rounded-sm bg-bad/20 px-1 font-mono text-micro text-bad">{failed}</span>
-          ) : null}
-          <DemoBadge />
-        </>
-      )
-    },
-    {
-      id: 'diff' as const,
-      label: 'Diff',
-      badge: (
-        <>
-          {data.changes?.filesChanged ? (
-            <span className="rounded-sm bg-active px-1 font-mono text-micro text-fg-mute">
-              {data.changes.filesChanged}
-            </span>
-          ) : null}
-          <DemoBadge />
-        </>
-      )
-    },
-    { id: 'browser' as const, label: 'Browser', badge: <DemoBadge /> }
+    // Just 'Graph' now: with the mock one gone from the bar this is the only
+    // graph in the app. The id stays 'functions' — what it opens is still the
+    // Function DB, and inheriting the dead tab's id would blur which is which.
+    { id: 'functions' as const, label: 'Graph' }
   ]
 
   return (
@@ -113,7 +95,7 @@ export function SurfacePane({
         onChange={onSurfaceChange}
         right={
           <>
-            {surface === 'graph' || surface === 'functions' ? (
+            {surface === 'functions' ? (
               // A ladder rather than ±0.2, so the two rungs below 60% — where
               // the function graph switches to file boxes — can be reached.
               <div className="flex items-center gap-0.5 font-mono text-micro text-fg-mute">
@@ -126,7 +108,9 @@ export function SurfacePane({
               <button
                 type="button"
                 onClick={onToggleSplit}
-                title={splitOpen ? 'Close split' : 'Split editor'}
+                // "Split" now names the graph/code divider inside the surface,
+                // so this button says what it actually opens: a second pane.
+                title={splitOpen ? 'Close the second pane' : 'Open a second pane'}
                 aria-pressed={splitOpen}
                 className={`p-1 ${splitOpen ? 'text-fg-dim' : 'text-fg-mute hover:text-fg-dim'}`}
               >
@@ -140,7 +124,7 @@ export function SurfacePane({
       <div className="min-h-0 flex-1">
         {surface === 'plan' ? (
           <PlanSurface {...data.pipeline} />
-        ) : surface === 'functions' ? (
+        ) : (
           <FunctionGraphSurface
             index={data.functions.index}
             loading={data.functions.loading}
@@ -150,22 +134,10 @@ export function SurfacePane({
             busy={data.functions.busy}
             zoom={zoom}
             onZoomChange={onZoomChange}
+            split={codeSplit}
+            onSplitChange={onCodeSplitChange}
+            onSplitOpen={onCodeSplitOpen}
           />
-        ) : surface === 'graph' ? (
-          <GraphSurface
-            graph={data.graph}
-            selectedSymbolId={data.selectedSymbolId}
-            onSelectSymbol={data.onSelectSymbol}
-            zoom={zoom}
-          />
-        ) : surface === 'code' ? (
-          <CodeSurface location={data.location} />
-        ) : surface === 'test' ? (
-          <TestSurface tests={data.tests} selectedSymbolName={data.location?.symbol.name ?? null} />
-        ) : surface === 'diff' ? (
-          <DiffSurface changes={data.changes} />
-        ) : (
-          <BrowserSurface />
         )}
       </div>
     </div>

@@ -78,6 +78,7 @@ import {
   type TraceDrawing
 } from '@domains/graph-view/layout'
 import type { CodeTarget } from '@domains/code-view/types'
+import { SPLIT_STEP, clampSplit, splitFrom } from '@domains/code-view/split'
 import { CodeViewer } from '@domains/code-view/ui/CodeViewer'
 import { FunctionDetail } from '@domains/graph-view/ui/FunctionDetail'
 import { Minimap } from '@domains/graph-view/ui/Minimap'
@@ -209,14 +210,22 @@ function takesSpace(target: EventTarget | null): boolean {
  * @param zoom       the surface's zoom factor
  * @param onZoomChange  change the scale — how a jump to one function brings the
  *                      level of detail it needs along with it
+ * @param split        the share the code panel takes of the row it shares with
+ *                     the canvas (0..1). The shell holds it, so it outlives a
+ *                     trip to another tab
+ * @param onSplitChange  the divider moved — hand the new share back to the shell
+ * @param onSplitOpen  the split has appeared. The shell's chance to make room
+ *                     for it, called at that moment and only then
  * @flow  no index -> a reading state ; index not ok -> the reason and a way out
- *        -> otherwise the canvas, plus the code viewer when a row was
- *        double-clicked, plus the detail panel for the selection, which folds
- *        away and comes back by itself when a row is picked
+ *        -> otherwise the canvas, plus — beside it, never over it — the code
+ *        panel when a row was double-clicked, with a divider between the two
+ *        that can be dragged, plus the detail panel for the selection, which
+ *        folds away and comes back by itself when a row is picked
  * 주요 내부 변수: hover(포인터 아래의 행/파일), focus(선택 여부 = 뷰 모드),
  * offsets(끌어다 놓은 상자들 — 세션 한정), drag(진행 중인 드래그),
  * pan(진행 중인 팬), spaceHeld(스페이스 홀드 = 강제 팬), lod(이 줌이 그리는 레벨),
  * codeTarget/codeOpen(코드 뷰어의 좌표와 표시 여부),
+ * splitRow(그래프+코드가 나눠 갖는 줄 — 비율의 기준자),
  * traceOn/traceDir/traceDepth(추적 설정), trace(DB가 답한 사슬 — null이면 이
  * 모드가 없던 때와 같은 화면)
  */
@@ -228,7 +237,10 @@ export function FunctionGraphSurface({
   onBuild,
   busy,
   zoom,
-  onZoomChange
+  onZoomChange,
+  split,
+  onSplitChange,
+  onSplitOpen
 }: {
   index: GraphIndexResult | null
   loading: boolean
@@ -238,6 +250,9 @@ export function FunctionGraphSurface({
   busy: boolean
   zoom: number
   onZoomChange?: (zoom: number) => void
+  split: number
+  onSplitChange: (fraction: number) => void
+  onSplitOpen?: () => void
 }): JSX.Element {
   const [detail, setDetail] = useState<GraphNodeDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -265,6 +280,8 @@ export function FunctionGraphSurface({
   const [traceDepth, setTraceDepth] = useState(TRACE_DEPTH_DEFAULT)
   const [trace, setTrace] = useState<GraphTrace | null>(null)
   const canvas = useRef<HTMLDivElement>(null)
+  /** The row the graph and the code share. Every share is measured against it. */
+  const splitRow = useRef<HTMLDivElement>(null)
 
   // The drag itself is a ref, not state: a pointer move already re-renders
   // through `offsets`, and there is nothing to gain from a second one.
@@ -378,6 +395,14 @@ export function FunctionGraphSurface({
   useEffect(() => {
     if (selected !== null) setDetailOpen(true)
   }, [selected])
+
+  // The moment the split appears, and only that moment. `codeOpen` as the
+  // dependency is what makes "다른 노드 더블클릭 → 스플릿 유지" a fact about the
+  // code: a second double-click does not move this boolean, so the shell is not
+  // told again and an inspector somebody re-opened stays open.
+  useEffect(() => {
+    if (codeOpen) onSplitOpen?.()
+  }, [codeOpen, onSplitOpen])
 
   // Dragged positions are of *this graph* and no other. A rebuild or a reload
   // makes new files, and the boxes are back where everybody else sees them —
@@ -716,6 +741,36 @@ export function FunctionGraphSurface({
   )
 
   /**
+   * The divider follows the pointer.
+   *
+   * @param clientX  the pointer's client x
+   * @flow  the row not measured yet -> nothing to do ; otherwise the share it
+   *        stands at, cut to both floors and handed up — no state lives here
+   */
+  const moveSplit = useCallback(
+    (clientX: number): void => {
+      const node = splitRow.current
+      if (!node) return
+      const rect = node.getBoundingClientRect()
+      onSplitChange(clampSplit(splitFrom(clientX, rect), rect.width))
+    },
+    [onSplitChange]
+  )
+
+  /**
+   * The divider, one notch, without a pointer.
+   *
+   * @param direction  -1 is left (the code panel widens), +1 is right
+   */
+  const stepSplit = useCallback(
+    (direction: number): void => {
+      const width = splitRow.current?.getBoundingClientRect().width ?? 0
+      onSplitChange(clampSplit(split - direction * SPLIT_STEP, width))
+    },
+    [onSplitChange, split]
+  )
+
+  /**
    * The far view's way in: a file box is clicked, and the level that shows its
    * functions arrives with that file in the middle of it.
    *
@@ -1026,252 +1081,273 @@ export function FunctionGraphSurface({
       />
 
       <div className="flex min-h-0 flex-1">
-        {/* The legend and the minimap sit on a layer that does not scroll, so
-            neither of them has to be pinned with a sticky trick. */}
-        <div className="relative min-w-0 flex-1">
-          <div
-            ref={canvas}
-            className={`h-full w-full overflow-auto bg-app ${
-              panning ? 'cursor-grabbing' : spaceHeld ? 'cursor-grab' : ''
-            }`}
-            onPointerDown={startPan}
-            onPointerMove={movePan}
-            onPointerUp={endPan}
-            onPointerCancel={endPan}
-            // The one end-of-pan the window cannot miss. Without it a capture
-            // lost some other way would leave `panning` set, and with it the
-            // whole graph pointer-transparent and unselectable for good.
-            onLostPointerCapture={endPan}
-          >
-            <svg
-              width={size.width * zoom}
-              height={size.height * zoom}
-              viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
-              className="block select-none"
-              // The whole forced pan, and the whole cursor, in one property:
-              // hit-testing falls through to the container, so `startDrag` can
-              // never fire, no box can ever be found under the pointer, and no
-              // descendant's own cursor can beat the one below.
-              // `pointer-events` is inherited, so this turns off every box and
-              // every row at once — which is why both flags have to be certain
-              // to clear. `spaceHeld` has the keyup and the window blur;
-              // `panning` lasts exactly as long as the container's capture,
-              // whose loss `onLostPointerCapture` always hears.
-              style={{ pointerEvents: panning || spaceHeld ? 'none' : undefined }}
-              onPointerDownCapture={clearDragFlag}
+        {/* The graph and the code's own row. This element is the ruler for the
+            share because the code panel's right edge *is* this row's right
+            edge, which makes the drag one rectangle's worth of arithmetic —
+            the node panel lives outside it, and folding it open or shut cannot
+            shift what the share means. */}
+        <div ref={splitRow} className="flex min-w-0 flex-1">
+          {/* The legend and the minimap sit on a layer that does not scroll, so
+              neither of them has to be pinned with a sticky trick. */}
+          <div className="relative min-w-0 flex-1">
+            <div
+              ref={canvas}
+              className={`h-full w-full overflow-auto bg-app ${
+                panning ? 'cursor-grabbing' : spaceHeld ? 'cursor-grab' : ''
+              }`}
+              onPointerDown={startPan}
+              onPointerMove={movePan}
+              onPointerUp={endPan}
+              onPointerCancel={endPan}
+              // The one end-of-pan the window cannot miss. Without it a capture
+              // lost some other way would leave `panning` set, and with it the
+              // whole graph pointer-transparent and unselectable for good.
+              onLostPointerCapture={endPan}
             >
-              <defs>
-                {/* One arrowhead per edge kind, each painted with that kind's
-                    own token. These markers used `context-stroke`, which is a
-                    Firefox extension that Chromium does not implement — and
-                    marker content inherits from `<defs>`, not from the path
-                    that references it, so the arrowheads were resolving to
-                    `stroke: none` and never painted at all. The direction the
-                    legend promises has to be drawn in a colour this renderer
-                    actually has. */}
-                <marker
-                  id="fn-arrow-calls"
-                  viewBox="0 0 8 8"
-                  refX="7"
-                  refY="4"
-                  markerWidth="7"
-                  markerHeight="7"
-                  orient="auto-start-reverse"
-                >
-                  <path
-                    d="M1 1 L7 4 L1 7"
-                    fill="none"
-                    stroke={EDGE_STYLES.calls.stroke}
-                    strokeWidth="1.2"
-                  />
-                </marker>
-                <marker
-                  id="fn-arrow-callers"
-                  viewBox="0 0 8 8"
-                  refX="7"
-                  refY="4"
-                  markerWidth="7"
-                  markerHeight="7"
-                  orient="auto-start-reverse"
-                >
-                  <path
-                    d="M1 1 L7 4 L1 7"
-                    fill="none"
-                    stroke={EDGE_STYLES.callers.stroke}
-                    strokeWidth="1.2"
-                  />
-                </marker>
-                {/* File links run from 0.5px to 4px wide. In the default marker
-                    units the arrowhead scales with the line and the heavy links
-                    end in a blot, so this one is measured in user space. */}
-                <marker
-                  id="fn-arrow-flat"
-                  viewBox="0 0 8 8"
-                  refX="7"
-                  refY="4"
-                  markerWidth="8"
-                  markerHeight="8"
-                  markerUnits="userSpaceOnUse"
-                  orient="auto-start-reverse"
-                >
-                  <path d="M1 1 L7 4 L1 7" fill="none" stroke="context-stroke" strokeWidth="1.2" />
-                </marker>
-              </defs>
-
-              {/* Clicking bare canvas is the first way back to the whole view,
-                  and dragging it is the pan — so it says it can be grabbed.
-                  During a pan the svg is transparent and the container's own
-                  `grabbing` is what shows through. */}
-              <rect
-                width={Math.max(1, size.width)}
-                height={Math.max(1, size.height)}
-                fill="transparent"
-                className="cursor-grab"
-                onClick={clearSelection}
-              />
-
-              {/* LOD, level one: the whole view, one curve per file pair. It
-                  survives every zoom — the far view keeps the file links and
-                  drops only the function edges. */}
-              <FileLinks lines={links.lines} hotPath={hover.path} dim={focus} />
-
-              {/* LOD, level two: function edges exist only around a selection,
-                  and only where this zoom draws function rows at all. */}
-              <g>
-                {edges.map((edge) => {
-                  const style = edgeStyle(edge.incoming)
-                  return (
+              <svg
+                width={size.width * zoom}
+                height={size.height * zoom}
+                viewBox={`0 0 ${Math.max(1, size.width)} ${Math.max(1, size.height)}`}
+                className="block select-none"
+                // The whole forced pan, and the whole cursor, in one property:
+                // hit-testing falls through to the container, so `startDrag` can
+                // never fire, no box can ever be found under the pointer, and no
+                // descendant's own cursor can beat the one below.
+                // `pointer-events` is inherited, so this turns off every box and
+                // every row at once — which is why both flags have to be certain
+                // to clear. `spaceHeld` has the keyup and the window blur;
+                // `panning` lasts exactly as long as the container's capture,
+                // whose loss `onLostPointerCapture` always hears.
+                style={{ pointerEvents: panning || spaceHeld ? 'none' : undefined }}
+                onPointerDownCapture={clearDragFlag}
+              >
+                <defs>
+                  {/* One arrowhead per edge kind, each painted with that kind's
+                      own token. These markers used `context-stroke`, which is a
+                      Firefox extension that Chromium does not implement — and
+                      marker content inherits from `<defs>`, not from the path
+                      that references it, so the arrowheads were resolving to
+                      `stroke: none` and never painted at all. The direction the
+                      legend promises has to be drawn in a colour this renderer
+                      actually has. */}
+                  <marker
+                    id="fn-arrow-calls"
+                    viewBox="0 0 8 8"
+                    refX="7"
+                    refY="4"
+                    markerWidth="7"
+                    markerHeight="7"
+                    orient="auto-start-reverse"
+                  >
                     <path
-                      key={edge.key}
-                      d={edge.d}
+                      d="M1 1 L7 4 L1 7"
                       fill="none"
-                      stroke={style.stroke}
-                      strokeWidth={1.4}
-                      strokeDasharray={style.dash ?? undefined}
-                      strokeOpacity={edge.faint ? 0.55 : 1}
-                      markerEnd={`url(#${style.marker})`}
+                      stroke={EDGE_STYLES.calls.stroke}
+                      strokeWidth="1.2"
                     />
-                  )
-                })}
-              </g>
+                  </marker>
+                  <marker
+                    id="fn-arrow-callers"
+                    viewBox="0 0 8 8"
+                    refX="7"
+                    refY="4"
+                    markerWidth="7"
+                    markerHeight="7"
+                    orient="auto-start-reverse"
+                  >
+                    <path
+                      d="M1 1 L7 4 L1 7"
+                      fill="none"
+                      stroke={EDGE_STYLES.callers.stroke}
+                      strokeWidth="1.2"
+                    />
+                  </marker>
+                  {/* File links run from 0.5px to 4px wide. In the default marker
+                      units the arrowhead scales with the line and the heavy links
+                      end in a blot, so this one is measured in user space. */}
+                  <marker
+                    id="fn-arrow-flat"
+                    viewBox="0 0 8 8"
+                    refX="7"
+                    refY="4"
+                    markerWidth="8"
+                    markerHeight="8"
+                    markerUnits="userSpaceOnUse"
+                    orient="auto-start-reverse"
+                  >
+                    <path
+                      d="M1 1 L7 4 L1 7"
+                      fill="none"
+                      stroke="context-stroke"
+                      strokeWidth="1.2"
+                    />
+                  </marker>
+                </defs>
 
-              {/* LOD, level two and a half: the traced chain, and the places it
-                  stops. Drawn outside the boxes rather than inside a row, so
-                  `FileBox`'s memo — 105 boxes and 1435 rows — is untouched by
-                  this whole mode. */}
-              {traced && trace ? (
-                <g pointerEvents="none">
-                  {traced.lines.map((line) => {
-                    // The style is the direction's, but the arrow is the call's:
-                    // caller -> callee, whichever way we walked to find it.
-                    const style = edgeStyle(trace.direction === 'callers')
+                {/* Clicking bare canvas is the first way back to the whole view,
+                    and dragging it is the pan — so it says it can be grabbed.
+                    During a pan the svg is transparent and the container's own
+                    `grabbing` is what shows through. */}
+                <rect
+                  width={Math.max(1, size.width)}
+                  height={Math.max(1, size.height)}
+                  fill="transparent"
+                  className="cursor-grab"
+                  onClick={clearSelection}
+                />
+
+                {/* LOD, level one: the whole view, one curve per file pair. It
+                    survives every zoom — the far view keeps the file links and
+                    drops only the function edges. */}
+                <FileLinks lines={links.lines} hotPath={hover.path} dim={focus} />
+
+                {/* LOD, level two: function edges exist only around a selection,
+                    and only where this zoom draws function rows at all. */}
+                <g>
+                  {edges.map((edge) => {
+                    const style = edgeStyle(edge.incoming)
                     return (
                       <path
-                        key={line.key}
-                        d={line.d}
+                        key={edge.key}
+                        d={edge.d}
                         fill="none"
                         stroke={style.stroke}
                         strokeWidth={1.4}
                         strokeDasharray={style.dash ?? undefined}
-                        strokeOpacity={traceOpacity(line.depth, trace.depth)}
+                        strokeOpacity={edge.faint ? 0.55 : 1}
                         markerEnd={`url(#${style.marker})`}
                       />
                     )
                   })}
-                  {/* The stubs take their pointer events back for the tooltip.
-                      They carry no `data-box`, so `startPan` still reads them as
-                      bare canvas and a drag begun on one still pans. */}
-                  {traced.stubs.map((stub) => (
-                    <g key={stub.key} pointerEvents="auto">
-                      <path
-                        d={stub.d}
-                        fill="none"
-                        stroke={TRACE_BREAK_STYLE.stroke}
-                        strokeWidth={1.4}
-                        strokeDasharray={TRACE_BREAK_STYLE.dash ?? undefined}
-                      />
-                      <path
-                        d={stub.tick}
-                        fill="none"
-                        stroke={TRACE_BREAK_STYLE.stroke}
-                        strokeWidth={1.4}
-                      />
-                      <title>{stub.label}</title>
-                    </g>
-                  ))}
                 </g>
-              ) : null}
 
-              {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
-                  one attribute changes, so the rows inside are not re-rendered
-                  even once while the box is being carried across the canvas. */}
-              {layout.boxes.map((box, i) => {
-                const off = offsets.get(box.path)
-                return (
-                  <g
-                    key={box.path}
-                    // What "empty space" means, asked of the DOM: a pointerdown
-                    // that finds this above it is a node's, not the canvas's.
-                    data-box={box.path}
-                    transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
-                    opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
-                    className="cursor-grab"
-                    // Only `opacity` transitions — a dragged box must not lag
-                    // 90ms behind the pointer carrying it.
-                    style={{ transition: 'opacity 90ms linear', touchAction: 'none' }}
-                    onPointerDown={(event) => startDrag(event, box)}
-                    onPointerMove={moveDrag}
-                    onPointerUp={endDrag}
-                    onPointerCancel={endDrag}
-                    onClickCapture={swallowClick}
-                    onDoubleClickCapture={swallowClick}
-                    onMouseOver={(event) => enter(event.target, box.path)}
-                    onMouseLeave={leave}
-                  >
-                    <FileBox
-                      box={box}
-                      lod={lod}
-                      labelScale={labelScale}
-                      selectedId={i === selectedBox ? selected : null}
-                      marks={marks.get(i) ?? NO_MARKS}
-                      hot={hotBoxes.has(i)}
-                      onSelect={pickRow}
-                      onOpenRow={openRow}
-                      onPickFile={lod === 'file' ? pickFile : undefined}
-                    />
+                {/* LOD, level two and a half: the traced chain, and the places it
+                    stops. Drawn outside the boxes rather than inside a row, so
+                    `FileBox`'s memo — 105 boxes and 1435 rows — is untouched by
+                    this whole mode. */}
+                {traced && trace ? (
+                  <g pointerEvents="none">
+                    {traced.lines.map((line) => {
+                      // The style is the direction's, but the arrow is the call's:
+                      // caller -> callee, whichever way we walked to find it.
+                      const style = edgeStyle(trace.direction === 'callers')
+                      return (
+                        <path
+                          key={line.key}
+                          d={line.d}
+                          fill="none"
+                          stroke={style.stroke}
+                          strokeWidth={1.4}
+                          strokeDasharray={style.dash ?? undefined}
+                          strokeOpacity={traceOpacity(line.depth, trace.depth)}
+                          markerEnd={`url(#${style.marker})`}
+                        />
+                      )
+                    })}
+                    {/* The stubs take their pointer events back for the tooltip.
+                        They carry no `data-box`, so `startPan` still reads them as
+                        bare canvas and a drag begun on one still pans. */}
+                    {traced.stubs.map((stub) => (
+                      <g key={stub.key} pointerEvents="auto">
+                        <path
+                          d={stub.d}
+                          fill="none"
+                          stroke={TRACE_BREAK_STYLE.stroke}
+                          strokeWidth={1.4}
+                          strokeDasharray={TRACE_BREAK_STYLE.dash ?? undefined}
+                        />
+                        <path
+                          d={stub.tick}
+                          fill="none"
+                          stroke={TRACE_BREAK_STYLE.stroke}
+                          strokeWidth={1.4}
+                        />
+                        <title>{stub.label}</title>
+                      </g>
+                    ))}
                   </g>
-                )
-              })}
-            </svg>
+                ) : null}
+
+                {/* The drag lives on this wrapper, outside `FileBox`'s memo: only
+                    one attribute changes, so the rows inside are not re-rendered
+                    even once while the box is being carried across the canvas. */}
+                {layout.boxes.map((box, i) => {
+                  const off = offsets.get(box.path)
+                  return (
+                    <g
+                      key={box.path}
+                      // What "empty space" means, asked of the DOM: a pointerdown
+                      // that finds this above it is a node's, not the canvas's.
+                      data-box={box.path}
+                      transform={off ? `translate(${off.dx} ${off.dy})` : undefined}
+                      opacity={focus && !focusBoxes.has(i) ? BOX_DIM : 1}
+                      className="cursor-grab"
+                      // Only `opacity` transitions — a dragged box must not lag
+                      // 90ms behind the pointer carrying it.
+                      style={{ transition: 'opacity 90ms linear', touchAction: 'none' }}
+                      onPointerDown={(event) => startDrag(event, box)}
+                      onPointerMove={moveDrag}
+                      onPointerUp={endDrag}
+                      onPointerCancel={endDrag}
+                      onClickCapture={swallowClick}
+                      onDoubleClickCapture={swallowClick}
+                      onMouseOver={(event) => enter(event.target, box.path)}
+                      onMouseLeave={leave}
+                    >
+                      <FileBox
+                        box={box}
+                        lod={lod}
+                        labelScale={labelScale}
+                        selectedId={i === selectedBox ? selected : null}
+                        marks={marks.get(i) ?? NO_MARKS}
+                        hot={hotBoxes.has(i)}
+                        onSelect={pickRow}
+                        onOpenRow={openRow}
+                        onPickFile={lod === 'file' ? pickFile : undefined}
+                      />
+                    </g>
+                  )
+                })}
+              </svg>
+            </div>
+
+            <Legend
+              shown={links.shown}
+              total={links.total}
+              lod={lod}
+              boxes={layout.boxes.length}
+              rows={layout.anchors.size}
+              trace={trace && traced ? { trace, drawing: traced } : null}
+            />
+            <Minimap
+              scrollRef={canvas}
+              layout={layout}
+              offsets={offsets}
+              size={size}
+              zoom={zoom}
+              open={mapOpen}
+              onToggle={toggleMap}
+            />
           </div>
 
-          <Legend
-            shown={links.shown}
-            total={links.total}
-            lod={lod}
-            boxes={layout.boxes.length}
-            rows={layout.anchors.size}
-            trace={trace && traced ? { trace, drawing: traced } : null}
-          />
-          <Minimap
-            scrollRef={canvas}
-            layout={layout}
-            offsets={offsets}
-            size={size}
-            zoom={zoom}
-            open={mapOpen}
-            onToggle={toggleMap}
-          />
+          {/* The summoned editor, beside the canvas and never over it, with the
+              divider that shares the row between them. There is no folded strip
+              for it: [코드 보기] is the way back, and a permanent vertical bar
+              would only narrow the canvas for nothing. The share is a
+              percentage of this row, which is exactly the box the drag measured
+              — so what was dragged and what is drawn read the same ruler. */}
+          {codeOpen ? (
+            <>
+              <SplitHandle onMove={moveSplit} onStep={stepSplit} />
+              <div
+                className="flex min-w-0 shrink-0 flex-col bg-panel"
+                style={{ width: `${(split * 100).toFixed(3)}%` }}
+              >
+                <CodeViewer target={codeTarget} onClose={() => setCodeOpen(false)} />
+              </div>
+            </>
+          ) : null}
         </div>
-
-        {/* The summoned editor, between the canvas and the node panel. There is
-            no folded strip for it: [코드 보기] is the way back, and a permanent
-            vertical bar would only narrow the canvas for nothing. */}
-        {codeOpen ? (
-          <div className="flex w-[34rem] min-w-0 shrink-0 flex-col border-l border-line bg-panel">
-            <CodeViewer target={codeTarget} onClose={() => setCodeOpen(false)} />
-          </div>
-        ) : null}
 
         {detailOpen ? (
           <div className="flex w-80 shrink-0 flex-col border-l border-line bg-panel">
@@ -1594,6 +1670,72 @@ function StepButton({
     >
       {label}
     </button>
+  )
+}
+
+/**
+ * The divider between the graph and the code — dragged, or nudged by arrow key.
+ *
+ * It sits *outside* the canvas's scroll container, so it never meets `startPan`:
+ * dragging the divider cannot pan the graph, and that is a fact about the DOM
+ * rather than a flag somebody has to keep correct. The pointer capture is here
+ * for the same reason the box drag has one — a divider dragged out over the
+ * editor must stay the owner of that pointer.
+ *
+ * @param onMove  the pointer's client x. What share that is, the parent decides
+ *                by measuring the row
+ * @param onStep  one notch: -1 is left, +1 is right
+ * @flow  the primary button only ; moves are read only from the captured
+ *        pointer ; up·cancel·lostpointercapture — whichever arrives first lets
+ *        go, and the rest see the id no longer matches
+ */
+function SplitHandle({
+  onMove,
+  onStep
+}: {
+  onMove: (clientX: number) => void
+  onStep: (direction: number) => void
+}): JSX.Element {
+  const held = useRef<number | null>(null)
+
+  const release = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (held.current !== event.pointerId) return
+    held.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize the code panel"
+      title="Drag to resize · ← → to nudge"
+      tabIndex={0}
+      className="w-1 shrink-0 cursor-col-resize border-l border-line hover:bg-accent-soft focus:bg-accent-soft focus:outline-none"
+      style={{ touchAction: 'none' }}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return
+        // Or the browser starts a text selection spanning both panels.
+        event.preventDefault()
+        event.currentTarget.setPointerCapture(event.pointerId)
+        held.current = event.pointerId
+      }}
+      onPointerMove={(event) => {
+        if (held.current !== event.pointerId) return
+        onMove(event.clientX)
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
+      onLostPointerCapture={release}
+      onKeyDown={(event) => {
+        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+        // Or the scroll container slides sideways along with it.
+        event.preventDefault()
+        onStep(event.key === 'ArrowLeft' ? -1 : 1)
+      }}
+    />
   )
 }
 

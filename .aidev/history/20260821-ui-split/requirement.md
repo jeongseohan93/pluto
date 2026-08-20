@@ -1,8 +1,7 @@
----
+﻿---
 approval: plan
-max_turns: implement=180
-setup: npm ci --prefix desktop
-test_commands: npm --prefix desktop run typecheck
+max_turns: implement=140
+test_commands: npx --prefix desktop tsc --noEmit -p desktop
 ---
 # UI 정리 — 탭 정돈 + 그래프/코드 스플릿 뷰
 
