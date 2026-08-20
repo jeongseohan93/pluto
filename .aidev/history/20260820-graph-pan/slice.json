@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-pan",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260820-graph-pan",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9d81b7ad339ebe5a80713b6284cb0e74dd701381",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260820-185502-graph-pan-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "a70e987d3c1c98d0363f4824cd7caf9639c56287"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260820-190412-graph-pan-implement",
+      "attempts": 1
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,23 @@
         "peak_context": 127055
       },
       "cost_usd": 3.076903
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-190412-graph-pan-implement",
+      "status": "completed",
+      "turns": 59,
+      "tokens": {
+        "input": 104,
+        "cache_creation": 98913,
+        "cache_read": 5160852,
+        "output": 35281,
+        "billed_input": 5259869,
+        "peak_context": 119799
+      },
+      "cost_usd": 4.452100999999999
     }
   ],
-  "updated_at": "2026-08-20T19:03:34+09:00"
+  "updated_at": "2026-08-20T19:12:27+09:00"
 }

@@ -71,6 +71,16 @@ export const FILE_META_PX = 9
 export const ZOOM_DETAIL = 1
 /** The rungs the zoom buttons climb. The bottom two are this slice's far view. */
 export const ZOOM_STEPS: readonly number[] = [0.4, 0.5, 0.7, 0.85, 1, 1.25, 1.5, 1.8]
+/** The ladder's two ends. The wheel moves between the rungs rather than along
+ *  them, so it needs the range and not the rungs; `nearestStep` then puts the
+ *  buttons back on the ladder from wherever the wheel left the zoom. */
+export const ZOOM_MIN = ZOOM_STEPS[0]
+export const ZOOM_MAX = ZOOM_STEPS[ZOOM_STEPS.length - 1]
+/** One wheel notch's share of an e-fold. 100px ⇒ ×1.16 — a notch you feel once. */
+export const ZOOM_WHEEL_RATE = 0.0015
+/** `deltaMode` 1 and 2 are lines and pages; these are what they are worth in px. */
+export const WHEEL_LINE_PX = 16
+export const WHEEL_PAGE_PX = 400
 
 /** How big the minimap may get, in client pixels. */
 export const MINIMAP_W = 196
@@ -169,6 +179,30 @@ export function zoomIn(zoom: number): number {
  */
 export function zoomOut(zoom: number): number {
   return ZOOM_STEPS[Math.max(0, nearestStep(zoom) - 1)]
+}
+
+/**
+ * Where one wheel event lands the zoom.
+ *
+ * Exponential rather than additive, so a notch is the same *proportion* at 0.4
+ * as it is at 1.8 — otherwise the far view crawls and the close one leaps. The
+ * result is continuous and sits between the rungs; the buttons cope, because
+ * `nearestStep` never assumed the zoom was standing on one.
+ *
+ * @param zoom       the current zoom
+ * @param deltaY     the wheel's vertical delta, in whatever `deltaMode` says
+ * @param deltaMode  0 pixels, 1 lines, 2 pages — the browser's choice, not ours
+ * @flow  a delta that is not a number leaves the zoom where it was, rather than
+ *        turning the whole canvas into a NaN ; clamped to the ladder's two ends
+ */
+export function zoomBy(zoom: number, deltaY: number, deltaMode = 0): number {
+  const from = zoom > 0 ? zoom : 1
+  const at = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, from))
+  if (!Number.isFinite(deltaY)) return at
+  const px = deltaY * (deltaMode === 1 ? WHEEL_LINE_PX : deltaMode === 2 ? WHEEL_PAGE_PX : 1)
+  // Down (a positive delta) is away, which is what a wheel means everywhere else.
+  const next = at * Math.exp(-px * ZOOM_WHEEL_RATE)
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next))
 }
 
 /**
@@ -516,14 +550,63 @@ export interface Viewport {
 }
 
 /**
+ * The user-unit point currently under one place in the window.
+ *
+ * The other direction from `anchorScroll`, and the first half of zooming about
+ * the cursor: read what is under the pointer *before* the scale moves, then ask
+ * for it back afterwards.
+ *
+ * @param scroll  the container's scroll position, in pixels
+ * @param at      a place in the container, in client pixels from its top-left
+ * @param zoom    the surface's zoom factor
+ * @flow  a zoom of zero reads as one rather than dividing by it, exactly as
+ *        `viewportOf` does
+ */
+export function pointAt(
+  scroll: { left: number; top: number },
+  at: { x: number; y: number },
+  zoom: number
+): { x: number; y: number } {
+  const z = zoom > 0 ? zoom : 1
+  return { x: (scroll.left + at.x) / z, y: (scroll.top + at.y) / z }
+}
+
+/**
+ * The scroll that puts one canvas point under one place in the window.
+ *
+ * @param point  where to look, in user units
+ * @param at     where in the container it should land, in client pixels
+ * @param zoom   the surface's zoom factor
+ * @param view   the scroll container's client size, in pixels
+ * @param size   the canvas, in user units
+ * @flow  clamped at both ends: neither before the origin, which the viewBox
+ *        cuts, nor past what there is to scroll — so a point near an edge lands
+ *        as close as the canvas allows rather than nowhere
+ */
+export function anchorScroll(
+  point: { x: number; y: number },
+  at: { x: number; y: number },
+  zoom: number,
+  view: { width: number; height: number },
+  size: { width: number; height: number }
+): { left: number; top: number } {
+  const z = zoom > 0 ? zoom : 1
+  return {
+    left: Math.min(Math.max(0, point.x * z - at.x), Math.max(0, size.width * z - view.width)),
+    top: Math.min(Math.max(0, point.y * z - at.y), Math.max(0, size.height * z - view.height))
+  }
+}
+
+/**
  * The scroll position that puts one point of the canvas in the middle.
+ *
+ * The middle is just one place to anchor to, so this is `anchorScroll` at half
+ * the view — same arithmetic it always had, said once instead of twice.
  *
  * @param point  where to look, in user units
  * @param zoom   the surface's zoom factor
  * @param view   the scroll container's client size, in pixels
  * @param size   the canvas, in user units
- * @flow  clamped at both ends: neither before the origin, which the viewBox
- *        cuts, nor past what there is to scroll
  */
 export function centerScroll(
   point: { x: number; y: number },
@@ -531,13 +614,24 @@ export function centerScroll(
   view: { width: number; height: number },
   size: { width: number; height: number }
 ): { left: number; top: number } {
-  const z = zoom > 0 ? zoom : 1
-  const left = point.x * z - view.width / 2
-  const top = point.y * z - view.height / 2
-  return {
-    left: Math.min(Math.max(0, left), Math.max(0, size.width * z - view.width)),
-    top: Math.min(Math.max(0, top), Math.max(0, size.height * z - view.height))
-  }
+  return anchorScroll(point, { x: view.width / 2, y: view.height / 2 }, zoom, view, size)
+}
+
+/**
+ * How far the view moves while a pan is under way.
+ *
+ * Client pixels on both sides, 1:1 with the hand — a node drag divides its
+ * offset by the zoom because that offset is in user units, and a pan does not,
+ * because the scroll it moves already is in pixels.
+ *
+ * @param base   the scroll position the pan started from
+ * @param moved  how far the pointer has travelled since, in client pixels
+ */
+export function panScroll(
+  base: { left: number; top: number },
+  moved: { dx: number; dy: number }
+): { left: number; top: number } {
+  return { left: base.left - moved.dx, top: base.top - moved.dy }
 }
 
 /**
