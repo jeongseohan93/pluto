@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260820-graph-trace",
+  "status": "pending",
+  "branch": "slice/20260820-graph-trace",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "f08455aeeeaf60a615e5b73fddcd647ea3a4b693",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-20T23:14:09+09:00"
+}
