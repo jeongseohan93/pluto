@@ -19,17 +19,23 @@
 import { existsSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import type {
-  GraphCallRow,
-  GraphCallerRow,
-  GraphEdge,
-  GraphFileEdge,
-  GraphFileGroup,
-  GraphFunction,
-  GraphIndexResult,
-  GraphMeta,
-  GraphNodeDetail,
-  GraphTag
+import {
+  clampTraceDepth,
+  type GraphCallRow,
+  type GraphCallerRow,
+  type GraphEdge,
+  type GraphFileEdge,
+  type GraphFileGroup,
+  type GraphFunction,
+  type GraphIndexResult,
+  type GraphMeta,
+  type GraphNodeDetail,
+  type GraphTag,
+  type GraphTrace,
+  type TraceBreak,
+  type TraceDirection,
+  type TraceEdge,
+  type TraceNode
 } from '../types'
 
 /** `aidev/graph/db.py` GRAPH_SCHEMA. A different number is a rebuild, not a migration. */
@@ -42,6 +48,10 @@ const DIRTY_FILENAME = 'dirty'
 
 /** A caller list past this length is a scroll nobody reads; the rest is counted. */
 const MAX_CALLERS = 200
+
+/** How many nodes one trace may draw. Past this the shallow rings are kept and
+ *  the rest is counted, so a cut chain still means what it shows. */
+const MAX_TRACE_NODES = 400
 
 interface SqliteStatement {
   all(...params: unknown[]): Record<string, unknown>[]
@@ -311,6 +321,198 @@ export function readGraphNode(repoRoot: string, id: number): GraphNodeDetail | n
 }
 
 /**
+ * 한 함수에서 깊이 N까지의 호출 사슬 — 그리고 그것이 끊긴 자리들.
+ *
+ * 사슬은 SQLite의 `WITH RECURSIVE`가 계산한다. 렌더러가 가진 `index.edges`로도
+ * BFS는 돌지만, 그 목록은 `JOIN functions dst`로 미해석 호출을 이미 버린 뒤라서
+ * "여기서 끊겼다"를 말할 재료가 없다. 끊김을 정직하게 말하려면 사슬과 끊김이
+ * 같은 조회에서 나와야 한다 — 그것이 이 함수가 IPC를 한 번 더 도는 이유다.
+ *
+ * `UNION ALL`이 아니라 `UNION`인 것이 이 조회의 전부다: 호출 그래프에는 순환이
+ * 있고(main -> run_pipeline -> ... -> main), `UNION ALL`은 경로를 열거하므로
+ * 깊이 5에서 조합적으로 터진다. `UNION`은 (id, depth) 쌍을 접으므로 작업량이
+ * 노드×깊이로 묶인다.
+ *
+ * @param repoRoot   the repository or worktree the app has open
+ * @param id         the `functions.id` the chain starts from
+ * @param direction  calls(부르는 쪽) 또는 callers(불리는 쪽)
+ * @param depth      1..5. 범위 밖은 클램프된다 — 경계를 넘어온 값이므로
+ * @flow  db 없음/열기 실패/그런 id 없음 -> null ; 재귀 CTE로 (id, 최단깊이) ->
+ *        상한을 넘으면 얕은 쪽부터 남기고 나머지는 센다 -> 확장된 노드들 사이의
+ *        엣지 -> 확장된 노드의 따라갈 수 없는 호출부를, 그래프가 그 이름을 아는
+ *        것(끊김)과 모르는 것(저장소 밖)으로 나눈다
+ * 주요 내부 변수: reached(id -> 최단 깊이), expanded(최대 깊이가 아니라 실제로
+ * 펼쳐진 노드들), candidates(끊긴 이름 -> 그 이름의 함수 수)
+ */
+export function readGraphTrace(
+  repoRoot: string,
+  id: number,
+  direction: TraceDirection,
+  depth: number
+): GraphTrace | null {
+  if (!Number.isInteger(id) || id < 0) return null
+  const limit = clampTraceDepth(depth)
+  const paths = graphPaths(repoRoot)
+  if (!existsSync(paths.db)) return null
+
+  const opened = openReadonly(paths.db)
+  if (!opened.db) return null
+  const db = opened.db
+
+  try {
+    if (db.prepare('SELECT 1 FROM functions WHERE id = ?').all(id).length === 0) return null
+
+    // The two directions differ by which end of `calls` is walked. `JOIN
+    // functions dst/src` is the same filter `readGraphIndex` uses: it drops both
+    // the unresolved calls and the ones aimed at an id that is not there — and
+    // those dropped rows are exactly what the break query below asks about.
+    const walk =
+      direction === 'callers'
+        ? `SELECT c.caller_id, s.depth + 1
+             FROM step s
+             JOIN calls c ON c.resolved_id = s.id
+             JOIN functions src ON src.id = c.caller_id
+            WHERE s.depth < ?`
+        : `SELECT c.resolved_id, s.depth + 1
+             FROM step s
+             JOIN calls c ON c.caller_id = s.id
+             JOIN functions dst ON dst.id = c.resolved_id
+            WHERE s.depth < ?`
+    const reachedRows = db
+      .prepare(
+        `WITH RECURSIVE step(id, depth) AS (
+           SELECT ?, 0
+           UNION
+           ${walk}
+         )
+         SELECT id, MIN(depth) AS depth FROM step GROUP BY id`
+      )
+      .all(id, limit)
+
+    // No SQL `LIMIT`: a recursive CTE's limit depends on the queue's order, and
+    // a cut nobody can describe is worse than one that is counted. Shallow rings
+    // survive first, so what is left still reads as a chain from the root.
+    const all = reachedRows
+      .map((row) => ({ id: int(row.id), depth: int(row.depth) }))
+      .sort((a, b) => (a.depth !== b.depth ? a.depth - b.depth : a.id - b.id))
+    const nodes: TraceNode[] = all.slice(0, MAX_TRACE_NODES)
+    const truncated = all.length - nodes.length
+
+    const reached = new Map<number, number>(nodes.map((node) => [node.id, node.depth]))
+    const ids = nodes.map((node) => node.id)
+    // Expanded, not merely reached: a node at the last ring was never followed,
+    // so neither its outgoing curves nor its breaks may be drawn — either would
+    // be the picture claiming the chain ends there.
+    const expanded = nodes.filter((node) => node.depth < limit).map((node) => node.id)
+
+    const edges: TraceEdge[] = []
+    if (ids.length > 1) {
+      const marks = placeholders(ids.length)
+      for (const row of db
+        .prepare(
+          `SELECT DISTINCT c.caller_id AS from_id, c.resolved_id AS to_id
+             FROM calls c
+             JOIN functions dst ON dst.id = c.resolved_id
+            WHERE c.caller_id IN (${marks}) AND c.resolved_id IN (${marks})
+              AND c.caller_id <> c.resolved_id`
+        )
+        .all(...ids, ...ids)) {
+        const from = int(row.from_id)
+        const to = int(row.to_id)
+        const fromDepth = reached.get(from)
+        const toDepth = reached.get(to)
+        if (fromDepth === undefined || toDepth === undefined) continue
+        // Whichever end this direction expanded from has to be one we followed.
+        const walked = direction === 'callers' ? toDepth < limit : fromDepth < limit
+        if (!walked) continue
+        edges.push({ from, to, depth: Math.max(fromDepth, toDepth) })
+      }
+    }
+
+    // `LEFT JOIN … WHERE dst.id IS NULL` catches both kinds of unfollowable
+    // call in one condition: resolved_id NULL, and resolved_id pointing at a
+    // function that is not there (a half-written update).
+    const stuck: Record<string, unknown>[] =
+      expanded.length === 0
+        ? []
+        : direction === 'callers'
+          ? db
+              .prepare(
+                `SELECT f.id AS at_id, f.name AS callee, COUNT(*) AS n
+                   FROM calls c
+                   JOIN functions f ON f.name = c.callee_name
+                   LEFT JOIN functions dst ON dst.id = c.resolved_id
+                  WHERE f.id IN (${placeholders(expanded.length)}) AND dst.id IS NULL
+                  GROUP BY f.id`
+              )
+              .all(...expanded)
+          : db
+              .prepare(
+                `SELECT c.caller_id AS at_id, c.callee_name AS callee, COUNT(*) AS n
+                   FROM calls c
+                   LEFT JOIN functions dst ON dst.id = c.resolved_id
+                  WHERE c.caller_id IN (${placeholders(expanded.length)}) AND dst.id IS NULL
+                  GROUP BY c.caller_id, c.callee_name`
+              )
+              .all(...expanded)
+
+    // Why the name matters: `db.stats()` counts an unresolved call as ambiguous
+    // only when the repository *has* a function of that name. Everything else is
+    // `len`, `print`, `str` — not a broken chain but the edge of the repository,
+    // and drawing a marker for each of them would put hundreds on one screen.
+    const names = [...new Set(stuck.map((row) => text(row.callee)))]
+    const candidates = new Map<string, number>()
+    if (names.length > 0) {
+      for (const row of db
+        .prepare(
+          `SELECT name, COUNT(*) AS n FROM functions
+            WHERE name IN (${placeholders(names.length)}) GROUP BY name`
+        )
+        .all(...names)) {
+        candidates.set(text(row.name), int(row.n))
+      }
+    }
+
+    const breaks: TraceBreak[] = []
+    let external = 0
+    for (const row of stuck) {
+      const callee = text(row.callee)
+      const count = int(row.n)
+      const known = candidates.get(callee) ?? 0
+      if (known === 0) {
+        external += count
+        continue
+      }
+      const atId = int(row.at_id)
+      breaks.push({
+        atId,
+        depth: reached.get(atId) ?? 0,
+        callee,
+        count,
+        candidates: known
+      })
+    }
+    breaks.sort((a, b) =>
+      a.depth !== b.depth
+        ? a.depth - b.depth
+        : a.atId !== b.atId
+          ? a.atId - b.atId
+          : a.callee < b.callee
+            ? -1
+            : a.callee > b.callee
+              ? 1
+              : 0
+    )
+
+    return { rootId: id, direction, depth: limit, nodes, edges, breaks, external, truncated }
+  } catch {
+    return null
+  } finally {
+    closeQuietly(opened.db)
+  }
+}
+
+/**
  * Does this graph know this file — the second check on a path from the screen.
  *
  * `register-handlers.ts` asks the same kind of question of a requirement before
@@ -453,6 +655,15 @@ function toFunction(row: Record<string, unknown>): GraphFunction {
     hasSpec: int(row.has_spec) === 1,
     isTest: int(row.is_test) === 1
   }
+}
+
+/**
+ * `?,?,?` — one bind mark per value of an `IN` list, as `db.py` spells it.
+ *
+ * @param count  how many values the list holds
+ */
+function placeholders(count: number): string {
+  return new Array(count).fill('?').join(',')
 }
 
 /** Closing must never be the thing that throws. */

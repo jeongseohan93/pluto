@@ -1,6 +1,6 @@
 {
   "slice_id": "20260820-graph-trace",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260820-graph-trace",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "f08455aeeeaf60a615e5b73fddcd647ea3a4b693",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260820-231415-graph-trace-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "4dcbabc44632607a805c4c350e411800a8a71980"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260821-001210-graph-trace-implement-2",
+      "attempts": 2
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,39 @@
         "peak_context": 170009
       },
       "cost_usd": 4.520008
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260820-235959-graph-trace-implement",
+      "status": "failed",
+      "turns": 81,
+      "tokens": {
+        "input": 150,
+        "cache_creation": 192967,
+        "cache_read": 13341700,
+        "output": 58738,
+        "billed_input": 13534817,
+        "peak_context": 213853
+      },
+      "cost_usd": 10.069720000000002
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260821-001210-graph-trace-implement-2",
+      "status": "completed",
+      "turns": 10,
+      "tokens": {
+        "input": 18,
+        "cache_creation": 246268,
+        "cache_read": 2333747,
+        "output": 7176,
+        "billed_input": 2580033,
+        "peak_context": 267153
+      },
+      "cost_usd": 3.8090435
     }
   ],
-  "updated_at": "2026-08-20T23:25:51+09:00"
+  "updated_at": "2026-08-21T00:14:09+09:00"
 }

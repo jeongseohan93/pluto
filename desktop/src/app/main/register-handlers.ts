@@ -25,8 +25,14 @@ import { isRequirementPath, isSafeSegment } from '../../domains/pipeline/command
 import type { CommandRunner } from '../../domains/pipeline/main/cli-runner'
 import { listRequirements, readSliceFailure } from '../../domains/pipeline/main/store'
 import type { CommandRequest, CommandStart } from '../../domains/pipeline/types'
-import { pathInGraph, readGraphIndex, readGraphNode } from '../../domains/graph-view/main/graph-store'
-import type { GraphIndexResult } from '../../domains/graph-view/types'
+import {
+  pathInGraph,
+  readGraphIndex,
+  readGraphNode,
+  readGraphTrace
+} from '../../domains/graph-view/main/graph-store'
+import { clampTraceDepth } from '../../domains/graph-view/types'
+import type { GraphIndexResult, GraphTrace, TraceDirection } from '../../domains/graph-view/types'
 import { readSource } from '../../domains/code-view/main/source-store'
 import type { SourceFile, SourceProblem } from '../../domains/code-view/types'
 
@@ -38,7 +44,7 @@ export interface SliceHandlerContext {
 
 /**
  * Register the v0.2.6 channels: launching, watching, finishing, and the graph —
- * plus v0.2.7's one source read.
+ * plus v0.2.7's one source read and v0.2.8's one call chain.
  *
  * @param ctx  the open repository and the single command slot
  * @flow  one `ipcMain.handle` per channel, each guarded and each answering with
@@ -123,6 +129,20 @@ export function registerSliceHandlers(ctx: SliceHandlerContext): void {
     if (!root) return null
     try {
       return readGraphNode(root, Number(id))
+    } catch {
+      return null
+    }
+  })
+
+  ipcMain.handle(IPC.graphTrace, (_event, request: unknown): GraphTrace | null => {
+    const root = ctx.repoRoot()
+    if (!root) return null
+    const ask = (request ?? {}) as { id?: unknown; direction?: unknown; depth?: unknown }
+    // The renderer's strings are checked twice, and a direction is a string: one
+    // of exactly two values reaches the query, never whatever arrived.
+    const direction: TraceDirection = ask.direction === 'callers' ? 'callers' : 'calls'
+    try {
+      return readGraphTrace(root, Number(ask.id), direction, clampTraceDepth(Number(ask.depth)))
     } catch {
       return null
     }
