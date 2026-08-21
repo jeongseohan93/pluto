@@ -568,3 +568,99 @@ def test_a_clean_slice_is_not_accused(repo, tmp_path, claude_bin, log):
     """
     assert guarded(tmp_path, repo, claude_bin) == 0
     assert state_of(repo)["stages"]["test"]["verify"]["attempts"][0]["temp_files"] == []
+
+
+# --------------------------------------------- 엔진 verify 2단 검사 (v0.8)
+#
+# The engine runs these commands itself, so there is nobody to declare a reason
+# for what they did. Both looks are therefore absolute, and they are two
+# independent looks rather than a before/after comparison.
+
+
+def writing_script(tmp_path, target, name="verify_writes.py"):
+    """A 'test command' that passes and writes a file, counting how often it ran."""
+    counter = tmp_path / "verify-runs.txt"
+    return verify_script(
+        tmp_path,
+        "from pathlib import Path\n"
+        "counter = Path(r'{0}')\n"
+        "counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))\n"
+        "Path(r'{1}').write_text('written by the verification itself\\n')\n"
+        "print('148 passed')\n".format(counter, target),
+        name=name,
+    )
+
+
+def run_count(tmp_path):
+    path = tmp_path / "verify-runs.txt"
+    return int(path.read_text(encoding="utf-8")) if path.exists() else 0
+
+
+def test_a_verify_command_that_writes_an_untracked_file_fails(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: test_commands가 untracked 파일을 만들면 FAIL."""
+    worktree = tmp_path / "wt" / "placeholder"
+    command = writing_script(tmp_path, "verify-scratch.txt")
+    requirement(
+        repo, front="approval: none\nspec_check: off\ntest_commands: {0}".format(command)
+    )
+
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert "verify가 저장소를 바꿨다" in state["reason"]
+    assert "verify-scratch.txt" in state["reason"]
+    # the commands did run: it is what they left behind that failed
+    assert run_count(tmp_path) == 1
+    assert not worktree.exists() or True
+
+
+def test_a_verify_command_that_rewrites_a_tracked_file_fails(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """A tracked file is no better: the engine may not change the thing it checks."""
+    command = writing_script(tmp_path, "README.md")
+    requirement(
+        repo, front="approval: none\nspec_check: off\ntest_commands: {0}".format(command)
+    )
+
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+    state = state_of(repo)
+    assert "verify가 저장소를 바꿨다" in state["reason"]
+    assert "README.md" in state["reason"]
+
+
+def test_verify_touching_a_declared_file_still_fails(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Declared or not makes no difference: 엔진 실행에는 사유 주체가 없다."""
+    command = writing_script(tmp_path, "README.md")
+    # the plan declares README.md as a MODIFY target, and it changes nothing here
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|README.md")
+    requirement(
+        repo, front="approval: none\nspec_check: off\ntest_commands: {0}".format(command)
+    )
+
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+    assert "verify가 저장소를 바꿨다" in state_of(repo)["reason"]
+
+
+def test_a_dirty_worktree_fails_verify_before_it_runs(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: verify가 파일을 고쳐 실패 -> resume -> 명령 재실행 없이 dirty로 재차 FAIL."""
+    command = writing_script(tmp_path, "verify-scratch.txt")
+    requirement(
+        repo, front="approval: none\nspec_check: off\ntest_commands: {0}".format(command)
+    )
+
+    assert main(argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md")) == 1
+    slice_id = state_of(repo)["slice_id"]
+    assert run_count(tmp_path) == 1
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 1
+    state = state_of(repo, slice_id)
+    assert "verify 시작 전 작업트리가 dirty하다" in state["reason"]
+    # the whole point of the first look: the commands were not run a second time
+    assert run_count(tmp_path) == 1

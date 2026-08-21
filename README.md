@@ -245,8 +245,13 @@ reflog가 살아있는 동안은 되살릴 수 있다. worktree 제거가 실패
 
 어느 분기에서도 **브랜치를 먼저 지우지 않는다.** 성공하면 `discard_failed`는 지워진다.
 
-`--no-worktree`를 주면 v0.2처럼 repo 안에서 직접 돈다. 경고를 찍고, v0.2의 dirty
-검사가 그대로 살아난다. git이 없거나 git repo가 아닌 디렉터리에서의 유일한 길이다.
+`--no-worktree`는 **v0.8부터 새 slice에서 쓸 수 없다.** 작업 지시서 사후 대조의
+보증 범위가 "worktree 안에서 Git이 관찰하는 변경"이라 격리가 없으면 검사의 기준
+자체가 없기 때문이다. 새 slice에서 주면 즉시 거부하고, `work_order_required`가 있는
+slice는 `workspace` 기록 없이는 resume/amend도 거부한다. 남아 있는 용도는
+**v0.3 이전에 시작돼 이미 돌던 legacy slice의 `--resume-slice`** 하나뿐이고, 거기서만
+v0.2의 dirty 규칙과 사후 대조 skip이 그대로 산다. git이 없거나 git repo가 아니면
+이제는 `git init`이 답이다.
 
 ### 의존성 설치 (setup)
 
@@ -539,6 +544,107 @@ model: claude-opus-5, diagnose=claude-sonnet-5
 가능한 단계는 `plan` / `implement` / `test` / `diagnose` / `decompose`. CLI 쪽은
 `--model` / `--model-stage diagnose=...`. 기본값은 **현행 유지**(아무것도 안 주면
 CLI 기본이 그대로 간다). 오타난 단계, 빈 값, 한 단계를 서로 다르게 두 번은 거부한다.
+
+### 작업 지시서와 사후 대조 (v0.8)
+
+구현 왕복의 최대 원인은 모호함이다. plan의 산문 지시는 해석 여지를 남기고, 여지는
+세션이 아무도 부탁하지 않은 파일을 만드는 자리가 된다. 그래서 plan은 산문 **위에**
+절 하나를 더 싣고, 그 절만은 기계가 읽는다.
+
+```markdown
+## 작업 지시서
+
+| 동사 | 대상 경로 | symbol | 책임 |
+| --- | --- | --- | --- |
+| CREATE | aidev/workorder.py |  | 지시서 파싱과 사후 대조 |
+| MODIFY | aidev/pipeline.py | run_pipeline | scope check 호출 지점 |
+| REFERENCE | aidev/verify.py |  | 검증 결과 구조 |
+```
+
+**세 동사뿐이다.** `CREATE`는 아직 없는 파일(있으면 plan FAIL), `MODIFY`는 이미 있는
+파일(없으면 FAIL, 지우려는 파일도 여기), `REFERENCE`는 읽기만 하는 파일이다.
+REFERENCE는 컨텍스트 트레이의 입력 목록이지 쓰기 권한이 아니고, **읽기
+allowlist도 아니다** — 지정 밖을 읽는 것은 실패가 아니다.
+
+**symbol은 선택이다.** 채우면 Function DB에서 *그 파일 안에서* 정확히 하나로
+해석되어야 한다. 0개도 FAIL, 2개 이상도 FAIL(좌표를 나열한다). 비우면 파일 단위
+지시이고, **엔진은 어느 함수를 말한 것인지 추정하지 않는다.** 기존 파일에 새 함수를
+추가하는 경우에는 symbol을 비운다 — 검증 시점에 없는 이름은 해석이 0개다.
+
+**형식은 고정이다.** 헤더 한 줄, 구분자 한 줄, 그 뒤가 데이터다. 절 제목은
+`## 작업 지시서`(또는 `WORK ORDER`), 인식 가능한 절이 2개 이상이면 FAIL,
+fenced code block 안의 제목은 절로 세지 않는다. 파싱은 전부 정규식과 문자열
+처리다 — **LLM이 이 표를 읽는 일은 없다.**
+
+**경로는 정규화된 repo-relative다.** 역슬래시·절대경로·드라이브 문자·콜론(ADS)·
+제어문자·`..`·빈 세그먼트·후행 `/`·Windows 예약 장치명(`CON`, `COM1`…)·점이나
+공백으로 끝나는 세그먼트는 전부 거부한다. symlink/junction으로 저장소를 벗어나는
+경로는 `realpath` 비교로 잡는다. 중복 기준은: 같은 경로에 서로 다른 동사면 FAIL,
+같은 `(경로, symbol)` 조합이 두 번이면 FAIL, 같은 경로·같은 동사에 **서로 다른**
+non-empty symbol은 허용(함수 단위 지시서의 정상 형태), symbol 없는 행과 symbol
+행을 한 경로에 섞으면 FAIL.
+
+**언제 검사하나.** plan 커밋 직전(세션 0)에 한 번, 그리고 파일을 바꾼 **모든 실행의
+stage commit 직전**에 최종 diff로 한 번 더다.
+
+| 최종 diff | 지시서에 | 결과 |
+| --- | --- | --- |
+| 새 파일 (A) | CREATE에 없음 | **즉시 FAIL** |
+| 삭제 (D) | MODIFY에 없음 | **즉시 FAIL** — 지우려면 그 경로를 미리 MODIFY로 선언한다 |
+| 수정 (M/T) | CREATE·MODIFY에 없음 | FAIL 아님. `unplanned_modified`로 분류 |
+
+미선언 수정을 FAIL로 만들지 않는 건 의도다. 한 줄 고쳐야 끝나는 일 때문에 slice
+전체를 죽이면 아무도 이 장치를 켜두지 않는다. 대신 **사유를 요구한다**: 그 실행의
+최종 응답 맨 끝에 `## 범위 밖 수정 사유` 절을 두고 `| 경로 | 사유 |` 표로 항목당 한
+줄씩 선언한다. 엔진은 실제 `unplanned_modified` 경로 집합과 사유 표 경로 집합의
+**완전 일치**를 요구한다 — 누락·중복·미존재 경로·여분 선언 전부 FAIL이다. 없으면
+절을 생략한다. **사유 선언은 지시서를 확장하지 않는다.** 그 경로는 끝까지
+unplanned로 남아 승인 화면과 리포트에 보인다.
+
+**최종 diff는 임시 index로 만든다.** `base..HEAD`에 `status`를 덧칠하지 않고,
+`GIT_INDEX_FILE`을 임시 파일로 잡아 `read-tree` → `add -A` →
+`diff --cached --name-status -z --no-renames <base>` 를 돌린다. 그래야 원복·삭제 후
+복원·추가 후 삭제가 전부 제대로 사라진다. 저장소의 실제 index와 HEAD는 건드리지
+않는다. `add -A`는 `.gitignore`를 존중하므로 `.aidev/graph/`와 `__pycache__`는 애초에
+보이지 않는다. git이 실패하거나 기준 커밋이 없거나 모르는 상태 문자가 나오면
+**예외를 올려 검사를 FAIL시킨다** — 차단 장치에 fail-open은 없다.
+
+**제외 목록은 디렉터리가 아니라 파일이다.** `.aidev/` 통째 제외는 하지 않는다.
+`mirror_history`가 실제로 덮어쓸 정확한 파일(`requirement.md`, `plan.md`,
+`slice.json`, 기록된 amend 번호, 본진 source가 실존하는 failure/diagnosis/progress)만
+빠지고, `.aidev/history/<slice>/evil.py` 같은 것은 **신규 파일 FAIL로 잡힌다.**
+setup 산출물은 이름이 아니라 **setup 직후의 mode + blob 지문**으로 제외한다. 내용이
+바뀌거나 삭제되면 정상 scope 대상으로 복귀하고, 이미 CREATE/MODIFY로 선언된
+경로에는 setup 제외를 적용하지 않는다.
+
+**엔진 verify는 무관용이다.** 엔진 실행에는 사유를 댈 주체가 없기 때문이다. 검증
+명령 실행 **직전**에 작업트리가 dirty하면 명령을 아예 실행하지 않고 FAIL,
+**직후**에 Git이 관찰하는 변경이 하나라도 있으면 FAIL이다 (지시서 선언 여부와
+무관하다). 두 검사는 실행 전후의 **각각 독립적인** 검사지 상태 비교가 아니다.
+
+**digest는 둘이다.** `document_digest = sha256(plan.md 전체 바이트)`는 재승인 판단용,
+`scope_digest = 정렬된 verb/path/symbol의 sha256`는 범위 비교·계측용이다(책임 문구는
+제외한다 — 문장을 다듬었다고 범위가 움직이면 아무도 그 digest를 믿지 않는다).
+plan은 **승인 직후** 재파싱·재검증되어 두 digest와 함께 봉인된다. 게이트는 사람이
+plan.md를 고치라고 열어 둔 자리이므로, implement가 받는 건 지금 파일 그대로다.
+implement/resume/repair/amend 직전에 `document_digest`가 어긋나면 재승인까지
+중단한다. digest가 빈 값이면 "미봉인"으로 취급한다 — 빈 값이 우회로가 되지 않는다.
+`approval: none`이면 사람 게이트를 만들지 않고 재검증·자동 재봉인만 한다.
+
+**amend와 데드락.** amend는 plan을 다시 보지 않으므로, 열린 amend 밑에서 plan.md가
+바뀌면 재승인할 기회가 영영 없어진다. 그래서 plan 게이트 처리를 **amend 필터보다
+먼저** 두고, 재승인이 끝나면 같은 amend 사이클이 그대로 이어진다. amend 지시문
+자체가 지시서 절을 실으면 그 행들이 **누적**된다 — plan의 원본 지시서는 불변이고,
+대조용 effective order는 `plan 지시서 + 모든 amends[].work_order`의 합이다.
+
+**보증 범위.** 이 장치가 보증하는 것은 **Git이 worktree 안에서 관찰하는 변경**이다.
+"모든 신규 파일 즉시 FAIL"이라는 문장도 그 범위 안에서 읽어야 한다. worktree 밖
+쓰기는 범위 밖이고, 안전핀 목록에 별도 항목으로 등록만 해 뒀다.
+
+**하위 호환.** `state.json`에 `work_order_required`가 있는 slice에만 적용된다. 그
+키가 없는 것은 v0.2/v0.3 시절 slice이고, resume에서 봉인도 사후 대조도 하지 않는다.
+새 plan과 replan은 지시서가 없으면 FAIL한다. **끄는 스위치는 없다** — 차단 장치에
+우회로를 두지 않는다.
 
 ### 사후 수정 (--amend, v0.4.1)
 
@@ -1112,10 +1218,15 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   | — | `--merge` 할 때만 본진에 tracked 변경이 없을 것 + base가 체크아웃돼 있을 것. merge가 본진을 실제로 쓰는 유일한 순간이다 |
   | — | `--rollback`은 worktree에 tracked 변경이 없을 것(reset이 삼킨다. untracked는 무관). `--revert-merge`는 본진에 쓰므로 `--merge`와 **같은 조건**이다 |
 
-  `--no-worktree`로 돌리면 격리가 없으므로 v0.2의 dirty 규칙이 그대로 살아난다.
-  v0.3 이전에 시작된 slice(`state.json`에 `workspace` 키가 없는 것)도 마찬가지로
-  본진에서 이어지고, 그렇다고 알려준다 — 지금 worktree를 새로 만들면 이미 찍힌
-  단계 커밋들과 다른 곳에서 나머지가 진행되기 때문이다.
+  v0.3 이전에 시작된 slice(`state.json`에 `workspace` 키가 없는 것)는 본진에서
+  이어지고 v0.2의 dirty 규칙이 그대로 살아난다 — 지금 worktree를 새로 만들면 이미
+  찍힌 단계 커밋들과 다른 곳에서 나머지가 진행되기 때문이다. v0.8부터 그것이
+  `--no-worktree`의 **유일한** 용도다: 새 slice는 격리 없이 발사할 수 없다.
+- **worktree 밖 쓰기 차단 — 범위 밖, 미구현.** 사후 대조(v0.8)의 보증은 "worktree
+  안에서 Git이 관찰하는 변경"이다. 세션이 홈 디렉터리나 다른 저장소에 쓴 것은 이
+  검사가 보지 못한다 (요약의 `(+N outside the workspace)` 줄이 세는 게 전부다).
+  안전 프로파일과 write guard가 부분적으로 막지만 기계적 보증은 아니다. 여기에
+  항목으로 등록만 해 두고, 구현은 이 slice의 범위가 아니다.
 - **stage 커밋이 파일을 너무 많이 쓸어담으면 커밋하지 않고 slice를 실패시킨다**
   (`--commit-file-limit`, 기본 2000). `.gitignore`가 부실한 프로젝트에서 setup이
   만든 `node_modules`가 통째로 브랜치에 실려 merge로 본진을 오염시키는 것을 막는다.
@@ -1215,7 +1326,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--reason` | 되돌린 이유. `rollbacks.json`에 남는다 (`--rollback` / `--revert-merge` 전용) |
 | `--base` | slice가 갈라져 나올 브랜치 (기본: repo의 현재 HEAD, **main 아님**) |
 | `--worktree-root` | worktree 부모 디렉터리 (기본 `<repo>-slices`) |
-| `--no-worktree` | 격리 없이 repo 안에서 직접 실행 (v0.2 동작) |
+| `--no-worktree` | legacy slice의 `--resume-slice` 전용. 새 slice에서는 거부한다 (v0.8) |
 | `--setup-timeout` | front matter setup 명령의 제한 시간 (기본 1800초) |
 | `--commit-file-limit` | 단계 커밋이 건드릴 수 있는 최대 파일 수 (기본 2000) |
 | `--max-turns` | 모든 단계의 기본 상한 (기본 80) |

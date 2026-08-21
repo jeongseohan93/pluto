@@ -304,6 +304,26 @@ class GraphDB:
                 return rows
         return []
 
+    def find_in_file(self, path: str, name: str) -> List[sqlite3.Row]:
+        """Every function in one file that a name could mean - all of them, at once.
+
+        Deliberately not ``find``'s ladder. ``find`` narrows until something
+        answers, which is right for a human asking a question and wrong for a
+        work order's symbol: two functions of the same bare name in one file
+        have to come back as two rows so the plan can be refused as ambiguous.
+
+        @param path  the repository-relative path the symbol was declared under
+        @param name  the symbol as the work order spelled it
+        """
+        return list(
+            self.conn.execute(
+                """SELECT * FROM functions
+                   WHERE path = ? AND (qualname = ? OR name = ? OR qualname LIKE ?)
+                   ORDER BY lineno, id""",
+                (path, name, name, "%." + name),
+            )
+        )
+
     def tags_of(self, func_id: int) -> List[sqlite3.Row]:
         """One function's spec tags, in the order they were written.
 

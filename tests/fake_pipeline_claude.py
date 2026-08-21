@@ -57,6 +57,34 @@ the pipeline has to survive.
                           times, every result an error - instead of the healthy
                           one (three different files edited, nothing repeated)
     AIDEV_FAKE_OBSERVATION  what the observe step answers with
+
+    v0.8 작업 지시서. The plan stage appends a '## 작업 지시서' table naming
+    exactly the files this invocation will really create, derived from the very
+    switches above - one place decides both, so the table and the work can never
+    drift apart.
+
+    AIDEV_FAKE_NO_WORK_ORDER  the plan emits no 작업 지시서 section at all
+    AIDEV_FAKE_ORDER        the table's data rows, verbatim, newline separated -
+                          for the malformed / escaping / ambiguous scenarios
+    AIDEV_FAKE_ORDER_EXTRA  extra rows appended to the generated table,
+                          'VERB|path|symbol' entries separated by ';'
+    AIDEV_FAKE_REASONS      implement and test append a '## 범위 밖 수정 사유'
+                          section: 'path|reason' entries separated by ';',
+                          'empty' for a section whose table has no rows
+    AIDEV_FAKE_EDIT         existing files (comma separated) implement appends to,
+                          declared as MODIFY in the table
+    AIDEV_FAKE_UNEDIT       files implement takes that same line back out of - a
+                          revert, so the path leaves the final diff entirely
+    AIDEV_FAKE_UNDECLARED_EDIT
+                          keep the EDIT/UNEDIT rows out of the table, so the edit
+                          is an unplanned one the reason table has to declare
+    AIDEV_FAKE_DELETE       existing files (comma separated) implement deletes
+    AIDEV_FAKE_WRITE        files implement creates and the table never mentions
+    AIDEV_FAKE_TEST_WRITE   a file the agent test stage writes
+
+    Any path in AIDEV_FAKE_WRITE / _EDIT / _UNEDIT / _DELETE / _TEST_WRITE /
+    _TEMPFILE / _ORDER_EXTRA may contain '{slice}', which becomes the worktree's
+    own directory name - the slice id a test cannot know in advance.
 """
 
 import glob
@@ -205,6 +233,131 @@ def big_plan():
     return "# PLAN\n\n## Files\n\n" + "".join(
         "- {0}: rewrite it\n".format(path) for path in files + tests
     )
+
+
+# The one line AIDEV_FAKE_EDIT appends and AIDEV_FAKE_UNEDIT takes back out, so a
+# revert really is byte-for-byte the file git already has.
+EDIT_MARKER = "# touched by the fake implement\n"
+
+
+def write_file(path, text):
+    """Write a file, making the directories it needs - real work in the real tree."""
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def here(path):
+    """A path a test named, with '{slice}' filled in from the worktree's own name.
+
+    A test cannot know the slice id before the slice exists, and the worktree is
+    named after it - so '.aidev/history/{slice}/evil.py' is expressible.
+    """
+    return str(path).replace("{slice}", os.path.basename(os.getcwd()))
+
+
+def csv_env(name):
+    """A comma separated environment list, emptied of blanks and filled in."""
+    return [here(part.strip()) for part in (os.environ.get(name) or "").split(",") if part.strip()]
+
+
+def verb_for(path):
+    """CREATE unless the file is already there - which is what a real plan would say.
+
+    It matters in an epic chain: slice 2 branches off slice 1's tip, so the file
+    slice 1 created is already present and declaring CREATE for it would be a
+    conflict the engine is right to refuse.
+    """
+    return "MODIFY" if os.path.exists(path) else "CREATE"
+
+
+def work_order_rows():
+    """Exactly the files this invocation really touches, as 작업 지시서 rows.
+
+    Derived from the same switches that do the touching, a few lines below, so
+    the declared scope and the actual work come from one decision rather than
+    two that have to be kept in step by hand. AIDEV_FAKE_WRITE is the deliberate
+    exception: those files are created and never declared.
+    """
+    rows = []
+    if os.environ.get("AIDEV_FAKE_BIG_PLAN"):
+        # Exactly the 18 paths the prose names, so the plan-scale count is
+        # measured over one list rather than the union of two.
+        for index in range(1, 13):
+            rows.append(("CREATE", "aidev/module{0}.py".format(index), "", "rewrite it"))
+        for index in range(1, 7):
+            rows.append(("CREATE", "tests/test_module{0}.py".format(index), "", "rewrite it"))
+    else:
+        rows.append((verb_for("aidev/thing.py"), "aidev/thing.py", "", "the file the fake plan names"))
+    for index in range(int(os.environ.get("AIDEV_FAKE_FILES") or 0)):
+        name = "generated-{0}.txt".format(index)
+        rows.append((verb_for(name), name, "", "derived output"))
+    if os.environ.get("AIDEV_FAKE_SPECLESS"):
+        rows.append((verb_for("aidev_generated.py"), "aidev_generated.py", "", "the helper"))
+    for name in csv_env("AIDEV_FAKE_TEMPFILE"):
+        rows.append((verb_for(name), name, "", "scratch work nobody meant to keep"))
+    if os.environ.get("AIDEV_FAKE_MIGRATION"):
+        name = "backend/migrations/003_add_seat.sql"
+        rows.append((verb_for(name), name, "", "a seat column"))
+    for name in csv_env("AIDEV_FAKE_EDIT") + csv_env("AIDEV_FAKE_UNEDIT"):
+        if not os.environ.get("AIDEV_FAKE_UNDECLARED_EDIT"):
+            rows.append(("MODIFY", name, "", "an edit the plan owns"))
+    for name in csv_env("AIDEV_FAKE_TEST_WRITE"):
+        rows.append((verb_for(name), name, "", "written by the test stage"))
+    for part in (os.environ.get("AIDEV_FAKE_ORDER_EXTRA") or "").split(";"):
+        fields = [here(field.strip()) for field in part.split("|")]
+        if len(fields) >= 2 and fields[0] and fields[1]:
+            rows.append((fields[0], fields[1], fields[2] if len(fields) > 2 else "", "an extra row"))
+    return rows
+
+
+def work_order_table():
+    """The '## 작업 지시서' section the plan stage appends, or '' when told not to."""
+    if os.environ.get("AIDEV_FAKE_NO_WORK_ORDER"):
+        return ""
+    body = os.environ.get("AIDEV_FAKE_ORDER")
+    if body is None:
+        body = "\n".join("| {0} | {1} | {2} | {3} |".format(*row) for row in work_order_rows())
+    return (
+        "\n## 작업 지시서\n\n"
+        "| 동사 | 대상 경로 | symbol | 책임 |\n"
+        "| --- | --- | --- | --- |\n" + body + "\n"
+    )
+
+
+def reasons_table():
+    """The '## 범위 밖 수정 사유' section implement and test append, or ''."""
+    spec = os.environ.get("AIDEV_FAKE_REASONS")
+    if spec is None:
+        return ""
+    header = "\n\n## 범위 밖 수정 사유\n\n| 경로 | 사유 |\n| --- | --- |\n"
+    if spec.strip().lower() == "empty":
+        return header
+    rows = []
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        path, _, reason = part.partition("|")
+        rows.append("| {0} | {1} |".format(path.strip(), reason.strip() or "부득이한 수정"))
+    return header + "\n".join(rows) + "\n"
+
+
+def result_text(stage, mode):
+    """What this invocation reports, with the v0.8 sections attached to it.
+
+    AIDEV_FAKE_TEXT replaces the body and not the sections: a test that pins the
+    plan's prose still gets a plan carrying a work order, which is what the
+    engine now requires of every plan.
+    """
+    text = os.environ.get("AIDEV_FAKE_TEXT") or final_text(stage, mode)
+    if stage == "plan":
+        return text + work_order_table()
+    if stage in ("implement", "test"):
+        return text + reasons_table()
+    return text
 
 
 def final_text(stage, mode):
@@ -450,6 +603,28 @@ def main():
             with open(name, "w", encoding="utf-8") as handle:
                 handle.write("scratch work nobody meant to keep\n")
 
+    if stage == "implement":
+        # Existing files, changed and removed for real: the scope check reads
+        # git's idea of the final diff, not a list a test handed it.
+        for name in csv_env("AIDEV_FAKE_EDIT"):
+            with open(name, "a", encoding="utf-8") as handle:
+                handle.write(EDIT_MARKER)
+        for name in csv_env("AIDEV_FAKE_UNEDIT"):
+            if os.path.exists(name):
+                with open(name, "r", encoding="utf-8") as handle:
+                    kept = [line for line in handle.readlines() if line != EDIT_MARKER]
+                with open(name, "w", encoding="utf-8", newline="") as handle:
+                    handle.writelines(kept)
+        for name in csv_env("AIDEV_FAKE_DELETE"):
+            if os.path.exists(name):
+                os.remove(name)
+        for name in csv_env("AIDEV_FAKE_WRITE"):
+            write_file(name, "a file the 지시서 never mentioned\n")
+
+    if stage == "test":
+        for name in csv_env("AIDEV_FAKE_TEST_WRITE"):
+            write_file(name, "written by the agent test stage\n")
+
     if os.environ.get("AIDEV_FAKE_MIGRATION") and stage == "implement":
         # A real file in a real stage commit, so a rollback range genuinely
         # contains a migration rather than one a test planted by hand.
@@ -510,7 +685,7 @@ def main():
                 "cache_read_input_tokens": 900,
                 "output_tokens": 40,
             },
-            "result": os.environ.get("AIDEV_FAKE_TEXT") or final_text(stage, mode),
+            "result": result_text(stage, mode),
         }
     )
     return 0

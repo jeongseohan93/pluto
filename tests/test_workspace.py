@@ -283,6 +283,141 @@ def test_delete_branch_returns_the_commit_it_removed(repo, tmp_path):
     assert workspace.resolve_commit(repo, sha) == sha
 
 
+# ------------------------------------------------- the working tree as a diff
+#
+# What the v0.8 scope check is built on: the tree as it really is, compared with
+# the commit the slice started from. Every case below is one a plain
+# ``diff base..HEAD`` or a plain ``status`` gets wrong on its own.
+
+
+def snapshot_repo(repo, tmp_path):
+    """A worktree with one committed file and one committed directory to work in."""
+    ws = workspace.create(repo, plan_for(repo, tmp_path))
+    (ws.path / "kept.py").write_text("x = 1\n", encoding="utf-8")
+    (ws.path / "gone.py").write_text("y = 2\n", encoding="utf-8")
+    base = workspace.commit_all(ws.path, "base")
+    return ws, base
+
+
+def test_a_snapshot_sees_edits_additions_and_deletions_together(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "kept.py").write_text("x = 2\n", encoding="utf-8")
+    (ws.path / "gone.py").unlink()
+    (ws.path / "brand-new.py").write_text("z = 3\n", encoding="utf-8")
+
+    assert workspace.diff_status(ws.path, base) == {
+        "kept.py": "M",
+        "gone.py": "D",
+        "brand-new.py": "A",
+    }
+
+
+def test_a_file_put_back_disappears_from_the_diff(repo, tmp_path):
+    """Measured need: 원복된 경로는 현재 unplanned 목록에서 빠져야 한다."""
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "kept.py").write_text("x = 999\n", encoding="utf-8")
+    assert workspace.diff_status(ws.path, base) == {"kept.py": "M"}
+
+    (ws.path / "kept.py").write_text("x = 1\n", encoding="utf-8")
+    assert workspace.diff_status(ws.path, base) == {}
+
+
+def test_a_deletion_that_was_committed_and_then_restored_is_not_in_the_diff(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "gone.py").unlink()
+    workspace.commit_all(ws.path, "delete it")
+    (ws.path / "gone.py").write_text("y = 2\n", encoding="utf-8")
+
+    assert workspace.diff_status(ws.path, base) == {}
+
+
+def test_a_file_added_and_then_deleted_never_shows_up(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "scratch.py").write_text("tmp\n", encoding="utf-8")
+    workspace.commit_all(ws.path, "add it")
+    (ws.path / "scratch.py").unlink()
+
+    assert workspace.diff_status(ws.path, base) == {}
+
+
+def test_a_path_with_spaces_and_hangul_comes_back_whole(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "문서").mkdir()
+    (ws.path / "문서" / "설계 노트.md").write_text("메모\n", encoding="utf-8")
+
+    assert workspace.diff_status(ws.path, base) == {"문서/설계 노트.md": "A"}
+
+
+def test_a_gitignored_file_is_not_in_the_snapshot_at_all(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (ws.path / "cache").mkdir()
+    (ws.path / "cache" / "big.bin").write_text("derived\n", encoding="utf-8")
+
+    status = workspace.diff_status(ws.path, base)
+    assert status == {".gitignore": "A"}
+
+
+def test_the_snapshot_carries_the_mode_and_blob_of_everything_in_the_tree(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "brand-new.py").write_text("z = 3\n", encoding="utf-8")
+
+    entries = workspace.snapshot(ws.path, base).entries
+    assert entries["brand-new.py"][0] == "100644"
+    assert len(entries["brand-new.py"][1]) == 40
+    before = entries["brand-new.py"]
+
+    (ws.path / "brand-new.py").write_text("z = 4\n", encoding="utf-8")
+    assert workspace.snapshot(ws.path, base).entries["brand-new.py"] != before
+
+
+def test_the_snapshot_leaves_the_real_index_and_head_exactly_where_they_were(repo, tmp_path):
+    ws, base = snapshot_repo(repo, tmp_path)
+    (ws.path / "brand-new.py").write_text("z = 3\n", encoding="utf-8")
+    before_status = git(ws.path, "status", "--porcelain").stdout
+    before_head = workspace.head_commit(ws.path)
+
+    workspace.snapshot(ws.path, base)
+
+    assert git(ws.path, "status", "--porcelain").stdout == before_status
+    assert workspace.head_commit(ws.path) == before_head
+    assert git(ws.path, "diff", "--cached", "--name-only").stdout == ""
+
+
+def test_a_base_that_is_not_a_commit_raises_rather_than_answering_empty(repo, tmp_path):
+    """Fail-closed: a blocking check must never be waved through by an empty answer."""
+    ws, _ = snapshot_repo(repo, tmp_path)
+    with pytest.raises(workspace.GitError):
+        workspace.diff_status(ws.path, "nope-not-a-ref")
+
+
+def test_an_unknown_status_letter_is_an_exception(monkeypatch):
+    with pytest.raises(ValueError) as caught:
+        workspace._parse_name_status("R100\0old.py\0new.py\0")
+    assert "R100" in str(caught.value)
+
+    assert workspace._parse_name_status("M\0a.py\0A\0b.py\0") == {"a.py": "M", "b.py": "A"}
+
+
+def test_status_entries_read_z_output_without_unquoting_anything(repo, tmp_path):
+    ws, _ = snapshot_repo(repo, tmp_path)
+    (ws.path / "a b.py").write_text("x\n", encoding="utf-8")
+    (ws.path / "kept.py").write_text("x = 5\n", encoding="utf-8")
+
+    entries = dict((path, code) for code, path in workspace.status_entries(ws.path))
+    assert entries["a b.py"] == "??"
+    assert entries["kept.py"] == " M"
+
+
+def test_status_entries_survive_a_rename(repo, tmp_path):
+    ws, _ = snapshot_repo(repo, tmp_path)
+    git(ws.path, "mv", "kept.py", "moved.py")
+
+    paths = [path for _, path in workspace.status_entries(ws.path)]
+    assert "moved.py" in paths
+    assert "kept.py" not in paths
+
+
 # -------------------------------------------------------------------- merge
 
 

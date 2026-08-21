@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import (
     __version__,
@@ -61,6 +61,7 @@ from . import (
     runner,
     specs,
     verify,
+    workorder,
     workspace,
 )
 from .verify import split_command
@@ -177,6 +178,14 @@ STATUS_DISCARDED = "discarded"
 # from there. 'reverted' is an ending: the merge was taken back off the base.
 STATUS_ROLLED_BACK = "rolled_back"
 STATUS_REVERTED = "reverted"
+# plan.md moved after it was approved, so nothing may run until it is approved
+# again. A midpoint like 'waiting_approval:<stage>', and it is published for the
+# same reason: a human has to be able to see why the slice is not moving.
+STATUS_PLAN_REAPPROVAL = "plan_reapproval_pending"
+
+# Where the sealed 작업 지시서 lives in state.json. Optional like every key added
+# after schema 2, which is why STATE_SCHEMA stays 2.
+WORK_ORDER_KEY = "work_order"
 
 # Approval verdicts.
 PENDING = "pending"
@@ -1489,9 +1498,23 @@ def previous_result(rec: SliceRecord) -> Optional[Dict[str, Any]]:
 
 
 def open_amend(
-    rec: SliceRecord, state: Dict[str, Any], instruction: str, stages: Sequence[str]
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    instruction: str,
+    stages: Sequence[str],
+    work_order: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Re-open ``stages`` for one more cycle and record why. Append-only."""
+    """Re-open ``stages`` for one more cycle and record why. Append-only.
+
+    @param rec          the slice being amended
+    @param state        state.json, mutated in place
+    @param instruction  what the human typed
+    @param stages       which stages this cycle re-runs
+    @param work_order   rows the instruction itself declared, when it declared any
+    @flow  append the cycle -> its own work order, if it brought one
+           -> every re-opened stage back to pending -> write the amendment down
+    주요 내부 변수: amends(사이클 목록), entry(이번 사이클)
+    """
     amends = state.get("amends")
     if not isinstance(amends, list):
         amends = []
@@ -1503,6 +1526,10 @@ def open_amend(
         "opened_at": now_iso(),
         "previous_result": previous_result(rec),
     }
+    if work_order:
+        # Rows this cycle adds to the effective scope. The plan's own table is
+        # never edited - an amend widens, it does not rewrite.
+        entry[WORK_ORDER_KEY] = dict(work_order)
     amends.append(entry)
     state["amend_open"] = True
     for stage in stages:
@@ -1801,10 +1828,43 @@ INSTRUCTIONS
 - Read the real code before you write anything. Do not guess file or symbol names.
 - Produce an implementation plan: which files change, what changes in each, how
   it will be verified, and what could go wrong.
-
+{work_order}
 Your final message is saved verbatim as plan.md, and plan.md plus the
 requirement is all the implement stage receives. Reply with the plan itself in
 markdown - no preamble, no closing question.
+"""
+
+# The one section of plan.md the engine parses rather than reads. It is rendered
+# into the prompt from the same constants the parser uses, so the format a stage
+# is told to write and the format the engine accepts cannot drift apart.
+_WORK_ORDER_RULES = """\
+- End the plan with a '## 작업 지시서' section: one fixed-column table, one row
+  per file this work touches. The engine parses this table deterministically and
+  refuses the plan when it does not hold, so it is a machine input, not a
+  formality.
+
+    ## 작업 지시서
+
+    | 동사 | 대상 경로 | symbol | 책임 |
+    | --- | --- | --- | --- |
+    | CREATE | aidev/workorder.py |  | 지시서 파싱과 사후 대조 |
+    | MODIFY | aidev/pipeline.py | run_pipeline | scope check 호출 지점 |
+    | REFERENCE | aidev/verify.py |  | 검증 결과 구조 |
+
+  동사는 CREATE / MODIFY / REFERENCE 셋뿐이다.
+    CREATE     아직 없는 파일. 이미 있으면 plan은 FAIL한다.
+    MODIFY     이미 있는 파일. 없으면 FAIL한다. 지우려는 파일도 MODIFY다.
+    REFERENCE  읽기만 하는 파일. 쓰기 권한이 아니다.
+  symbol은 선택이다. 채우면 Function DB에서 그 파일 안에서 정확히 하나로
+  해석되어야 한다 - 0개도 2개 이상도 FAIL이다. 기존 파일에 **새 함수를
+  추가**하는 경우에는 symbol을 비우고 파일 단위 MODIFY로 선언하라: 계획을
+  검증하는 시점에 없는 이름은 해석이 0개라 반드시 FAIL한다.
+  대상 경로는 정규화된 repo-relative 경로다 - '/'로 쓰고, '..'도 절대경로도
+  드라이브 문자도 콜론도 쓰지 않는다.
+  같은 경로에 서로 다른 동사를 쓰거나, 같은 (경로, symbol) 조합을 두 번
+  쓰거나, 같은 경로에 symbol 없는 행과 symbol 행을 섞으면 FAIL이다.
+  구현 단계는 이 표의 CREATE에 없는 파일을 새로 만들 수 없고, MODIFY에 없는
+  파일을 지울 수 없다. 실제로 손댈 파일을 빠짐없이 적어라.
 """
 
 _IMPLEMENT_PROMPT = """\
@@ -1818,7 +1878,7 @@ REQUIREMENT
 APPROVED PLAN
 -------------
 {plan}
-{approval}{briefing}
+{work_order}{approval}{briefing}
 INSTRUCTIONS
 - Follow the approved plan. Where the real code contradicts it, follow the code
   and say so in your final message.
@@ -2011,7 +2071,7 @@ REQUIREMENT
 PLAN THAT WAS IMPLEMENTED
 -------------------------
 {plan}
-{approval}
+{work_order}{approval}
 INSTRUCTIONS
 - Run this project's own test suite the way the project runs it. Find the
   command from the project's config rather than assuming one.
@@ -2106,6 +2166,23 @@ _WORKSPACE_NOTE = """\
   looking for it.
 """
 
+# The approved 작업 지시서, handed to every stage that can change a file, with the
+# one sentence the requirement fixed. Empty for a legacy slice, which is what
+# keeps a prompt with no work order byte-for-byte what it was before this.
+_WORK_ORDER_NOTE = """
+작업 지시서 (approved - 이 표가 이번 실행의 범위다)
+--------------------------------------------------
+{table}
+
+지시서에 없는 파일 수정 금지, 부득이한 수정은 사유 표로 선언.
+
+지시서의 CREATE에 없는 새 파일을 만들면 그 실행은 즉시 실패한다. MODIFY에 없는
+파일을 지워도 즉시 실패한다. 선언되지 않은 기존 파일을 고쳤다면 최종 응답 맨
+끝에 '## 범위 밖 수정 사유' 절을 두고 '| 경로 | 사유 |' 표로 항목당 한 줄씩
+선언하라 - 고친 경로 전부, 그리고 고치지 않은 경로는 하나도 넣지 않는다. 범위
+밖 수정이 없으면 그 절은 생략한다.
+"""
+
 
 _VERDICT_RE = re.compile(r"^[^\S\n]*TEST_RESULT:[^\S\n]*(PASS|FAIL)\b", re.IGNORECASE | re.MULTILINE)
 
@@ -2138,6 +2215,7 @@ def build_prompt(
     diet: bool = False,
     approvals: Sequence[Dict[str, Any]] = (),
     briefing: str = "",
+    work_order: str = "",
 ) -> str:
     """The prompt one stage is given, built from what the engine already knows.
 
@@ -2155,12 +2233,17 @@ def build_prompt(
     @param diet           whether verification reaches the stage through ``aidev verify``
     @param approvals      conditions a human attached to this slice's approvals
     @param briefing       the 상차림 the engine set for this stage, '' for none
-    @flow  plan (+replan) -> implement/test template -> allowed/test-command/workspace/approval notes
+    @param work_order     the 작업 지시서 block this stage gets - the rules for plan,
+                          the approved table for the others, '' for a legacy slice
+    @flow  plan (+rules, +replan) -> implement/test template
+           -> allowed/test-command/workspace/work-order/approval notes
     주요 내부 변수: note(허용 규칙 + 검증 명령 안내), where(워크스페이스 안내)
     """
     if stage == "plan":
         return _PLAN_PROMPT.format(
-            requirement=requirement.strip(), briefing=_brief_note(briefing)
+            requirement=requirement.strip(),
+            briefing=_brief_note(briefing),
+            work_order=work_order,
         ) + _replan_note(replan)
     template = _IMPLEMENT_PROMPT if stage == "implement" else _TEST_PROMPT
     note = ""
@@ -2189,6 +2272,7 @@ def build_prompt(
         workspace=where,
         amend=_amend_note(amend),
         approval=_approval_note(approvals),
+        work_order=work_order,
         **extra
     )
 
@@ -3029,7 +3113,7 @@ def run_stage(
     @param repair       a failed verification this run must fix, if any
     @param replan       the rejected plan and its rejection, for a re-plan
     @flow  session policy -> set the table (v0.6) -> build prompt (+approval conditions,
-           +observation) -> execute -> record what the briefing cost
+           +work order, +observation) -> execute -> record what the briefing cost
            -> ok? return : write progress -> plan_recovery -> extend | observe | return
            ; quota -> record the wait -> auto_resume? sleep and retry : return
     주요 내부 변수: attempt(회차), session(이어붙일 세션), retries(쿼터 재시도 수),
@@ -3084,6 +3168,10 @@ def run_stage(
             # repair and an amend all carry the condition without asking for it.
             approvals=approval_conditions(state),
             briefing=brief.get("text", ""),
+            # plan is told the format; everything that can write is told the
+            # approved table itself. A legacy slice gets '' and the prompt it
+            # always had, byte for byte.
+            work_order=stage_work_order(state, stage),
         )
         if session:
             prompt += _RESUME_NOTE.format(stage=stage)
@@ -3232,7 +3320,19 @@ def record_run(rec: SliceRecord, run: StageRun) -> None:
 
 
 def run_setup(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> Optional[str]:
-    """Run the declared setup command once. Returns a reason to fail the slice, or None."""
+    """Run the declared setup command once. Returns a reason to fail the slice, or None.
+
+    What it produced is fingerprinted rather than merely named (v0.8), so the
+    scope check can excuse ``node_modules/`` while still catching a session that
+    rewrote a file setup created.
+
+    @param cfg    the slice's configuration - the command and the timeout
+    @param rec    the slice record, for setup.log
+    @param state  state.json, where the run and its output are recorded
+    @flow  nothing declared or already done -> None ; snapshot -> run -> log
+           -> fingerprint what it produced -> non-zero exit is a reason to fail
+    주요 내부 변수: before(설치 전 스냅샷), output(명령 출력), code(종료 코드)
+    """
     command = cfg.setup_command
     if not command:
         return None  # nothing declared: nothing runs, and nothing is granted
@@ -3241,6 +3341,7 @@ def run_setup(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> O
         say("setup already ran for this slice - not repeating it")
         return None
 
+    before = _setup_snapshot(cfg, state)
     argv = split_command(command)
     exe = shutil.which(argv[0], path=os.environ.get("PATH"))
     if exe is None:
@@ -3272,6 +3373,8 @@ def run_setup(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> O
         "ran_at": now_iso(),
         "log": str(log_path),
     }
+    if code == 0:
+        record_setup_products(cfg, state, before)
     rec.write_state(state)
     if code == 0:
         return None
@@ -3587,8 +3690,11 @@ def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any])
 
 
 def _pending_files(cwd: Path) -> List[str]:
-    status = git_porcelain(cwd) or ""
-    return [_porcelain_path(line) for line in status.splitlines() if line.strip()]
+    """Every path a stage commit would sweep in, read with ``-z`` so quoting cannot lie.
+
+    @param cwd  the worktree the commit is about to be made in
+    """
+    return [path for _, path in workspace.status_entries(cwd)]
 
 
 def _explosion_reason(cfg: PipelineConfig, stage: str, paths: Sequence[str]) -> str:
@@ -3758,6 +3864,10 @@ def run_temp_file_check(cfg: PipelineConfig, state: Dict[str, Any]) -> List[str]
     slice's own record into the worktree and ``write_text_atomic`` brushes a
     ``*.tmp`` past it, so without this every slice would accuse itself.
 
+    The uncommitted half is read through ``status_entries`` (``--porcelain=v1 -z``)
+    rather than through quoted porcelain, so a Korean or spaced path is judged
+    by its real name instead of by git's escaping of it.
+
     @param cfg    the slice's configuration - ``temp_guard`` turns this off
     @param state  state.json, which knows what commit the slice started from
     @flow  off -> [] ; no commit range -> committed additions skipped ; add the
@@ -3772,9 +3882,9 @@ def run_temp_file_check(cfg: PipelineConfig, state: Dict[str, Any]) -> List[str]
     try:
         if base and head:
             added += workspace.added_paths(cfg.cwd, base, head)
-        for line in (git_porcelain(cfg.cwd) or "").splitlines():
-            if line[:2] in _ADDED_STATUSES:
-                added.append(_porcelain_path(line))
+        for code, path in workspace.status_entries(cfg.cwd):
+            if code in _ADDED_STATUSES:
+                added.append(path)
     except workspace.GitError as exc:
         # A checker that cannot read the diff must not be the reason a stage fails.
         say("note: temp-file check could not read the diff ({0}) - skipped".format(exc))
@@ -3790,6 +3900,837 @@ def run_temp_file_check(cfg: PipelineConfig, state: Dict[str, Any]) -> List[str]
         if verify.looks_temporary(path):
             found.add(path)
     return sorted(found)
+
+
+# ------------------------------------------------------ 작업 지시서 (v0.8)
+#
+# The plan declares its scope as a table, the engine checks that table before the
+# plan may be committed, and checks the real diff against it before any stage
+# that changed a file may be committed. What this guarantees is bounded and said
+# out loud: **changes git observes inside the worktree**. A write outside the
+# worktree is not covered here and is registered in the README as a separate,
+# unbuilt safety pin - claiming more than the mechanism does would be worse than
+# claiming less.
+
+# What a refusal shows a human, and what --replan hands the next plan stage. The
+# same words the plan prompt already carries, so a rejected plan is told exactly
+# what it was told before.
+_WORK_ORDER_HELP = """\
+    plan.md는 '## 작업 지시서' 절에 다음 표를 그대로 실어야 한다:
+
+      | 동사 | 대상 경로 | symbol | 책임 |
+      | --- | --- | --- | --- |
+      | CREATE | aidev/workorder.py |  | 지시서 파싱과 사후 대조 |
+      | MODIFY | aidev/pipeline.py | run_pipeline | scope check 호출 지점 |
+
+    동사는 CREATE / MODIFY / REFERENCE 셋뿐이고, symbol은 선택이다.
+    기존 파일에 새 함수를 추가하는 경우에는 symbol을 비우고 파일 단위 MODIFY로
+    선언한다 - 아직 없는 이름은 해석이 0개라 반드시 FAIL한다."""
+
+
+def work_order_refusal(reasons: Sequence[str]) -> str:
+    """One refusal carrying every reason at once, plus the format itself.
+
+    Every reason rather than the first: a plan stage that has to be re-run once
+    per mistake costs a session per line of a table.
+
+    @param reasons  what ``validate_work_order`` or the parser objected to
+    """
+    return (
+        "작업 지시서를 받아들일 수 없다:\n"
+        + "\n".join("  - " + str(reason) for reason in reasons)
+        + "\n"
+        + _WORK_ORDER_HELP
+    )
+
+
+def work_order_required(state: Dict[str, Any]) -> bool:
+    """Is this a slice the work order rules apply to at all?
+
+    Only slices launched from v0.8 on carry the key. A v0.2/v0.3 record does
+    not, and resuming one must not fail it for a document nobody ever asked it
+    to write - which is the whole of the backward compatibility promise.
+
+    @param state  state.json
+    """
+    return bool(state.get("work_order_required"))
+
+
+def open_graph_for_order(
+    cfg: PipelineConfig, items: Sequence[workorder.Item]
+) -> Tuple[Optional[Any], str]:
+    """The Function DB a symbol row is resolved against, brought up to date first.
+
+    Fail-closed, and only when it is needed. A work order with no symbol at all
+    never opens the graph, so a file-level order is checkable with ``--no-graph``
+    and in a repository the graph cannot parse. One symbol changes that: every
+    way the graph can be unavailable then becomes a reason to refuse the plan,
+    because a symbol nobody could resolve is exactly the ambiguity this removes.
+
+    @param cfg    the slice's configuration - the worktree and the graph switch
+    @param items  the parsed work order rows
+    @flow  no symbol row -> (None, '') ; --no-graph -> refuse ; build or refresh
+           -> HEAD moved -> rebuild -> still dirty or unopenable -> refuse
+    주요 내부 변수: path(graph.db 위치), db(열린 핸들), head(현재 커밋)
+    """
+    if not any(item.symbol for item in items):
+        return None, ""
+    if not cfg.graph_hook:
+        return None, (
+            "지시서에 symbol 행이 있는데 --no-graph다 - symbol 해석은 Function DB가 "
+            "필요하다. --no-graph는 symbol 없는 파일 단위 지시서에서만 쓸 수 있다"
+        )
+    path = graph.db_path(cfg.cwd)
+    try:
+        if not path.exists():
+            graph.update_repo(cfg.cwd)
+        else:
+            graph.refresh_if_dirty(cfg.cwd)
+            opened = graph.open_db(path)
+            head = workspace.head_commit(cfg.cwd) or ""
+            stale = opened is None or str((opened.meta() or {}).get("base_commit") or "") != head
+            if opened is not None:
+                opened.close()
+            if stale:
+                graph.update_repo(cfg.cwd)
+        if graph.is_dirty(cfg.cwd):
+            return None, "Function DB가 최신이 아니다 (갱신에 실패했다): {0}".format(path)
+        db = graph.open_db(path)
+    except Exception as exc:  # a graph that cannot be built cannot resolve a symbol
+        return None, "Function DB를 준비할 수 없다: {0}".format(exc)
+    if db is None:
+        return None, "Function DB를 열 수 없다: {0}".format(path)
+    return db, ""
+
+
+def validate_work_order(
+    cfg: PipelineConfig, items: Sequence[workorder.Item], base_dir: Optional[Path] = None
+) -> List[str]:
+    """Everything about a work order the table alone cannot say. Empty means it holds.
+
+    The engine never infers. A row with no symbol is a file-level instruction and
+    nothing here guesses which function inside it was meant; a row with a symbol
+    has to resolve to exactly one function *in that file*, and both zero and two
+    are refusals.
+
+    @param cfg       the slice's configuration - the worktree and the graph switch
+    @param items     the parsed rows
+    @param base_dir  what the paths are relative to; ``cfg.cwd`` when None
+    @flow  per row: symlink escape -> CREATE must not exist / MODIFY-REFERENCE must
+           -> open the graph if any symbol -> per symbol row: exactly one match
+    주요 내부 변수: root(기준 디렉터리), reasons(사유 목록), db(열린 그래프)
+    """
+    root = Path(base_dir) if base_dir is not None else Path(cfg.cwd)
+    reasons: List[str] = []
+    for item in items:
+        if workorder.escapes_root(root, item.path):
+            reasons.append(
+                "{0}행: 경로가 저장소 밖을 가리킨다 (symlink/junction 포함): {1}".format(
+                    item.row, item.path
+                )
+            )
+            continue
+        target = root / item.path
+        if item.verb == workorder.VERB_CREATE:
+            if target.exists():
+                reasons.append(
+                    "{0}행: CREATE 대상이 이미 있다 - 고치는 것이라면 MODIFY다: {1}".format(
+                        item.row, item.path
+                    )
+                )
+            continue
+        if not target.is_file():
+            reasons.append(
+                "{0}행: {1} 대상이 없다: {2}".format(item.row, item.verb, item.path)
+            )
+    db, refusal = open_graph_for_order(cfg, items)
+    if refusal:
+        return reasons + [refusal]
+    if db is None:
+        return reasons
+    try:
+        for item in items:
+            if not item.symbol:
+                continue
+            rows = db.find_in_file(item.path, item.symbol)
+            if not rows:
+                reasons.append(
+                    "{0}행: symbol '{1}'을 {2} 안에서 찾을 수 없다 - 새로 만드는 "
+                    "함수라면 symbol을 비우고 파일 단위 MODIFY로 선언하라".format(
+                        item.row, item.symbol, item.path
+                    )
+                )
+            elif len(rows) > 1:
+                where = ", ".join(
+                    "{0}:{1}".format(row["qualname"], row["lineno"]) for row in rows[:6]
+                )
+                reasons.append(
+                    "{0}행: symbol '{1}'이 {2} 안에서 {3}개로 해석된다 ({4})".format(
+                        item.row, item.symbol, item.path, len(rows), where
+                    )
+                )
+    finally:
+        db.close()
+    return reasons
+
+
+def read_work_order(
+    cfg: PipelineConfig, text: str, base_dir: Optional[Path] = None
+) -> Tuple[List[workorder.Item], List[str]]:
+    """Parse a document's work order and check it, in one call. ``(items, reasons)``.
+
+    @param cfg       the slice's configuration
+    @param text      the document - plan.md, or an amend instruction
+    @param base_dir  what the paths are relative to; ``cfg.cwd`` when None
+    @flow  parse -> parser errors are the whole answer -> otherwise validate
+    """
+    order = workorder.parse_work_order(text)
+    if order.errors:
+        return order.items, list(order.errors)
+    return order.items, validate_work_order(cfg, order.items, base_dir)
+
+
+def effective_order(state: Dict[str, Any]) -> List[workorder.Item]:
+    """The scope the final diff is compared with: the plan's table plus every amend's.
+
+    The plan's own table in state.json is never rewritten. An amend *adds* rows
+    and cannot edit or remove one, so the sum is taken at read time and the
+    original survives untouched - which is what makes the audit trail readable
+    after five amends.
+
+    @param state  state.json
+    @flow  the sealed order -> each amends[].work_order in order -> drop repeats
+    주요 내부 변수: items(누적 목록), seen(이미 본 (동사, 경로, symbol))
+    """
+    record = state.get(WORK_ORDER_KEY)
+    items = workorder.items_from_dicts((record or {}).get("items") if isinstance(record, dict) else [])
+    for entry in state.get("amends") or []:
+        if not isinstance(entry, dict):
+            continue
+        added = entry.get(WORK_ORDER_KEY)
+        if isinstance(added, dict):
+            items += workorder.items_from_dicts(added.get("items"))
+    seen: set = set()
+    unique: List[workorder.Item] = []
+    for item in items:
+        if item.key in seen:
+            continue
+        seen.add(item.key)
+        unique.append(item)
+    return unique
+
+
+def work_order_note(state: Dict[str, Any]) -> str:
+    """The effective work order as a table again, for a prompt. '' when there is none.
+
+    @param state  state.json
+    """
+    items = effective_order(state)
+    return workorder.render_table(items) if items else ""
+
+
+def stage_work_order(state: Dict[str, Any], stage: str) -> str:
+    """The 작업 지시서 block one stage's prompt carries. '' for a legacy slice.
+
+    plan is told the *format*, because it is the stage that writes the table.
+    Every stage that can change a file is told the table itself, together with
+    the one sentence the requirement fixed. '' is the load-bearing answer: a
+    slice with no work order gets exactly the prompt it got before this existed.
+
+    @param state  state.json
+    @param stage  the stage about to run
+    @flow  legacy -> '' ; plan -> the rules ; else the approved table, when there is one
+    주요 내부 변수: table(재렌더된 지시서)
+    """
+    if not work_order_required(state):
+        return ""
+    if stage == "plan":
+        return _WORK_ORDER_RULES
+    table = work_order_note(state)
+    return _WORK_ORDER_NOTE.format(table=table) if table else ""
+
+
+def plan_work_order_note(rec: SliceRecord) -> str:
+    """The work order as plan.md spells it *right now*, for the approval screen.
+
+    Read from the file rather than from state on purpose: the gate is where a
+    human edits plan.md, so what they are shown has to be what they are about to
+    approve, not what the stage originally wrote.
+
+    @param rec  the slice record holding plan.md
+    """
+    order = workorder.parse_work_order(rec.read_plan())
+    if order.errors or not order.items:
+        return ""
+    return "이 계획이 선언한 작업 지시서:\n" + workorder.render_table(order.items)
+
+
+def read_amend_order(
+    cfg: PipelineConfig, state: Dict[str, Any], instruction: str
+) -> Optional[Dict[str, Any]]:
+    """A work order carried by an amend instruction, checked exactly as a plan's is.
+
+    An amend without one is not an error - the correction then lives inside the
+    scope already declared, and the engine widens nothing by itself. An amend
+    *with* one is refused before the cycle is opened, so a bad table costs no
+    stage at all.
+
+    @param cfg          the slice's configuration
+    @param state        state.json - a legacy slice is never asked for one
+    @param instruction  what the human typed after --amend
+    @flow  legacy or no section -> None ; parser errors -> refuse
+           -> validate -> refuse -> the record state.json keeps
+    주요 내부 변수: order(파싱 결과), reasons(검증 사유)
+    """
+    if not work_order_required(state):
+        return None
+    order = workorder.parse_work_order(instruction)
+    if not order.present:
+        return None
+    if order.errors:
+        raise PipelineError(work_order_refusal(order.errors))
+    reasons = validate_work_order(cfg, order.items)
+    if reasons:
+        raise PipelineError(work_order_refusal(reasons))
+    return {
+        "items": [item.to_dict() for item in order.items],
+        "scope_digest": workorder.items_digest(order.items),
+        "at": now_iso(),
+    }
+
+
+# ------------------------------------------------------------------ the seal
+#
+# Two digests, because two different questions are being asked. Whether the
+# document a human approved is still the document is a question about *bytes*,
+# and a human who reworded a paragraph at the gate did change what they approved.
+# Whether the scope moved is a question about the table only, and a reworded duty
+# column is not a scope change. Conflating them would either re-open the gate for
+# a typo fix or let a rewritten table through on an unchanged digest.
+
+
+def seal_plan(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> Optional[str]:
+    """Re-read plan.md, check its work order again, and record both digests.
+
+    Run at the moment of approval rather than when the plan was written, because
+    the gate is precisely where a human is invited to edit plan.md - and what
+    implement is handed is the file as it stands now, not as the stage wrote it.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record holding plan.md
+    @param state  state.json, where the seal is written
+    @flow  read the bytes -> parse and validate -> reasons? the refusal
+           ; else store the rows, both digests and the moment
+    주요 내부 변수: data(plan.md 원문 바이트), items/reasons(검증 결과)
+    """
+    try:
+        data = rec.plan_path.read_bytes()
+    except OSError as exc:
+        return "plan.md를 읽을 수 없다: {0}".format(exc)
+    items, reasons = read_work_order(cfg, data.decode("utf-8", errors="replace"))
+    if reasons:
+        return work_order_refusal(reasons)
+    state[WORK_ORDER_KEY] = {
+        "items": [item.to_dict() for item in items],
+        "scope_digest": workorder.items_digest(items),
+        "document_digest": workorder.document_digest(data),
+        "sealed": True,
+        "sealed_at": now_iso(),
+        "graph": {"used": any(item.symbol for item in items)},
+    }
+    rec.write_state(state)
+    say(
+        "work order sealed: {0} row(s), scope {1}".format(
+            len(items), state[WORK_ORDER_KEY]["scope_digest"][7:19]
+        )
+    )
+    return None
+
+
+def plan_seal_status(rec: SliceRecord, state: Dict[str, Any]) -> str:
+    """Is the plan this slice is about to act on the one that was approved?
+
+    ``legacy`` for a slice from before work orders, ``unsealed`` when nothing was
+    ever sealed, ``stale`` when plan.md has moved since, ``ok`` otherwise. An
+    empty digest counts as ``unsealed`` rather than as a match, so a blank value
+    cannot become the way past the seal.
+
+    @param rec    the slice record holding plan.md
+    @param state  state.json, where the seal is kept
+    @flow  legacy -> not sealed or blank digest -> unreadable plan -> compare
+    주요 내부 변수: record(봉인 기록), digest(승인 시점의 문서 digest)
+    """
+    if not work_order_required(state):
+        return "legacy"
+    record = state.get(WORK_ORDER_KEY)
+    if not isinstance(record, dict) or not record.get("sealed"):
+        return "unsealed"
+    digest = str(record.get("document_digest") or "")
+    if not digest:
+        return "unsealed"
+    try:
+        data = rec.plan_path.read_bytes()
+    except OSError:
+        return "stale"
+    return "ok" if workorder.document_digest(data) == digest else "stale"
+
+
+def plan_is_gated(state: Dict[str, Any]) -> bool:
+    """Does this slice stop for a human at the plan gate? ``approval: none`` does not.
+
+    @param state  state.json
+    """
+    return "plan" in {str(name) for name in (state.get("gates") or ())}
+
+
+def ensure_plan_sealed(
+    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]
+) -> Optional[str]:
+    """The seal, re-checked in the last breath before anything is allowed to write.
+
+    ``handle_plan_gate`` settles this at the top of a run; this is the check that
+    catches a plan.md edited *during* the run, and the one an ``approval: none``
+    slice seals itself through.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record
+    @param state  state.json
+    @flow  legacy or ok -> None ; no human gate -> re-validate and re-seal
+           ; else refuse until it is approved again
+    주요 내부 변수: status(봉인 상태)
+    """
+    status = plan_seal_status(rec, state)
+    if status in ("legacy", "ok"):
+        return None
+    if not plan_is_gated(state):
+        # approval: none - there is no human to ask, so the answer is a
+        # re-validation and a re-seal, never a gate nobody would ever open.
+        return seal_plan(cfg, rec, state)
+    return (
+        "plan.md가 승인된 내용과 다르다 (document digest 불일치).\n"
+        "    다시 승인할 때까지 이 slice는 아무것도 쓰지 않는다: {0}".format(
+            rec.approval_path("plan")
+        )
+    )
+
+
+def reopen_plan_gate(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Put the answered plan approval aside so the same gate can be asked again.
+
+    Nothing is deleted: the answered file moves to
+    ``approvals/plan-reapproval-NNN.md``, which keeps the record of what was
+    approved before the plan moved. The live file has to go, or the next poll
+    would read the answer it was just given and walk straight past the gate.
+
+    @param rec    the slice whose approvals directory is rearranged
+    @param state  state.json, where the re-approval is recorded
+    @flow  number it -> copy the old answer aside -> unlink -> clear the stage's
+           verdict -> append the record
+    주요 내부 변수: records(재승인 이력), number(이번이 몇 번째인지)
+    """
+    records = state.get("plan_reapprovals")
+    if not isinstance(records, list):
+        records = []
+        state["plan_reapprovals"] = records
+    number = len(records) + 1
+    path = rec.approval_path("plan")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    kept = ""
+    if text.strip():
+        target = rec.approvals_dir / "plan-reapproval-{0:03d}.md".format(number)
+        write_text_atomic(target, text)
+        kept = "approvals/{0}".format(target.name)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    entry = stage_entry(state, "plan")
+    for key in ("approval", "approval_reason"):
+        entry.pop(key, None)
+    record = {"n": number, "at": now_iso(), "kept": kept}
+    records.append(record)
+    rec.write_state(state)
+    return record
+
+
+def handle_plan_gate(
+    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]
+) -> Optional[int]:
+    """Settle the plan seal before anything else this run might do.
+
+    Deliberately ahead of the amend filter. An amend re-opens implement and test
+    and never looks at plan again, so a plan.md edited underneath an open amend
+    would leave the slice unable to finish and unable to be re-approved - the
+    deadlock the requirement names. Handling the gate here, first, means the
+    same amend cycle carries on the moment the plan is approved again.
+
+    ``None`` means carry on; an int is the exit code this run ends with.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record
+    @param state  state.json, updated in place
+    @flow  legacy or no plan yet -> None ; ok -> None ; stale and gated -> re-open
+           and wait -> rejected/timeout ends the run -> re-seal, failing if it will not
+    주요 내부 변수: status(봉인 상태), decision(사람의 재승인)
+    """
+    if not work_order_required(state):
+        return None
+    if stage_entry(state, "plan").get("status") != "done":
+        return None
+    status = plan_seal_status(rec, state)
+    if status == "ok":
+        return None
+    if status == "stale" and plan_is_gated(state):
+        reopen_plan_gate(rec, state)
+        say("plan.md가 승인 이후 바뀌었다 - 재승인 없이는 진행하지 않는다")
+        set_status(rec, state, STATUS_PLAN_REAPPROVAL)
+        decision = await_approval(cfg, rec, state, "plan", note=plan_work_order_note(rec))
+        if decision.verdict == REJECTED:
+            state["reason"] = "rejected at 'plan': {0}".format(
+                decision.reason or "(no reason given)"
+            )
+            set_status(rec, state, STATUS_REJECTED)
+            say("REJECTED - {0}".format(state["reason"]))
+            return EXIT_REJECTED
+        if decision.verdict != APPROVED:
+            return fail_slice(rec, state, "timed out waiting for re-approval of 'plan'")
+    reason = seal_plan(cfg, rec, state)
+    if reason is not None:
+        stage_entry(state, "plan")["status"] = "failed"
+        return fail_slice(rec, state, reason)
+    return None
+
+
+# ------------------------------------------------------------ 사후 대조 (v0.8)
+
+
+def mirror_paths(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any]) -> List[str]:
+    """Exactly the files ``mirror_history`` will overwrite inside the worktree.
+
+    Named one by one rather than by directory, and that is the whole point:
+    excusing ``.aidev/history/**`` wholesale is what would let a stage hide a
+    brand-new file under it. Anything else that appears under ``.aidev/`` is a
+    new file like any other, and fails like one.
+
+    @param cfg    the slice's configuration, for the worktree
+    @param rec    the slice whose documents are mirrored
+    @param state  state.json, which names the amends
+    @flow  requirement and slice.json -> plan when there is one -> amends by
+           number -> failure/diagnosis/progress only where the source exists
+    주요 내부 변수: prefix(worktree 안 history 경로), paths(정확한 파일 목록)
+    """
+    prefix = "{0}/{1}/{2}".format(AIDEV_DIRNAME, HISTORY_DIR, rec.slice_id)
+    paths = ["{0}/requirement.md".format(prefix), "{0}/slice.json".format(prefix)]
+    if rec.read_plan().strip():
+        paths.append("{0}/plan.md".format(prefix))
+    for entry in state.get("amends") or []:
+        if isinstance(entry, dict) and entry.get("n"):
+            paths.append("{0}/amends/{1}".format(prefix, rec.amend_path(int(entry["n"])).name))
+    for source in (rec.failure_path, rec.diagnosis_path, rec.progress_path):
+        if source.exists():
+            paths.append("{0}/{1}".format(prefix, source.name))
+    return paths
+
+
+def engine_excluded(
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    order: Sequence[workorder.Item],
+) -> Dict[str, Optional[Tuple[str, str]]]:
+    """Paths the scope check must not judge, because the engine itself wrote them.
+
+    Two kinds, excluded on different terms. The mirror files are excluded
+    outright - the engine rewrites them before every commit. A setup command's
+    output is excluded only while it is still byte-for-byte what setup produced:
+    edit it or delete it and it is scope again, which is what stops "setup made
+    it" from becoming a laundering route.
+
+    A path the work order already declares is never excluded: it was declared,
+    so it should be judged as declared.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record
+    @param state  state.json, holding the setup fingerprints
+    @param order  the effective work order
+    @flow  mirror files -> setup products with their fingerprint -> drop declared paths
+    주요 내부 변수: declared(지시서가 이미 아는 경로), excluded(경로 -> 지문 또는 None)
+    """
+    declared = {item.path for item in order}
+    excluded: Dict[str, Optional[Tuple[str, str]]] = {}
+    for path in mirror_paths(cfg, rec, state):
+        if path not in declared:
+            excluded[path] = None
+    for entry in ((state.get("setup") or {}).get("produced") or []):
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "")
+        if not path or path in declared:
+            continue
+        excluded[path] = (str(entry.get("mode") or ""), str(entry.get("blob") or ""))
+    return excluded
+
+
+def resolve_excluded(
+    excluded: Dict[str, Optional[Tuple[str, str]]], entries: Dict[str, Tuple[str, str]]
+) -> Set[str]:
+    """Which of the excluded paths really are excluded at this moment.
+
+    A mirror file always is. A setup product only while its mode and blob still
+    match the fingerprint taken the instant setup finished - the name alone
+    would let a session rewrite a file setup created and call it setup's.
+
+    @param excluded  path -> fingerprint, or None for an unconditional exclusion
+    @param entries   the snapshot's ``ls-files -s`` entries, path -> (mode, blob)
+    """
+    keep: Set[str] = set()
+    for path, fingerprint in excluded.items():
+        if fingerprint is None or entries.get(path) == fingerprint:
+            keep.add(path)
+    return keep
+
+
+def reasoned_paths(state: Dict[str, Any]) -> Set[str]:
+    """Paths a reason was already declared for, so a later cycle is not asked twice.
+
+    The final diff is measured from the slice's first commit, so an unplanned
+    edit an earlier stage declared is still in every later diff. Demanding it be
+    re-declared on every run is what would make the last amend impossible to pass.
+
+    @param state  state.json, whose ``scope_checks`` are the audit trail
+    """
+    found: Set[str] = set()
+    for entry in state.get("scope_checks") or []:
+        if isinstance(entry, dict):
+            for path in entry.get("declared_reasons") or []:
+                found.add(str(path))
+    return found
+
+
+def _setup_snapshot(cfg: PipelineConfig, state: Dict[str, Any]) -> Optional[Any]:
+    """The tree as it was before the setup command ran, or None when that cannot be had.
+
+    @param cfg    the slice's configuration
+    @param state  state.json, which knows what commit the slice started from
+    @flow  legacy or no worktree or no base -> None ; snapshot ; git trouble -> None
+    """
+    if cfg.workspace is None or not work_order_required(state):
+        return None
+    base = spec_base_commit(cfg, state)
+    if not base:
+        return None
+    try:
+        return workspace.snapshot(cfg.cwd, base)
+    except (workspace.GitError, ValueError):
+        return None
+
+
+def record_setup_products(cfg: PipelineConfig, state: Dict[str, Any], before: Optional[Any]) -> None:
+    """Fingerprint what the setup command produced, so it can be told apart later.
+
+    The name alone would not do. A file setup created and implement then rewrote
+    is implement's change, and only the mode and the blob can say which of the
+    two a path is at any later moment.
+
+    @param cfg     the slice's configuration, for the worktree
+    @param state   state.json, where the fingerprints are kept under ``setup``
+    @param before  the snapshot taken before setup ran, or None
+    @flow  no before -> nothing ; snapshot again -> every entry that moved -> record it
+    주요 내부 변수: after(설치 후 스냅샷), produced(setup이 남긴 것들)
+    """
+    if before is None:
+        return
+    base = spec_base_commit(cfg, state)
+    try:
+        after = workspace.snapshot(cfg.cwd, base) if base else None
+    except (workspace.GitError, ValueError) as exc:
+        say("note: setup output not fingerprinted ({0})".format(exc))
+        return
+    if after is None:
+        return
+    produced = [
+        {"path": path, "mode": entry[0], "blob": entry[1]}
+        for path, entry in sorted(after.entries.items())
+        if before.entries.get(path) != entry
+    ]
+    record = state.get("setup")
+    if isinstance(record, dict):
+        record["produced"] = produced
+    if produced:
+        say("setup produced {0} file(s) - fingerprinted, not excused by name".format(len(produced)))
+
+
+def scope_check(
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    state: Dict[str, Any],
+    stage: str,
+    label: str,
+    text: str = "",
+) -> Optional[str]:
+    """Compare the final diff with the work order, immediately before the commit.
+
+    Fail-closed all the way down: a git that cannot answer, a base commit that is
+    not there, a status letter nobody knows - each is a refusal, because a
+    blocking device that fails open blocks nothing.
+
+    ``unplanned_modified`` is recomputed from scratch every time rather than
+    accumulated, so a path that was put back stops being an unplanned change -
+    while ``scope_checks`` goes on saying it once was.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record
+    @param state  state.json, where the audit trail and the current list live
+    @param stage  which stage is about to be committed
+    @param label  what that commit is called, e.g. ``repair1/implement``
+    @param text   the run's final message, where the reason table is read from
+    @flow  legacy -> None ; no worktree -> refuse outright ; base -> snapshot
+           -> classify -> reason table -> record -> the failures, or None
+    주요 내부 변수: verdict(분류 결과), reasons(사유 표), failures(사유 목록)
+    """
+    if not work_order_required(state):
+        return None
+    if cfg.workspace is None:
+        raise PipelineError(
+            "slice {0}은 작업 지시서 slice인데 worktree가 없다 - 사후 대조의 보증은 "
+            "worktree 안의 Git 관찰 변경이고, 격리 없이는 그 기준이 없다".format(rec.slice_id)
+        )
+    order = effective_order(state)
+    failures: List[str] = []
+    snapshot: Optional[Any] = None
+    base = spec_base_commit(cfg, state)
+    if not base:
+        failures.append("이 slice의 기준 커밋을 찾을 수 없다 - 최종 diff를 만들 수 없다")
+    else:
+        try:
+            snapshot = workspace.snapshot(cfg.cwd, base)
+        except (workspace.GitError, ValueError) as exc:
+            failures.append("최종 diff를 읽을 수 없다: {0}".format(exc))
+    verdict = workorder.ScopeVerdict()
+    reasons = workorder.Reasons()
+    if snapshot is not None:
+        excluded = resolve_excluded(
+            engine_excluded(cfg, rec, state, order), snapshot.entries
+        )
+        verdict = workorder.classify(snapshot.status, order, excluded)
+        reasons = workorder.parse_reasons(text or "")
+        failures += verdict.failures + reasons.errors
+        failures += workorder.match_reasons(
+            verdict.unplanned, reasons.paths, reasoned_paths(state)
+        )
+    record_scope_check(state, stage, label, verdict, reasons, failures)
+    rec.write_state(state)
+    if failures:
+        return "'{0}' 단계의 최종 변경이 작업 지시서와 맞지 않아 커밋하지 않는다:\n".format(
+            label
+        ) + "\n".join("  - " + failure for failure in failures)
+    if verdict.unplanned:
+        say("scope: {0} unplanned file(s), each declared with a reason".format(len(verdict.unplanned)))
+    return None
+
+
+def record_scope_check(
+    state: Dict[str, Any],
+    stage: str,
+    label: str,
+    verdict: workorder.ScopeVerdict,
+    reasons: workorder.Reasons,
+    failures: Sequence[str],
+) -> None:
+    """Append one comparison to the audit trail and recompute the current unplanned list.
+
+    Two different lifetimes on purpose. ``scope_checks`` only ever grows: it is
+    the history, and a path that was reverted still happened. ``unplanned_modified``
+    is replaced whole from the diff that was just measured, so it is always a
+    statement about the repository as it is now.
+
+    @param state     state.json, mutated in place
+    @param stage     which stage was checked
+    @param label     what its commit is called
+    @param verdict   what ``classify`` decided
+    @param reasons   the parsed reason table
+    @param failures  every refusal this check produced
+    @flow  append the record -> per current unplanned path: this run's reason,
+           else the one already recorded -> replace the list
+    주요 내부 변수: previous(직전 목록), declared(이번에 선언된 사유)
+    """
+    moment = now_iso()
+    declared = dict(reasons.rows)
+    checks = state.get("scope_checks")
+    if not isinstance(checks, list):
+        checks = []
+        state["scope_checks"] = checks
+    record: Dict[str, Any] = {
+        "at": moment,
+        "stage": stage,
+        "label": label,
+        "ok": not failures,
+        "added": list(verdict.added),
+        "deleted": list(verdict.deleted),
+        "unplanned": list(verdict.unplanned),
+        "declared_reasons": sorted(declared),
+    }
+    if failures:
+        record["reason"] = str(failures[0]).splitlines()[0]
+    checks.append(record)
+    previous = {
+        str(entry.get("path")): entry
+        for entry in (state.get("unplanned_modified") or [])
+        if isinstance(entry, dict) and entry.get("path")
+    }
+    state["unplanned_modified"] = [
+        {
+            "path": path,
+            "reason": declared.get(path) or str((previous.get(path) or {}).get("reason") or ""),
+            "stage": str((previous.get(path) or {}).get("stage") or stage),
+            "at": str((previous.get(path) or {}).get("at") or moment),
+        }
+        for path in verdict.unplanned
+    ]
+
+
+def engine_verify_guard(
+    cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any], when: str
+) -> Optional[str]:
+    """Two independent checks around the engine's own verification commands.
+
+    Zero tolerance, because there is nobody to declare a reason: the engine ran
+    it. *Before*, an already-dirty tree is a refusal and the commands are not
+    run at all - running on top of somebody else's mess is how it gets laundered.
+    *After*, any observable change is a refusal, declared or not, because
+    verification that edits the thing it is verifying has stopped being
+    verification. Two separate looks rather than one comparison, so neither can
+    be satisfied by the other.
+
+    @param cfg    the slice's configuration
+    @param rec    the slice record, named in the refusal
+    @param state  state.json - a legacy slice is not guarded
+    @param when   'before' or 'after'
+    @flow  legacy or no worktree -> None ; diff against HEAD -> empty? None
+           : the refusal, worded for which of the two looks this is
+    주요 내부 변수: status(HEAD 대비 변경 목록), listing(사람이 읽을 목록)
+    """
+    if not work_order_required(state) or cfg.workspace is None:
+        return None
+    try:
+        status = workspace.diff_status(cfg.cwd, "HEAD")
+    except (workspace.GitError, ValueError) as exc:
+        return "verify {0}: 작업트리를 읽을 수 없다: {1}".format(when, exc)
+    if not status:
+        return None
+    listing = "\n".join("    {0}  {1}".format(status[path], path) for path in sorted(status)[:20])
+    if when == "before":
+        return (
+            "verify 시작 전 작업트리가 dirty하다 - 검증 명령을 실행하지 않는다 "
+            "({0}):\n{1}".format(rec.slice_id, listing)
+        )
+    return (
+        "verify가 저장소를 바꿨다 - 엔진 실행에는 사유를 댈 주체가 없다 "
+        "({0}):\n{1}".format(rec.slice_id, listing)
+    )
 
 
 def record_verify(
@@ -4020,13 +4961,20 @@ def run_verify(
     @param state        state.json, updated in place
     @param requirement  the requirement body, for the retry and the diagnosis
     @param amend        the open amend cycle, if any
-    @flow  run -> spec check -> temp-file check -> clean? return None
-           : failure.md -> grade -> diagnose? -> implement -> repeat
+    @flow  dirty guard -> run -> changed-the-repo guard -> spec check
+           -> temp-file check -> clean? return None
+           : failure.md -> grade -> diagnose? -> implement -> scope check -> repeat
     주요 내부 변수: attempt(회차), result(VerifyResult), grade(small|large)
     """
     attempt = 0
     while True:
         attempt += 1
+        # The engine has no reason table of its own, so both looks are absolute:
+        # a tree that was already dirty, and a tree the commands moved.
+        reason = engine_verify_guard(cfg, rec, state, "before")
+        if reason is not None:
+            note_stage_failure(state, "test")
+            return reason
         say("verify: {0}".format("  ".join(cfg.test_commands)))
         result = verify.run_commands(
             cfg.test_commands,
@@ -4035,6 +4983,10 @@ def run_verify(
             timeout=cfg.verify_timeout,
             attempt=attempt,
         )
+        reason = engine_verify_guard(cfg, rec, state, "after")
+        if reason is not None:
+            note_stage_failure(state, "test")
+            return reason
         # Always, whatever the commands said: a green suite over an undocumented
         # function is still a slice that broke the convention, and so is a green
         # suite with reindent_tmp.py sitting beside it.
@@ -4098,6 +5050,9 @@ def run_verify(
         entry["status"] = "pending"
         entry.pop("session_id", None)  # it concluded 'done'; that memory is now wrong
         rec.write_state(state)
+        reason = ensure_plan_sealed(cfg, rec, state)
+        if reason is not None:
+            return reason
         run = run_stage(
             cfg,
             rec,
@@ -4114,15 +5069,36 @@ def run_verify(
                 attempt, run.status, run.run_id, run.exit_code, rec.failure_path
             )
         entry.update({"status": "done", "run_id": run.run_id})
-        reason = commit_stage(
-            cfg, rec, state, "implement", label=REPAIR_LABEL.format(attempt, "implement")
-        )
+        label = REPAIR_LABEL.format(attempt, "implement")
+        reason = scope_check(cfg, rec, state, "implement", label, run.text)
+        if reason is not None:
+            entry["status"] = "failed"
+            note_stage_failure(state, "implement")
+            return reason
+        reason = commit_stage(cfg, rec, state, "implement", label=label)
         if reason is not None:
             return reason
         rec.write_state(state)
 
 
 # ---------------------------------------------------------------- the loop
+
+
+def _gate_note(rec: SliceRecord, state: Dict[str, Any], stage: str) -> str:
+    """What the deciding human is shown above the approval file. '' for most gates.
+
+    The plan gate gets two things: the size warning it always got, and - since
+    v0.8 - the work order the plan declares, so the scope is on the same screen
+    as the decision about it.
+
+    @param rec    the slice record, whose plan.md the table is read from
+    @param state  state.json, carrying the measured plan scale
+    @param stage  which gate is being opened
+    """
+    if stage != "plan":
+        return ""
+    parts = [plan_scale_note(state.get("plan_scale")), plan_work_order_note(rec)]
+    return "\n".join(part for part in parts if part.strip())
 
 
 def note_stage_failure(state: Dict[str, Any], stage: str) -> None:
@@ -4242,7 +5218,7 @@ def finish_stage(
     @param state   state.json, where the verdict and the plan scale land
     @param run     what the stage actually did
     @param before  ``git status`` from before a readonly stage, or None
-    @flow  safety violations -> plan (readonly proof, save)
+    @flow  safety violations -> plan (readonly proof, save, work order check)
            -> test (verdict, spec check, temp-file check -> _fallback_failure)
     """
     # Recorded before any verdict, so a failing stage still reports what it did.
@@ -4267,6 +5243,14 @@ def finish_stage(
         say("plan saved: {0}".format(rec.plan_path))
         state["plan_scale"] = _measure_plan(cfg, run.text)
         say_lines(plan_scale_note(state["plan_scale"]))
+        if work_order_required(state):
+            # Before the plan may be committed, and therefore before the
+            # approval gate: a plan nobody could act on unambiguously never
+            # reaches a human's screen at all.
+            items, reasons = read_work_order(cfg, run.text)
+            if reasons:
+                return work_order_refusal(reasons)
+            say("work order: {0} row(s) declared".format(len(items)))
 
     if run.stage == "test":
         verdict = parse_test_verdict(run.text)
@@ -4436,8 +5420,9 @@ def run_pipeline(
     @param rec          the slice record - state.json's single writer is this loop
     @param state        state.json, updated in place
     @param requirement  the requirement body every stage is given
-    @flow  per stage: dirty check -> setup? -> run (or verify engine)
-           -> close the stage's progress and observation notes -> commit -> gate
+    @flow  plan seal gate (before the amend filter) -> per stage: dirty check
+           -> setup? -> run (or verify engine) -> close the stage's progress and
+           observation notes -> scope check -> commit -> gate -> seal the plan
     주요 내부 변수: gates(켜진 승인 게이트), amend(열려 있는 amend 사이클)
     """
     # The last safety pin for the empty-requirement guard: every entry point
@@ -4453,6 +5438,12 @@ def run_pipeline(
     state.pop("reason", None)
     resume_quota_wait(cfg, rec, state)
     restore_extensions(cfg, state)
+    # Ahead of the amend filter on purpose: an amend never revisits plan, so a
+    # plan.md edited underneath one could otherwise never be re-approved and the
+    # cycle could never finish. Settled here, the same amend simply carries on.
+    code = handle_plan_gate(cfg, rec, state)
+    if code is not None:
+        return code
     gates = {str(name) for name in (state.get("gates") or ())}
     # Inside an amend only that cycle's stages run, so plan is history and its
     # gate is never re-read - which is also what lets a rejected slice be amended.
@@ -4485,10 +5476,18 @@ def run_pipeline(
             before = repo_changes(cfg.cwd, include_slice_files=True) if readonly else None
             if not readonly:
                 state["mutated"] = True
+                # The last look before anything may write: a plan.md that moved
+                # since the approval stops the slice here rather than after it.
+                reason = ensure_plan_sealed(cfg, rec, state)
+                if reason is not None:
+                    return fail_slice(rec, state, reason)
             if stage == "implement":
                 reason = run_setup(cfg, rec, state)
                 if reason is not None:
                     return fail_slice(rec, state, reason)
+            # What the stage said, which is where a reason table is read from.
+            # The engine's own verification says nothing and declares nothing.
+            said = ""
             if stage == "test" and cfg.engine_verifies():
                 # No session at all on the pass path: the engine runs the declared
                 # commands itself, and only spends money when something failed.
@@ -4526,6 +5525,7 @@ def run_pipeline(
                         ),
                     )
                 entry.update({"status": "done", "run_id": run.run_id})
+                said = run.text
                 reason = finish_stage(cfg, rec, state, run, before)
                 if reason is not None:
                     entry["status"] = "failed"
@@ -4546,6 +5546,14 @@ def run_pipeline(
                 # The new plan is written: the rejected one is history now.
                 state.pop("replan_open", None)
             label = AMEND_LABEL.format(amend["n"], stage) if amend is not None else None
+            if stage != "plan":
+                # The last thing before the commit, over the final diff: a new
+                # file nobody declared never reaches the branch at all.
+                reason = scope_check(cfg, rec, state, stage, label or stage, said)
+                if reason is not None:
+                    entry["status"] = "failed"
+                    note_stage_failure(state, stage)
+                    return fail_slice(rec, state, reason)
             reason = commit_stage(cfg, rec, state, stage, label=label)
             if reason is not None:
                 # The stage itself succeeded and stays done; what failed is the
@@ -4556,7 +5564,7 @@ def run_pipeline(
         # Stage-independent: the same question after every stage, and the front
         # matter only decided which gates are on.
         if stage in gates:
-            note = plan_scale_note(state.get("plan_scale")) if stage == "plan" else ""
+            note = _gate_note(rec, state, stage)
             decision = await_approval(cfg, rec, state, stage, note=note)
             if decision.verdict == REJECTED:
                 state["reason"] = "rejected at '{0}': {1}".format(
@@ -4567,6 +5575,14 @@ def run_pipeline(
                 return EXIT_REJECTED
             if decision.verdict != APPROVED:
                 return fail_slice(rec, state, "timed out waiting for approval of '{0}'".format(stage))
+        if stage == "plan" and plan_seal_status(rec, state) not in ("ok", "legacy"):
+            # Sealed the instant the plan is settled - after the gate, because
+            # the gate is where a human may still edit it, and whether or not
+            # there was a gate, because 'approval: none' seals itself.
+            reason = seal_plan(cfg, rec, state)
+            if reason is not None:
+                stage_entry(state, "plan")["status"] = "failed"
+                return fail_slice(rec, state, reason)
 
     if amend is not None:
         close_amend(state)
@@ -4638,7 +5654,9 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
     file was showing up there.
 
     v0.7 adds one more line under it, on the same rule: what the engine did on
-    its own, and silence when it did nothing.
+    its own, and silence when it did nothing. v0.8 adds the 작업 지시서 line the
+    same way: how much was declared, how much fell outside it, and every
+    unplanned path with the reason its stage gave for it.
 
     @param state  state.json, which names the stages and what they decided
     @param runs   the stored runs, where the tokens and the cost come from
@@ -4720,6 +5738,7 @@ def render_summary(state: Dict[str, Any], runs: Sequence[Dict[str, Any]]) -> str
         lines.extend(_verify_lines(state, note.get(verdict, ""), verdict))
     lines.extend(_briefing_lines(state, runs))
     lines.extend(_recovery_lines(state))
+    lines.extend(_scope_lines(state))
     amends = [entry for entry in (state.get("amends") or []) if isinstance(entry, dict)]
     if amends:
         said = str(amends[-1].get("instruction") or "").strip().splitlines()
@@ -4802,6 +5821,39 @@ def _recovery_lines(state: Dict[str, Any]) -> List[str]:
     stopped = record.get("stopped")
     if isinstance(stopped, dict):
         lines.append("Stopped   {0}  ({1})".format(stopped.get("detail", "?"), stopped.get("pin", "?")))
+    return lines
+
+
+def _scope_lines(state: Dict[str, Any]) -> List[str]:
+    """What the work order declared, what fell outside it, and how often it was checked.
+
+    Silent for a slice that has none, so every summary printed before this
+    existed prints exactly as it did.
+
+    @param state  state.json, whose scope_checks are the audit trail
+    @flow  nothing declared and nothing checked -> [] ; the counts -> one line
+           ; the last refusal -> a second
+    주요 내부 변수: checks(감사 이력), unplanned(현재 범위 밖 수정)
+    """
+    checks = [entry for entry in (state.get("scope_checks") or []) if isinstance(entry, dict)]
+    order = effective_order(state)
+    if not checks and not order:
+        return []
+    unplanned = [u for u in (state.get("unplanned_modified") or []) if isinstance(u, dict)]
+    lines = [
+        "Scope     order {0}   unplanned {1}   scope checks {2}".format(
+            len(order), len(unplanned), len(checks)
+        )
+    ]
+    failed = [entry for entry in checks if not entry.get("ok")]
+    if failed:
+        lines.append("Scope     {0}".format(_clip(str(failed[-1].get("reason") or ""), 58)))
+    for entry in unplanned[:5]:
+        lines.append(
+            "Unplanned {0}  ({1})".format(
+                entry.get("path", "?"), _clip(str(entry.get("reason") or ""), 40)
+            )
+        )
     return lines
 
 
@@ -5597,8 +6649,9 @@ def launch_slice(
     @param source            the file the text was read from, when there was one,
                              so a later resume can re-read its front matter
     @flow  guard + validate every front matter key (recovery switches included)
-           -> slice record -> workspace -> run_pipeline
-    주요 내부 변수: plan(worktree 계획, --no-worktree면 None), ws(만들어진 작업 공간)
+           -> slice record -> no worktree? refuse (v0.8) -> mark the slice as one
+           the work order rules apply to -> workspace -> run_pipeline
+    주요 내부 변수: plan(worktree 계획), ws(만들어진 작업 공간)
     """
     body = guard_requirement(text, name)
     fields, _ = parse_front_matter(text)
@@ -5624,10 +6677,19 @@ def launch_slice(
     plan = _plan_workspace(args, repo, slice_id, base=base, start=start) if isolate else None
 
     if plan is None:
-        say("warning: --no-worktree - the AI will edit {0} directly".format(repo))
-        ensure_clean_repo(repo)
-    else:
-        _refuse_blocked_workspace(repo, plan)
+        # v0.8: isolation stopped being a preference. The after-the-fact scope
+        # check is defined over "changes git observes inside the worktree", and
+        # without a worktree there is no such thing to observe - so there is no
+        # honest way to run a work order slice here. Only a legacy slice's
+        # --resume-slice still runs without one.
+        raise PipelineError(
+            "--no-worktree는 새 slice에서 더 쓸 수 없다.\n"
+            "    작업 지시서 사후 대조의 보증 범위는 worktree 안에서 Git이 관찰하는 "
+            "변경이고,\n"
+            "    격리가 없으면 그 기준 자체가 없다.\n"
+            "    이미 승인되어 돌아가던 legacy slice의 --resume-slice 에만 남아 있다."
+        )
+    _refuse_blocked_workspace(repo, plan)
     # Inside a queue the advice is wrong: the unfinished slices are the queue's own.
     if unfinished and not quiet_unfinished:
         say("note: unfinished slice(s) here: {0}".format(", ".join(unfinished)))
@@ -5636,6 +6698,10 @@ def launch_slice(
     rec.ensure()
     write_text_atomic(rec.requirement_path, text)
     state = new_state(slice_id, repo, gates, epic=epic)
+    # v0.8, and optional like every key added after schema 2: this slice's plan
+    # must carry a 작업 지시서, and every stage that writes is compared with it.
+    # A record without the key is a v0.2/v0.3 slice and is left exactly alone.
+    state["work_order_required"] = True
     if source is not None:
         # Optional, like every key added after schema 2: an epic's slice has no
         # file of its own, and a reader that has never seen this key is only older.
@@ -5665,16 +6731,31 @@ def _plan_workspace(
     base: Optional[str] = None,
     start: Optional[str] = None,
 ) -> workspace.WorkspacePlan:
-    """Work out where this workspace would live, refusing a repo that cannot host one."""
+    """Work out where this workspace would live, refusing a repo that cannot host one.
+
+    Since v0.8 the refusals no longer offer ``--no-worktree`` as the way out:
+    the work order's after-the-fact check is defined over what git observes
+    inside a worktree, so a new slice without one has no such check at all.
+
+    @param args    the parsed arguments, for --base and --worktree-root
+    @param repo    the user's repository
+    @param name    the slice id, which is also the worktree's directory name
+    @param branch  the branch to cut, defaulting to ``slice/<name>``
+    @param base    the branch it merges back into
+    @param start   an explicit commit to fork at, for a queued slice
+    @flow  no git -> refuse ; not a repo -> refuse ; plan_workspace -> GitError -> refuse
+    """
     if not workspace.git_available():
         raise PipelineError(
             "git is not on PATH, so no worktree can be created.\n"
-            "    Install git, or pass --no-worktree to run in {0} itself.".format(repo)
+            "    Install git: since v0.8 every new slice is isolated, because the work "
+            "order's after-the-fact check is defined over what git observes."
         )
     if not workspace.is_git_repo(repo):
         raise PipelineError(
             "{0} is not a git repository, so no worktree can be created.\n"
-            "    Run 'git init' there, or pass --no-worktree to run in it directly.".format(repo)
+            "    Run 'git init' there. Since v0.8 there is no un-isolated way in: the "
+            "work order's after-the-fact check needs a worktree git can measure.".format(repo)
         )
     try:
         return workspace.plan_workspace(
@@ -5796,6 +6877,27 @@ def resume_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
             ))
         return EXIT_DONE
     return continue_slice(args, repo, data_dir, rec)
+
+
+def refuse_unisolated(rec: SliceRecord, state: Dict[str, Any]) -> None:
+    """A work order slice with no worktree cannot be continued, and says why.
+
+    This is the hole ``--no-worktree`` would otherwise leave open from the other
+    end: refusing it at launch is worthless if a record can simply be resumed
+    without one. Only a legacy slice - which was never promised this check -
+    goes on without a worktree.
+
+    @param rec    the slice being continued or amended
+    @param state  state.json, which says whether this slice declared a work order
+    """
+    if not work_order_required(state):
+        return
+    raise PipelineError(
+        "slice {0}은 작업 지시서 slice인데 worktree 기록이 없다.\n"
+        "    사후 대조의 보증 범위는 worktree 안에서 Git이 관찰하는 변경이라, "
+        "격리 없이는 검사 자체가 성립하지 않는다.\n"
+        "    이 상태로는 진행하지 않는다.".format(rec.slice_id)
+    )
 
 
 def _broken_workspace_error(
@@ -5937,8 +7039,9 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
     @param data_dir  where runs are stored
     @param rec       the slice to continue, already located
     @flow  refuse finished states -> re-read the source's front matter
-           -> re-guard the requirement -> verify workspace
-           (a broken one is refused by ``_broken_workspace_error``) -> _finish
+           -> re-guard the requirement -> no worktree? legacy only (v0.8)
+           -> verify workspace (a broken one is refused by
+           ``_broken_workspace_error``) -> _finish
     """
     state = rec.read_state()
     if state is None:
@@ -5968,6 +7071,7 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
     ws = workspace.Workspace.from_dict(state.get("workspace"))
 
     if ws is None:
+        refuse_unisolated(rec, state)
         # A slice started before v0.3 has no workspace key, and re-creating one
         # now would put its remaining stages somewhere its earlier ones never were.
         say("note: this slice has no workspace - continuing in {0} (v0.2 behaviour)".format(repo))
@@ -6007,8 +7111,10 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
     @param data_dir   where runs are stored
     @param repo_given whether --repo was named, for the "no slices here" hint
     @flow  instruction -> find slice -> re-read the source's front matter
-           -> re-guard the requirement -> verify workspace
-           (a broken one is refused by ``_broken_workspace_error``) -> open the cycle -> _finish
+           -> re-guard the requirement -> no worktree? legacy only (v0.8)
+           -> verify workspace (a broken one is refused by
+           ``_broken_workspace_error``) -> read any 작업 지시서 the instruction
+           carries -> open the cycle -> _finish
     """
     instruction = (getattr(args, "instruction", None) or "").strip()
     if not instruction:
@@ -6034,6 +7140,7 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
     setup_command = resolve_setup(fields)
     ws = workspace.Workspace.from_dict(state.get("workspace"))
     if ws is None:
+        refuse_unisolated(rec, state)
         # Same as a resume: a slice from before v0.3 is amended where its earlier
         # stages actually ran, not in a worktree invented after the fact.
         say("note: this slice has no workspace - amending in {0} (v0.2 behaviour)".format(repo))
@@ -6050,10 +7157,19 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
             )
         )
     number = len([e for e in (state.get("amends") or []) if isinstance(e, dict)]) + 1
+    cfg = _config(args, repo, data_dir, ws, setup_command, fields)
+    # Refused before the cycle is opened, so a table nobody could act on costs
+    # no stage at all. An instruction with no table widens nothing.
+    amend_order = read_amend_order(cfg, state, instruction)
 
     if args.dry_run:
         print("slice     {0}  ({1})".format(rec.slice_id, status or "?"))
         print("amend     #{0}".format(number))
+        print("order     {0}".format(
+            "{0} row(s) added to the scope".format(len(amend_order["items"]))
+            if amend_order
+            else "(none: the amend stays inside the approved scope)"
+        ))
         print("work      {0}".format(ws.path if ws else "{0} (no worktree)".format(repo)))
         print("stages    {0}   (plan is not re-run: the instruction is the plan)".format(
             " -> ".join(stages)
@@ -6064,8 +7180,12 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
         print("says      {0}".format(instruction))
         return EXIT_DONE
 
-    entry = open_amend(rec, state, instruction, stages)
+    entry = open_amend(rec, state, instruction, stages, work_order=amend_order)
     say("amend #{0} of slice {1} (was {2})".format(entry["n"], rec.slice_id, status or "?"))
+    if amend_order:
+        say("  order  +{0} row(s) - the plan's own 지시서 is left as it is".format(
+            len(amend_order["items"])
+        ))
     say("  {0}".format(_clip(instruction.splitlines()[0], 70)))
     say("  stages {0} (plan is history: the instruction is this cycle's plan)".format(
         ", ".join(stages)
@@ -6083,7 +7203,7 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
         say("note: this slice is part of epic {0}; later slices were branched from its "
             "earlier tip and do not contain this amend".format(epic["epic_id"]))
     state.setdefault("quota", {"waiting": False, "resume_at": None, "retries": 0})
-    return _finish(_config(args, repo, data_dir, ws, setup_command, fields), rec, state, body)
+    return _finish(cfg, rec, state, body)
 
 
 # ------------------------------------------------------------------- replan
@@ -6127,7 +7247,8 @@ def reopen_plan(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
 
     @param rec    the slice record whose files are moved
     @param state  state.json, wound back in place
-    @flow  archive plan.md + approvals/plan.md -> stages pending -> record the replan
+    @flow  archive plan.md + approvals/plan.md -> stages pending -> drop the seal
+           -> record the replan
     주요 내부 변수: number(이번이 몇 번째 재계획인지), record(state에 남기는 기록)
     """
     replans = state.setdefault("replans", [])
@@ -6176,6 +7297,9 @@ def reopen_plan(rec: SliceRecord, state: Dict[str, Any]) -> Dict[str, Any]:
             entry.pop(key, None)
     state.pop("test_verdict", None)
     state.pop("progress", None)
+    # The plan that declared the scope is being replaced, so the seal goes with
+    # it: the next plan has to declare a work order of its own or fail.
+    state.pop(WORK_ORDER_KEY, None)
     return record
 
 
