@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,8 +94,19 @@ def _base_args(repo: Path) -> List[str]:
     return ["-c", "commit.gpgsign=false"] + identity_args(repo)
 
 
-def _spawn(repo: Path, args: Sequence[str], timeout: float = GIT_TIMEOUT_S) -> Any:
-    """Raw git call with no ``-c`` preamble - used by the identity lookup itself."""
+def _spawn(
+    repo: Path,
+    args: Sequence[str],
+    timeout: float = GIT_TIMEOUT_S,
+    env: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Raw git call with no ``-c`` preamble - used by the identity lookup itself.
+
+    @param repo     where git runs
+    @param args     the argv after ``git``
+    @param timeout  seconds before the child is killed
+    @param env      extra environment, merged over this process's own; None keeps it
+    """
     return subprocess.run(
         [_exe()] + [str(a) for a in args],
         cwd=str(repo),
@@ -104,14 +116,28 @@ def _spawn(repo: Path, args: Sequence[str], timeout: float = GIT_TIMEOUT_S) -> A
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env=dict(os.environ, **env) if env else None,
     )
 
 
-def run(repo: Path, args: Sequence[str], check: bool = True, timeout: float = GIT_TIMEOUT_S) -> Any:
-    """Run git in ``repo``. Returns the CompletedProcess; raises on failure if asked."""
+def run(
+    repo: Path,
+    args: Sequence[str],
+    check: bool = True,
+    timeout: float = GIT_TIMEOUT_S,
+    env: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Run git in ``repo``. Returns the CompletedProcess; raises on failure if asked.
+
+    @param repo     where git runs
+    @param args     the argv after ``git``
+    @param check    raise ``GitError`` on a non-zero exit
+    @param timeout  seconds before the child is killed
+    @param env      extra environment, for the calls that need their own index file
+    """
     argv = _base_args(repo) + [str(a) for a in args]
     try:
-        proc = _spawn(repo, argv, timeout=timeout)
+        proc = _spawn(repo, argv, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         raise GitError(args, None, str(exc))
     if check and proc.returncode != 0:
@@ -268,6 +294,157 @@ def porcelain(repo: Path) -> Optional[str]:
     except GitError:
         return None
     return proc.stdout if proc.returncode == 0 else None
+
+
+# -------------------------------------------------- the working tree as a diff
+#
+# The after-the-fact scope check needs one thing git has no single command for:
+# "what does the working tree look like, right now, compared with the commit
+# this slice started from" - including files nobody staged and files nobody
+# committed. ``diff base..HEAD`` answers about commits and ``status`` answers
+# about HEAD, and overlaying one on the other is where a revert stops being
+# visible. So a *temporary index* is filled with the real tree and diffed
+# against the base. The repository's own index is never touched.
+
+# Only these mean anything here. R and C cannot appear (--no-renames), and a
+# letter this version does not know is an exception rather than a guess.
+SNAPSHOT_STATUSES: Tuple[str, ...] = ("A", "M", "D", "T")
+
+
+@dataclass
+class TreeSnapshot:
+    """The working tree measured against a commit, and what is in it right now."""
+
+    #: path -> one of A / M / D / T, against the base commit.
+    status: Dict[str, str] = field(default_factory=dict)
+    #: path -> (mode, blob), for everything the tree currently holds.
+    entries: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+
+
+def _parse_name_status(raw: str) -> Dict[str, str]:
+    """Read ``--name-status -z`` output. An unknown status is an error, never a skip.
+
+    @param raw  git's stdout, NUL separated
+    @flow  fields in pairs -> unknown or rename letter -> ValueError -> path to letter
+    주요 내부 변수: fields(NUL로 나뉜 조각들), status(경로 -> 상태 문자)
+    """
+    fields = raw.split("\0")
+    status: Dict[str, str] = {}
+    index = 0
+    while index < len(fields):
+        letter = fields[index].strip()
+        index += 1
+        if not letter:
+            continue
+        if index >= len(fields):
+            raise ValueError("git --name-status ended after {0!r} with no path".format(letter))
+        path = fields[index]
+        index += 1
+        code = letter[0].upper()
+        if code not in SNAPSHOT_STATUSES:
+            raise ValueError("unknown git status {0!r} for {1}".format(letter, path))
+        status[path] = code
+    return status
+
+
+def _parse_ls_files(raw: str) -> Dict[str, Tuple[str, str]]:
+    """Read ``ls-files -s -z`` output into path -> (mode, blob).
+
+    @param raw  git's stdout, NUL separated
+    """
+    entries: Dict[str, Tuple[str, str]] = {}
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or not path:
+            continue
+        entries[path] = (parts[0], parts[1])
+    return entries
+
+
+def snapshot(repo: Path, base: str) -> TreeSnapshot:
+    """What the working tree really is, compared with ``base``. Raises rather than guesses.
+
+    A temporary ``GIT_INDEX_FILE`` is filled from HEAD, brought up to the working
+    tree with ``add -A`` and then diffed against the base, so uncommitted work,
+    untracked files and a file that was put back all read correctly. ``add -A``
+    honours .gitignore, which is why the graph cache and ``__pycache__`` never
+    appear and are not on any exclusion list.
+
+    @param repo  the repository or worktree to measure
+    @param base  the commit to compare against
+    @flow  resolve base (missing -> GitError) -> temp index: read-tree, add -A
+           -> diff --cached --name-status -z --no-renames -> ls-files -s -z
+    주요 내부 변수: directory(임시 index 자리), commit(기준 커밋), env(GIT_INDEX_FILE)
+    """
+    commit = resolve_commit(repo, base)
+    if commit is None:
+        raise GitError(["rev-parse", str(base)], 1, "no such commit: {0}".format(base))
+    start = resolve_commit(repo, "HEAD") or commit
+    directory = tempfile.mkdtemp(prefix="aidev-index-")
+    env = {"GIT_INDEX_FILE": os.path.join(directory, "index")}
+    try:
+        run(repo, ["read-tree", start], env=env)
+        run(repo, ["add", "-A"], env=env)
+        changed = run(
+            repo,
+            ["diff", "--cached", "--name-status", "-z", "--no-renames", commit],
+            env=env,
+        ).stdout
+        listing = run(repo, ["ls-files", "-s", "-z"], env=env).stdout
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    return TreeSnapshot(status=_parse_name_status(changed), entries=_parse_ls_files(listing))
+
+
+def diff_status(repo: Path, base: str) -> Dict[str, str]:
+    """The final diff as path -> status letter. Fail-closed: it raises, it never returns {}.
+
+    The entry point every blocking check goes through, which is exactly why it
+    has no tolerant arm: a git that could not answer must stop a stage, not wave
+    it through with an empty answer.
+
+    @param repo  the repository or worktree to measure
+    @param base  the commit to compare against
+    """
+    return snapshot(repo, base).status
+
+
+def status_entries(repo: Path) -> List[Tuple[str, str]]:
+    """``git status --porcelain=v1 -z -uall`` as ``(code, path)`` pairs.
+
+    ``-z`` because without it a path with a space, a quote or a Korean name
+    comes back quoted and escaped, and every reader would have to unescape it.
+
+    @param repo  the repository or worktree to ask
+    @flow  no git or a failing git -> [] ; fields -> code and path ; a rename
+           carries its source in the next field, which is skipped
+    주요 내부 변수: fields(NUL로 나뉜 조각들), entries(모인 (코드, 경로))
+    """
+    if not git_available():
+        return []
+    try:
+        proc = run(repo, ["status", "--porcelain=v1", "-z", "-uall"], check=False)
+    except GitError:
+        return []
+    if proc.returncode != 0:
+        return []
+    fields = proc.stdout.split("\0")
+    entries: List[Tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        code, path = record[:2], record[3:]
+        if code[:1] in ("R", "C"):
+            index += 1  # the source path rides in its own field
+        if path:
+            entries.append((code, path))
+    return entries
 
 
 def list_files(repo: Path) -> Optional[List[str]]:

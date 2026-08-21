@@ -3511,7 +3511,9 @@ def test_legacy_slice_without_workspace_resumes_in_place(repo, tmp_path, claude_
 
     directory = slice_dir(repo)
     state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
-    for key in ("workspace", "commits", "mutated"):
+    # The v0.8 keys go too: a v0.2 record never had a work order, and that is
+    # exactly what makes it legacy and exempt from the after-the-fact check.
+    for key in ("workspace", "commits", "mutated", "work_order_required", "work_order"):
         state.pop(key, None)
     state["schema"] = 1
     state["stages"]["test"] = {"status": "pending"}
@@ -3554,7 +3556,9 @@ def test_a_legacy_state_without_a_commit_range_skips_the_spec_check(
 
     directory = slice_dir(repo)
     state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
-    for key in ("workspace", "commits", "mutated", "test_verdict"):
+    for key in (
+        "workspace", "commits", "mutated", "test_verdict", "work_order_required", "work_order"
+    ):
         state.pop(key, None)
     state["schema"] = 1
     state["stages"]["test"] = {"status": "pending"}
@@ -3574,20 +3578,34 @@ def test_a_legacy_state_without_a_commit_range_skips_the_spec_check(
     assert len(invocations(log)) == before
 
 
-def test_non_git_repo_is_refused_with_a_way_out(tmp_path, claude_bin, log, capsys):
+def test_a_non_git_repo_is_refused_and_there_is_no_way_round_it(tmp_path, claude_bin, log, capsys):
+    """v0.8: --no-worktree stopped being the escape hatch, and says why."""
     plain = tmp_path / "not-a-repo"
     (plain / "tasks").mkdir(parents=True)
     requirement(plain, front="approval: none")
 
     assert run_slice(plain, tmp_path, claude_bin) == 2
     err = capsys.readouterr().err
-    assert "not a git repository" in err and "--no-worktree" in err
+    assert "not a git repository" in err
+    assert "git init" in err
     assert invocations(log) == []
 
-    assert run_slice(plain, tmp_path, claude_bin, "--no-worktree") == 0
-    assert state_of(plain)["status"] == "done"
-    assert "workspace" not in state_of(plain)
-    assert Path(invocations(log)[0]["cwd"]).resolve() == plain.resolve()
+    # the old way out is now a refusal of its own, and nothing was launched
+    assert run_slice(plain, tmp_path, claude_bin, "--no-worktree") == 2
+    err = capsys.readouterr().err
+    assert "--no-worktree는 새 slice에서 더 쓸 수 없다" in err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(plain).exists()
+
+
+def test_a_new_slice_refuses_no_worktree_even_in_a_real_repo(repo, tmp_path, claude_bin, log, capsys):
+    """Done Criteria: 신규 slice의 --no-worktree -> 거부. The guarantee needs a worktree."""
+    requirement(repo, front="approval: none")
+
+    assert run_slice(repo, tmp_path, claude_bin, "--no-worktree") == 2
+    assert "worktree 안에서 Git이 관찰하는 변경" in capsys.readouterr().err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
 
 
 def test_commit_file_limit_refuses_a_node_modules_explosion(
@@ -3706,7 +3724,11 @@ def test_briefing_off_changes_the_prompt_by_not_one_byte(repo, tmp_path, claude_
 
     prompt = invocations(log)[0]["prompt"]
     assert "BRIEFING" not in prompt
-    assert prompt == pipeline.build_prompt("plan", body)
+    # The A/B is about the briefing and nothing else, so the 작업 지시서 rules
+    # (v0.8) ride along on both sides of the comparison.
+    assert prompt == pipeline.build_prompt(
+        "plan", body, work_order=pipeline.stage_work_order(state_of(repo), "plan")
+    )
     # nothing was built, so nothing was written down either
     assert not (slice_dir(repo) / "briefings").exists()
     assert "briefing" not in state_of(repo)
@@ -3979,3 +4001,735 @@ def test_wait_is_chunked_but_exact(monkeypatch):
     pipeline.sleep_seconds(75)
     assert sum(slept) == 75
     assert max(slept) <= pipeline._WAIT_CHUNK_S
+
+
+# ================================================== 작업 지시서 (v0.8)
+#
+# The plan declares its scope as a fixed-column table, the engine checks that
+# table before the plan may be committed, and checks the real diff against it
+# before any stage that changed a file may be committed. What follows is the
+# Done Criteria of that requirement, one test each.
+
+
+AMBIGUOUS_MODULE = '''
+class Alpha:
+    """Two classes, one bare name - the ambiguity a work order must refuse."""
+
+    def helper(self, seat):
+        """Alpha's own helper.
+
+        @param seat  the seat index
+        """
+        return seat
+
+
+class Beta:
+    """The other one."""
+
+    def helper(self, seat):
+        """Beta's own helper.
+
+        @param seat  the seat index
+        """
+        return seat + 1
+
+
+def only_once(seat):
+    """The one name in this file that means exactly one thing.
+
+    @param seat  the seat index
+    """
+    return seat * 2
+'''.lstrip("\n")
+
+
+def with_module(repo, name="lib.py", body=AMBIGUOUS_MODULE):
+    """Commit a real python module, so the Function DB has something to resolve against."""
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    commit_all(repo, "add {0}".format(name))
+    return name
+
+
+def order_of(repo, slice_id=None):
+    return state_of(repo, slice_id).get("work_order") or {}
+
+
+def plan_text(repo):
+    return (slice_dir(repo) / "plan.md").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------- plan-time checking
+
+
+def test_a_plan_with_a_work_order_passes_and_is_sealed(repo, tmp_path, claude_bin, log):
+    """Done Criteria: 지시서 포함 plan 통과."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert state["work_order_required"] is True
+    assert state["schema"] == pipeline.STATE_SCHEMA  # every new key is optional
+    order = state["work_order"]
+    assert order["sealed"] is True
+    assert order["items"] == [
+        {
+            "verb": "CREATE",
+            "path": "aidev/thing.py",
+            "symbol": "",
+            "note": "the file the fake plan names",
+        }
+    ]
+    assert order["scope_digest"].startswith("sha256:")
+    assert order["document_digest"].startswith("sha256:")
+    assert order["scope_digest"] != order["document_digest"]
+    assert order["graph"] == {"used": False}
+    assert "## 작업 지시서" in plan_text(repo)
+
+    # every stage that could write was compared with it before its commit
+    assert [entry["label"] for entry in state["scope_checks"]] == ["implement", "test"]
+    assert all(entry["ok"] for entry in state["scope_checks"])
+    assert state["unplanned_modified"] == []
+
+    # and the approved table reached the sessions that could act on it
+    implement = invocations(log)[1]["prompt"]
+    assert "| CREATE | aidev/thing.py |" in implement
+    assert "지시서에 없는 파일 수정 금지, 부득이한 수정은 사유 표로 선언." in implement
+    # while plan was told the format instead
+    assert "## 작업 지시서" in invocations(log)[0]["prompt"]
+    assert "symbol을 비우고 파일 단위 MODIFY로 선언" in invocations(log)[0]["prompt"]
+
+
+def test_a_plan_without_a_work_order_fails(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Done Criteria: 지시서 없는 새 plan -> FAIL, before the gate ever opens."""
+    requirement(repo, front="approval: plan")
+    monkeypatch.setenv("AIDEV_FAKE_NO_WORK_ORDER", "1")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: pytest.fail("the gate was opened"))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert "'## 작업 지시서' 절이 없다" in state["reason"]
+    assert "| 동사 | 대상 경로 | symbol | 책임 |" in state["reason"]
+    assert state["stages"]["plan"]["status"] == "failed"
+    # nothing was committed, so the branch never carried a plan nobody could act on
+    assert set(state["commits"]) == {"requirement"}
+    assert "work_order" not in state
+
+
+def test_a_modify_target_that_does_not_exist_fails_the_plan(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 미존재 MODIFY 대상 -> plan FAIL."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|aidev/never_written.py")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert "MODIFY 대상이 없다: aidev/never_written.py" in state["reason"]
+    assert state["stages"]["plan"]["status"] == "failed"
+
+
+def test_a_create_target_that_already_exists_fails_the_plan(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_ORDER", "| CREATE | README.md |  | 이미 있다 |")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    reason = state_of(repo)["reason"]
+    assert "CREATE 대상이 이미 있다" in reason and "README.md" in reason
+    assert "고치는 것이라면 MODIFY다" in reason  # the refusal names the way out
+
+
+@pytest.mark.parametrize(
+    "rows, expected",
+    [
+        ("| MODIFY | ../outside.py |  | 나간다 |", "'.'와 '..'는 쓸 수 없다"),
+        ("| MODIFY | /etc/passwd |  | 절대경로 |", "절대경로는 쓸 수 없다"),
+        ("| MODIFY | C:/Windows/x.py |  | 드라이브 |", "콜론은 쓸 수 없다"),
+        ("| MODIFY | a\\b.py |  | 역슬래시 |", "역슬래시는 쓰지 않는다"),
+        ("| MODIFY | CON.py |  | 예약어 |", "Windows 예약 장치명"),
+        ("| CREATE | a.py |  | 만든다 |\n| MODIFY | a.py |  | 고친다 |", "서로 다른 동사"),
+        ("| MODIFY | README.md |  | 하나 |\n| MODIFY | README.md |  | 둘 |", "두 번 있다"),
+        ("| MODIFY | README.md |  | 파일 |\n| MODIFY | README.md | x | 함수 |", "함께 있다"),
+    ],
+)
+def test_a_path_escape_or_a_verb_conflict_fails_the_plan(
+    repo, tmp_path, claude_bin, log, monkeypatch, rows, expected
+):
+    """Done Criteria: 경로 탈출·동사 충돌 -> FAIL, one refusal per shape."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_ORDER", rows)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert expected in state["reason"]
+    assert state["stages"]["plan"]["status"] == "failed"
+    assert "work_order" not in state
+
+
+def test_a_symbol_nobody_can_resolve_fails_the_plan(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Done Criteria: symbol 해석 0개 -> plan FAIL, with the way out named."""
+    name = with_module(repo)
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|{0}|no_such_function".format(name))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    reason = state_of(repo)["reason"]
+    assert "symbol 'no_such_function'을 lib.py 안에서 찾을 수 없다" in reason
+    assert "symbol을 비우고 파일 단위 MODIFY로 선언하라" in reason
+
+
+def test_two_functions_with_the_same_bare_name_are_ambiguous(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 같은 파일 내 동명 bare name 2개 -> ambiguous FAIL."""
+    name = with_module(repo)
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|{0}|helper".format(name))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    reason = state_of(repo)["reason"]
+    assert "symbol 'helper'이 lib.py 안에서 2개로 해석된다" in reason
+    assert "Alpha.helper" in reason and "Beta.helper" in reason
+
+
+def test_a_symbol_that_means_one_thing_passes_and_is_recorded(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    name = with_module(repo)
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|{0}|only_once".format(name))
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    order = order_of(repo)
+    assert order["graph"] == {"used": True}
+    assert {"verb": "MODIFY", "path": "lib.py", "symbol": "only_once", "note": "an extra row"} in (
+        order["items"]
+    )
+
+
+def test_a_symbol_row_refuses_no_graph(repo, tmp_path, claude_bin, log, monkeypatch):
+    """--no-graph is allowed for a file-level order and refused for a symbol one."""
+    name = with_module(repo)
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+
+    # file-level: no graph is needed, so --no-graph is honoured
+    assert run_slice(repo, tmp_path, claude_bin, "--no-graph") == 0
+
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|{0}|only_once".format(name))
+    assert run_slice(repo, tmp_path, claude_bin, "--no-graph") == 1
+    assert "--no-graph" in state_of(repo)["reason"]
+
+
+# --------------------------------------------------------- the final diff
+
+
+def test_a_file_outside_the_order_fails_before_the_commit(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 지시서 밖 신규 파일 -> FAIL, and nothing is committed."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_WRITE", "evil.py")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert state["status"] == "failed"
+    assert "지시서의 CREATE에 없는 새 파일" in state["reason"]
+    assert "evil.py" in state["reason"]
+    assert state["stages"]["implement"]["status"] == "failed"
+    # the stage is not on the branch: the refusal happens before the commit
+    assert set(state["commits"]) == {"requirement", "plan"}
+    assert state["scope_checks"][-1]["added"] == ["evil.py"]
+    # and the work itself is still in the worktree for a human to look at
+    assert (worktree(repo, tmp_path) / "evil.py").exists()
+
+
+def test_a_new_file_under_aidev_history_is_still_a_new_file(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """The exclusion list names files, not directories - so this has nowhere to hide."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_WRITE", ".aidev/history/{slice}/evil.py")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert "지시서의 CREATE에 없는 새 파일" in state["reason"]
+    assert ".aidev/history/{0}/evil.py".format(state["slice_id"]) in state["reason"]
+    # while the engine's own mirror files under that very directory passed
+    assert set(state["commits"]) == {"requirement", "plan"}
+
+
+def test_an_undeclared_deletion_fails(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Done Criteria: MODIFY에 없는 파일 삭제 -> 즉시 FAIL."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_DELETE", "README.md")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert "MODIFY에 없는 삭제" in state["reason"]
+    assert "README.md" in state["reason"]
+    assert state["scope_checks"][-1]["deleted"] == ["README.md"]
+
+
+def test_a_declared_deletion_is_allowed(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Declaring the path as MODIFY is what buys the right to remove it."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_DELETE", "README.md")
+    monkeypatch.setenv("AIDEV_FAKE_ORDER_EXTRA", "MODIFY|README.md")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    assert not (worktree(repo, tmp_path) / "README.md").exists()
+
+
+def test_the_agent_test_stage_is_scope_checked(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Done Criteria: agent test가 범위 밖 파일을 만들면 FAIL."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_ORDER", "| CREATE | aidev/thing.py |  | 계획한 파일 |")
+    monkeypatch.setenv("AIDEV_FAKE_TEST_WRITE", "stray.txt")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    state = state_of(repo)
+    assert state["stages"]["implement"]["status"] == "done"
+    assert state["stages"]["test"]["status"] == "failed"
+    assert "stray.txt" in state["reason"]
+    assert set(state["commits"]) == {"requirement", "plan", "implement"}
+
+
+def test_a_scope_failure_reruns_the_same_stage_on_resume(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: scope FAIL 후 resume -> 같은 stage 재실행·재검증."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_WRITE", "evil.py")
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+    slice_id = state_of(repo)["slice_id"]
+    before = len(invocations(log))
+    assert len(state_of(repo)["scope_checks"]) == 1
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 1
+    state = state_of(repo, slice_id)
+    # the same stage ran again, and was checked again
+    assert [c["prompt"].splitlines()[0].split()[3] for c in invocations(log)[before:]] == [
+        "IMPLEMENT"
+    ]
+    assert len(state["scope_checks"]) == 2
+    assert [check["ok"] for check in state["scope_checks"]] == [False, False]
+    assert set(state["commits"]) == {"requirement", "plan"}
+
+
+# ------------------------------------------------------------ the reason table
+
+
+def unplanned_run(repo, tmp_path, claude_bin, monkeypatch, reasons=None):
+    """A slice whose implement edits README.md without the order declaring it."""
+    requirement(repo, front="approval: none")
+    git_repo(repo)
+    monkeypatch.setenv("AIDEV_FAKE_EDIT", "README.md")
+    monkeypatch.setenv("AIDEV_FAKE_UNDECLARED_EDIT", "1")
+    if reasons is not None:
+        monkeypatch.setenv("AIDEV_FAKE_REASONS", reasons)
+    return run_slice(repo, tmp_path, claude_bin)
+
+
+def test_an_unplanned_edit_passes_when_the_reason_table_matches(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: unplanned 수정 + 사유 표 일치 -> 통과."""
+    assert unplanned_run(
+        repo, tmp_path, claude_bin, monkeypatch, "README.md|문서가 사실과 달라졌다"
+    ) == 0
+
+    state = state_of(repo)
+    assert state["status"] == "done"
+    assert [entry["path"] for entry in state["unplanned_modified"]] == ["README.md"]
+    assert state["unplanned_modified"][0]["reason"] == "문서가 사실과 달라졌다"
+    assert state["scope_checks"][0]["unplanned"] == ["README.md"]
+    assert state["scope_checks"][0]["declared_reasons"] == ["README.md"]
+
+
+def test_a_declared_reason_never_becomes_part_of_the_order(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """사유 선언은 지시서를 확장하지 않는다 - 끝까지 unplanned로 남는다."""
+    assert unplanned_run(repo, tmp_path, claude_bin, monkeypatch, "README.md|사실과 달라졌다") == 0
+
+    state = state_of(repo)
+    assert [item["path"] for item in state["work_order"]["items"]] == ["aidev/thing.py"]
+    assert [entry["path"] for entry in state["unplanned_modified"]] == ["README.md"]
+    # and it is shown, not buried: the summary says so on its own line
+    assert pipeline._scope_lines(state)[0].startswith("Scope     order 1   unplanned 1")
+
+
+@pytest.mark.parametrize(
+    "reasons, expected",
+    [
+        (None, "사유가 없다"),
+        ("README.md|하나;tasks/doctor.md|둘", "범위 밖 수정이 아닌 경로"),
+        ("README.md|하나;README.md|둘", "같은 경로가 두 번"),
+        ("empty", "데이터 행이 하나도 없다"),
+    ],
+)
+def test_a_reason_table_that_does_not_match_fails(
+    repo, tmp_path, claude_bin, log, monkeypatch, reasons, expected
+):
+    """Done Criteria: 불일치·누락·여분 -> FAIL."""
+    assert unplanned_run(repo, tmp_path, claude_bin, monkeypatch, reasons) == 1
+    state = state_of(repo)
+    assert expected in state["reason"]
+    assert state["stages"]["implement"]["status"] == "failed"
+    assert set(state["commits"]) == {"requirement", "plan"}
+
+
+def test_two_reason_sections_fail(repo, tmp_path, claude_bin, log, monkeypatch):
+    """인식 가능한 사유 절이 2개 이상이면 FAIL."""
+    monkeypatch.setenv(
+        "AIDEV_FAKE_TEXT",
+        "끝났다.\n\n## 범위 밖 수정 사유\n\n| 경로 | 사유 |\n| --- | --- |\n| README.md | 하나 |\n",
+    )
+    assert unplanned_run(repo, tmp_path, claude_bin, monkeypatch, "README.md|둘") == 1
+    assert "절이 2개" in state_of(repo)["reason"]
+
+
+def test_a_reason_heading_inside_a_fence_is_not_a_section(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """fenced code block 안의 제목은 절로 인식하지 않는다."""
+    monkeypatch.setenv("AIDEV_FAKE_TEXT", "형식은 이렇다:\n\n```\n## 범위 밖 수정 사유\n```\n")
+    assert unplanned_run(repo, tmp_path, claude_bin, monkeypatch, "README.md|사실과 달라졌다") == 0
+    assert [e["path"] for e in state_of(repo)["unplanned_modified"]] == ["README.md"]
+
+
+def test_reverting_an_unplanned_file_drops_it_but_keeps_the_audit(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: unplanned 파일 원복 -> 현재 목록에서 제거 + 감사 이력 유지."""
+    assert unplanned_run(repo, tmp_path, claude_bin, monkeypatch, "README.md|사실과 달라졌다") == 0
+    slice_id = state_of(repo)["slice_id"]
+    checks_before = len(state_of(repo)["scope_checks"])
+
+    # the amend puts the file back exactly as git already had it
+    monkeypatch.delenv("AIDEV_FAKE_EDIT")
+    monkeypatch.delenv("AIDEV_FAKE_REASONS")
+    monkeypatch.setenv("AIDEV_FAKE_UNEDIT", "README.md")
+    assert amend(repo, tmp_path, claude_bin, slice_id, "README를 되돌려라") == 0
+
+    state = state_of(repo, slice_id)
+    assert state["unplanned_modified"] == []          # recomputed, not accumulated
+    assert len(state["scope_checks"]) > checks_before  # append-only history
+    assert any(check["unplanned"] == ["README.md"] for check in state["scope_checks"])
+    text = (worktree(repo, tmp_path, slice_id) / "README.md").read_text(encoding="utf-8")
+    assert text == "jokertest\n"
+
+
+# ------------------------------------------------------------------ the seal
+
+
+def gated_slice(repo, tmp_path, claude_bin, monkeypatch):
+    """Run a slice through a real plan gate, answering it from the sleep hook."""
+    requirement(repo, front="approval: plan")
+    git_repo(repo)
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            "approved\n", encoding="utf-8"
+        ),
+    )
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    return state_of(repo)["slice_id"]
+
+
+def test_the_gate_shows_the_work_order_and_seals_what_was_approved(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """승인 직후 plan.md를 재파싱·재검증하고 digest를 저장한다."""
+    seen = {}
+    requirement(repo, front="approval: plan")
+    git_repo(repo)
+
+    def approve(_seconds):
+        path = slice_dir(repo) / "approvals" / "plan.md"
+        seen["template"] = path.read_text(encoding="utf-8")
+        # a human editing plan.md at the gate is exactly what the seal answers to
+        plan = slice_dir(repo) / "plan.md"
+        plan.write_text(plan.read_text(encoding="utf-8") + "\n한 줄 덧붙였다.\n", encoding="utf-8")
+        path.write_text("approved\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_sleep", approve)
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+
+    assert "# | CREATE | aidev/thing.py |" in seen["template"]
+    assert order_of(repo)["document_digest"] == pipeline.workorder.document_digest(
+        (slice_dir(repo) / "plan.md").read_bytes()
+    )
+    assert "한 줄 덧붙였다" in plan_text(repo)
+
+
+def test_approval_none_reseals_itself_without_a_gate(repo, tmp_path, claude_bin, log, monkeypatch):
+    """approval: none - digest 불일치는 게이트가 아니라 재검증·자동 재봉인이다."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    was = order_of(repo, slice_id)["document_digest"]
+
+    plan = slice_dir(repo) / "plan.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n산문 한 줄.\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: pytest.fail("a gate was opened"))
+
+    assert amend(repo, tmp_path, claude_bin, slice_id, "한 번 더") == 0
+    order = order_of(repo, slice_id)
+    assert order["document_digest"] != was
+    assert order["sealed"] is True
+    # the scope itself did not move, so the scope digest is the one it was
+    assert order["scope_digest"] == pipeline.workorder.items_digest(
+        pipeline.workorder.items_from_dicts(order["items"])
+    )
+    assert "plan_reapprovals" not in state_of(repo, slice_id)
+
+
+def test_editing_the_plan_pauses_an_amend_until_it_is_approved_again(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """Done Criteria: plan 수정 -> amend 중단 -> 재승인 -> 같은 amend 재개 (데드락 없음)."""
+    slice_id = gated_slice(repo, tmp_path, claude_bin, monkeypatch)
+    before = len(invocations(log))
+
+    plan = slice_dir(repo) / "plan.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n사람이 고쳤다.\n", encoding="utf-8")
+
+    answered = {"n": 0}
+
+    def approve_again(_seconds):
+        answered["n"] += 1
+        (slice_dir(repo) / "approvals" / "plan.md").write_text("approved\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "_sleep", approve_again)
+    assert amend(repo, tmp_path, claude_bin, slice_id, "그리고 이것도 고쳐라") == 0
+
+    state = state_of(repo, slice_id)
+    assert answered["n"] >= 1                       # the gate really was re-opened
+    assert state["plan_reapprovals"][0]["n"] == 1
+    kept = slice_dir(repo) / state["plan_reapprovals"][0]["kept"]
+    assert kept.read_text(encoding="utf-8").strip() == "approved"
+    # the same amend carried straight on afterwards: implement and test both ran
+    stages = [c["prompt"].splitlines()[0].split()[3] for c in invocations(log)[before:]]
+    assert stages == ["IMPLEMENT", "TEST"]
+    assert state["status"] == "done"
+    assert state["amend_open"] is False
+    assert {"amend1/implement", "amend1/test"} <= set(state["commits"])
+    assert "재승인 없이는 진행하지 않는다" in capsys.readouterr().out
+
+
+def test_an_empty_digest_is_not_a_way_past_the_seal(repo, tmp_path, claude_bin, log, monkeypatch):
+    """digest 빈 값이 미봉인 우회로가 되지 않게 한다."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    directory = slice_dir(repo)
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    state["work_order"]["document_digest"] = ""
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    record = pipeline.SliceRecord(pipeline.slices_root(repo), slice_id)
+    assert pipeline.plan_seal_status(record, record.read_state()) == "unsealed"
+
+    # approval: none re-seals rather than stopping, and what it re-seals is real
+    assert amend(repo, tmp_path, claude_bin, slice_id, "한 번 더") == 0
+    assert order_of(repo, slice_id)["document_digest"].startswith("sha256:")
+
+
+def test_a_stale_plan_stops_a_gated_amend_before_anything_writes(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    slice_id = gated_slice(repo, tmp_path, claude_bin, monkeypatch)
+    plan = slice_dir(repo) / "plan.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n사람이 고쳤다.\n", encoding="utf-8")
+    before = len(invocations(log))
+
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            "rejected: 이건 아니다\n", encoding="utf-8"
+        ),
+    )
+    assert amend(repo, tmp_path, claude_bin, slice_id, "고쳐라") == 3
+    assert state_of(repo, slice_id)["status"] == pipeline.STATUS_REJECTED
+    assert invocations(log)[before:] == []  # nothing ran, so nothing could write
+
+
+# ------------------------------------------------------------------ amends
+
+
+def test_an_amend_work_order_extends_the_effective_scope_only(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """대조용 effective order = plan 지시서 + amends[].work_order 의 누적 합산."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    instruction = (
+        "README를 고쳐라\n\n"
+        "## 작업 지시서\n\n"
+        "| 동사 | 대상 경로 | symbol | 책임 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| MODIFY | README.md |  | 이번 사이클이 여는 범위 |\n"
+    )
+    monkeypatch.setenv("AIDEV_FAKE_EDIT", "README.md")
+    monkeypatch.setenv("AIDEV_FAKE_UNDECLARED_EDIT", "1")
+
+    assert amend(repo, tmp_path, claude_bin, slice_id, instruction) == 0
+
+    state = state_of(repo, slice_id)
+    # the plan's own table is untouched; the amend's rows sit beside it
+    assert [item["path"] for item in state["work_order"]["items"]] == ["aidev/thing.py"]
+    assert [item["path"] for item in state["amends"][0]["work_order"]["items"]] == ["README.md"]
+    assert sorted(item.path for item in pipeline.effective_order(state)) == [
+        "README.md",
+        "aidev/thing.py",
+    ]
+    # declared, so no reason was owed for it
+    assert state["unplanned_modified"] == []
+
+
+def test_an_amend_work_order_that_does_not_hold_is_refused_before_the_cycle_opens(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    before = len(invocations(log))
+    instruction = (
+        "고쳐라\n\n## 작업 지시서\n\n"
+        "| 동사 | 대상 경로 | symbol | 책임 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| MODIFY | ../밖.py |  | 나간다 |\n"
+    )
+
+    assert amend(repo, tmp_path, claude_bin, slice_id, instruction) == 2
+    assert "'.'와 '..'는 쓸 수 없다" in capsys.readouterr().err
+    assert invocations(log)[before:] == []
+    assert state_of(repo, slice_id).get("amends") is None
+
+
+# ------------------------------------------------------------------ replan
+
+
+def test_a_replan_must_produce_a_work_order_again(repo, tmp_path, claude_bin, log, monkeypatch):
+    """새 plan과 재계획(replan)은 작업 지시서가 없으면 FAIL한다."""
+    requirement(repo, front="approval: plan")
+    git_repo(repo)
+    monkeypatch.setattr(
+        pipeline,
+        "_sleep",
+        lambda _s: (slice_dir(repo) / "approvals" / "plan.md").write_text(
+            "rejected: 범위가 넓다\n", encoding="utf-8"
+        ),
+    )
+    assert run_slice(repo, tmp_path, claude_bin) == 3
+    slice_id = state_of(repo)["slice_id"]
+
+    monkeypatch.setenv("AIDEV_FAKE_NO_WORK_ORDER", "1")
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: pytest.fail("the gate was opened"))
+    assert main(argv(repo, tmp_path, claude_bin, "--replan", slice_id)) == 1
+
+    state = state_of(repo, slice_id)
+    assert "'## 작업 지시서' 절이 없다" in state["reason"]
+    assert "work_order" not in state       # the seal went with the plan it belonged to
+
+
+# ----------------------------------------------------------- setup output
+
+
+def test_setup_output_is_excluded_only_while_it_matches_its_fingerprint(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """setup이 만든 경로는 이름이 아니라 mode + blob으로 제외된다."""
+    maker = tmp_path / "make_deps.py"
+    maker.write_text(
+        "from pathlib import Path\nPath('deps.txt').write_text('installed\\n')\n",
+        encoding="utf-8",
+    )
+    command = '"{0}" "{1}"'.format(sys.executable, maker)
+    requirement(repo, front="approval: none\nsetup: {0}".format(command))
+    git_repo(repo)
+
+    # setup's own output is excused, so a clean slice is not accused of it
+    assert run_slice(repo, tmp_path, claude_bin) == 0
+    produced = state_of(repo)["setup"]["produced"]
+    assert [entry["path"] for entry in produced] == ["deps.txt"]
+    assert len(produced[0]["blob"]) == 40
+    assert state_of(repo)["unplanned_modified"] == []
+
+    # touch what setup made, and it stops being setup's
+    slice_id = state_of(repo)["slice_id"]
+    monkeypatch.setenv("AIDEV_FAKE_EDIT", "deps.txt")
+    monkeypatch.setenv("AIDEV_FAKE_UNDECLARED_EDIT", "1")
+    assert amend(repo, tmp_path, claude_bin, slice_id, "deps를 건드려라") == 1
+    assert "deps.txt" in state_of(repo, slice_id)["reason"]
+
+
+# ------------------------------------------------------------------ legacy
+
+
+def test_a_legacy_slice_resumes_without_a_work_order(repo, tmp_path, claude_bin, log, monkeypatch):
+    """Done Criteria: legacy resume 하위 호환 동작 확인."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    directory = slice_dir(repo)
+    finished = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+
+    def rewind(drop_work_order):
+        """Wind the finished record back to 'test pending', legacy or not."""
+        state = copy.deepcopy(finished)
+        if drop_work_order:
+            for key in ("work_order_required", "work_order"):
+                state.pop(key, None)
+        state["stages"]["test"] = {"status": "pending"}
+        state["status"] = "failed"
+        (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    # plan.md loses its table entirely - a v0.2 plan never had one
+    plan = directory / "plan.md"
+    plan.write_text(plan.read_text(encoding="utf-8").split("## 작업 지시서")[0], encoding="utf-8")
+
+    rewind(drop_work_order=True)
+    before = len(invocations(log))
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 0
+    assert state_of(repo, slice_id)["status"] == "done"
+    # and the prompt it was given is the one it always was: no table, no note
+    resumed = invocations(log)[before]["prompt"]
+    assert "작업 지시서" not in resumed
+    assert "범위 밖 수정 사유" not in resumed
+
+    # the contrast: keep the key and the very same plan is refused
+    rewind(drop_work_order=False)
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 1
+    assert "'## 작업 지시서' 절이 없다" in state_of(repo, slice_id)["reason"]
+
+
+def test_a_work_order_slice_will_not_resume_without_its_worktree(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    """--no-worktree 우회 차단: legacy 기존 slice의 resume만 사후 대조 skip 허용."""
+    slice_id = finished_slice(repo, tmp_path, claude_bin)
+    directory = slice_dir(repo)
+    state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    state.pop("workspace", None)
+    state["stages"]["test"] = {"status": "pending"}
+    state["status"] = "failed"
+    (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", slice_id)) == 2
+    assert "worktree 기록이 없다" in capsys.readouterr().err
+
+    assert amend(repo, tmp_path, claude_bin, slice_id, "고쳐라") == 2
+    assert "worktree 기록이 없다" in capsys.readouterr().err

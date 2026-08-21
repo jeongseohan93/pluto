@@ -1,6 +1,6 @@
 {
   "slice_id": "20260821-work-order-6",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260821-work-order-6",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "7674f8c0e6772a0e368d24f36df99d656648e2ce",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260821-224124-work-order-6-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "037fec8318333045cf473d269c4354909216390c"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260822-040120-work-order-6-implement-2",
+      "attempts": 2
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,39 @@
         "peak_context": 231947
       },
       "cost_usd": 6.621827499999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260821-232018-work-order-6-implement",
+      "status": "failed",
+      "turns": 181,
+      "tokens": {
+        "input": 1298,
+        "cache_creation": 462532,
+        "cache_read": 64420815,
+        "output": 205110,
+        "billed_input": 64884645,
+        "peak_context": 483418
+      },
+      "cost_usd": 41.96996749999998
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260822-040120-work-order-6-implement-2",
+      "status": "completed",
+      "turns": 44,
+      "tokens": {
+        "input": 82,
+        "cache_creation": 99893,
+        "cache_read": 4181201,
+        "output": 18850,
+        "billed_input": 4281176,
+        "peak_context": 120779
+      },
+      "cost_usd": 3.5611904999999995
     }
   ],
-  "updated_at": "2026-08-21T22:54:00+09:00"
+  "updated_at": "2026-08-22T04:20:04+09:00"
 }
