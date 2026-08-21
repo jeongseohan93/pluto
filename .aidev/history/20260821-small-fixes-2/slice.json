@@ -1,0 +1,77 @@
+{
+  "slice_id": "20260821-small-fixes-2",
+  "status": "running:implement",
+  "branch": "slice/20260821-small-fixes-2",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "a61096ef27adb6ca747ac293e182f936d2406bcd",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 50,
+    "test_files": 8,
+    "budget": 120,
+    "warn": true
+  },
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260821-050138-small-fixes-2-plan",
+      "attempts": 1,
+      "commit": "d5b80608e128f01e1d33f78993c7196742c5cd04"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260821-130538-small-fixes-2-implement-2",
+      "attempts": 2,
+      "commit": "d5b83e6510428b94e9984ddba7cc0f5aae69042e"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260821-050138-small-fixes-2-plan",
+      "status": "completed",
+      "turns": 63,
+      "tokens": {
+        "input": 90,
+        "cache_creation": 170020,
+        "cache_read": 5534971,
+        "output": 42567,
+        "billed_input": 5705081,
+        "peak_context": 184489
+      },
+      "cost_usd": 5.5323105
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260821-130538-small-fixes-2-implement-2",
+      "status": "completed",
+      "turns": 132,
+      "tokens": {
+        "input": 205,
+        "cache_creation": 167778,
+        "cache_read": 14495388,
+        "output": 59927,
+        "billed_input": 14663371,
+        "peak_context": 188663
+      },
+      "cost_usd": 10.424674000000007
+    }
+  ],
+  "updated_at": "2026-08-21T13:51:10+09:00"
+}

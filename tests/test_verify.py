@@ -9,12 +9,15 @@ tests must not disturb.
 import json
 import sys
 
+import pytest
+
 from aidev import verify
 from aidev.cli import main
 
 from test_pipeline import (  # noqa: F401  (pytest fixtures, used by name)
     argv,
     claude_bin,
+    git_repo,
     invocations,
     log,
     repo,
@@ -119,6 +122,85 @@ def test_render_failure_md_carries_everything_the_retry_needs():
     assert "passed 143   failed 2   skipped 1" in text
     assert "full log: /logs/01.log" in text
     assert "last commit: abc1234" in text
+
+
+# ------------------------------------------------------ temporary file names
+#
+# Three measured leftovers on three branches: .tsscratch, reindent_tmp.py and
+# reindent.py. The convention said not to; the convention is not machinery.
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "reindent_tmp.py",
+        "reindent.py",
+        ".tsscratch",
+        "desktop/src/x.tsscratch",
+        "notes.bak",
+        "panel.tsx.orig",
+        "debug.py",
+        "a/b/wip-notes.md",
+        "main.py~",
+        "aidev\\temp_notes.py",
+    ],
+)
+def test_a_name_that_reads_as_scratch_work(path):
+    assert verify.looks_temporary(path) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "aidev/verify.py",
+        "tests/test_pipeline.py",
+        "src/debug/panel.ts",  # a folder named debug is architecture, not leftovers
+        "oldest.py",
+        "useDebug.ts",
+        "templates/index.html",
+        "contemporary.md",
+        "",
+    ],
+)
+def test_a_name_that_must_not_be_accused(path):
+    assert verify.looks_temporary(path) is False
+
+
+def test_a_temp_file_makes_the_result_dirty():
+    result = verify.VerifyResult(ok=True, temp_files=["x_tmp.py"])
+
+    assert result.clean is False
+    assert result.failure_count() == 1
+    assert result.to_dict()["temp_files"] == ["x_tmp.py"]
+
+
+def test_render_failure_md_lists_the_temp_files():
+    result = verify.VerifyResult(ok=True, temp_files=["reindent_tmp.py", "desktop/src/.tsscratch"])
+
+    text = verify.render_failure_md(result, slice_id="s")
+
+    assert "## Temporary files (2)" in text
+    assert "- reindent_tmp.py" in text
+    assert "- desktop/src/.tsscratch" in text
+    assert "임시 작업 잔재" in text
+
+
+def test_result_from_report_reads_the_agents_own_words():
+    """The fallback path has no command, only what the session wrote about one."""
+    result = verify.result_from_report(
+        "I ran pytest.\n"
+        "FAILED tests/test_night.py::test_doctor - AssertionError: expected 3, got 2\n"
+        "1 failed, 143 passed\n"
+        "TEST_RESULT: FAIL"
+    )
+
+    assert result.ok is False
+    assert result.parsed is True
+    assert result.failures[0].name == "tests/test_night.py::test_doctor"
+    assert result.failures[0].file == "tests/test_night.py"
+    assert "expected 3, got 2" in result.failures[0].message
+    assert (result.passed, result.failed) == (143, 1)
+    assert result.commands[0].exit_code == 1
 
 
 def test_unreadable_output_falls_back_to_the_tail():
@@ -416,3 +498,73 @@ def test_no_test_commands_means_the_agent_stage_as_before(repo, tmp_path, claude
 
     assert len(invocations(log)) == 3  # plan, implement, test - v0.4 exactly
     assert "verify" not in state_of(repo)["stages"]["test"]
+
+
+# ------------------------------------------------- the temp-file guard, whole
+#
+# The unit tests above judge a name. These run a slice that really leaves one
+# behind, so what is being checked is git's idea of what the slice added and not
+# a list a test handed the checker.
+
+
+def guarded(tmp_path, repo, claude_bin, *extra):
+    """Launch a slice whose commands pass, so only the guard can fail it.
+
+    @param tmp_path    the pytest temp dir the script and data dir live under
+    @param repo        the user's repository
+    @param claude_bin  the stub launcher
+    @param extra       further CLI arguments
+    """
+    command = verify_script(tmp_path, "print('148 passed')\n")
+    requirement(
+        repo, front="approval: none\nspec_check: off\ntest_commands: {0}".format(command)
+    )
+    return main(
+        argv(repo, tmp_path, claude_bin, "--requirement", "tasks/doctor.md", *extra)
+    )
+
+
+def test_a_slice_that_adds_a_temp_file_fails_verification(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 임시파일 포함 slice가 FAIL + 목록 표시."""
+    monkeypatch.setenv("AIDEV_FAKE_TEMPFILE", "reindent_tmp.py")
+
+    assert guarded(tmp_path, repo, claude_bin, "--max-repairs", "0") == 1
+
+    state = state_of(repo)
+    assert state["test_verdict"] == "fail"
+    text = (slice_dir(repo) / "failure.md").read_text(encoding="utf-8")
+    assert "## Temporary files (1)" in text
+    assert "- reindent_tmp.py" in text
+    attempt = state["stages"]["test"]["verify"]["attempts"][0]
+    # the declared commands passed; leaving the file behind is what failed
+    assert attempt["commands"][0]["exit_code"] == 0
+    assert attempt["temp_files"] == ["reindent_tmp.py"]
+
+
+def test_the_repair_round_can_delete_a_temp_file(repo, tmp_path, claude_bin, log, monkeypatch):
+    monkeypatch.setenv("AIDEV_FAKE_TEMPFILE", "reindent_tmp.py")
+    # plan, implement, then the repair - which cleans up instead of scattering
+    monkeypatch.setenv("AIDEV_FAKE_TEMPFILE_FIX", "2")
+
+    assert guarded(tmp_path, repo, claude_bin) == 0
+    assert state_of(repo)["test_verdict"] == "pass"
+
+
+def test_no_temp_guard_lets_it_through(repo, tmp_path, claude_bin, log, monkeypatch):
+    """The way out of a false positive, because a false positive kills a slice."""
+    monkeypatch.setenv("AIDEV_FAKE_TEMPFILE", "reindent_tmp.py")
+
+    assert guarded(tmp_path, repo, claude_bin, "--no-temp-guard") == 0
+    assert state_of(repo)["test_verdict"] == "pass"
+    assert state_of(repo)["stages"]["test"]["verify"]["attempts"][0]["temp_files"] == []
+
+
+def test_a_clean_slice_is_not_accused(repo, tmp_path, claude_bin, log):
+    """The regression pin: .aidev/ holds this slice's own record and a *.tmp
+    brushes past it while write_text_atomic works. Without that exclusion every
+    slice in the suite would accuse itself, so this passing is the whole point.
+    """
+    assert guarded(tmp_path, repo, claude_bin) == 0
+    assert state_of(repo)["stages"]["test"]["verify"]["attempts"][0]["temp_files"] == []

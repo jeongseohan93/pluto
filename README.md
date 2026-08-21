@@ -127,6 +127,12 @@ aidev pipeline --repo ~/jokertest --rollback 20260816-doctor --to plan  # 되감
 aidev pipeline --repo ~/jokertest --revert-merge 20260816-doctor        # 철회
 ```
 
+요구사항은 `tasks/*.md`에 둔다. **`tasks/specs/` 아래는 우산 명세 보관소**다 — 한
+영역 전체를 서술하는, 한 slice가 감당할 크기가 아닌 문서를 두는 곳이고
+`--requirement tasks/specs/...`는 exit 2로 **거부된다**(규약 문구가 아니라 기계로
+막는다). 개별 requirement로 분해해 `tasks/`에 두고 쏘거나, 분해 자체를 맡기려면
+`--epic`으로 쏜다 — epic 경로는 막지 않는다. 우산을 쪼개는 것이 epic의 일이다.
+
 `--repo` 기본값은 현재 디렉터리다. cwd에 `.aidev/`가 없어서 결과가 비면 그 이유를
 찍고, **전에 `--repo`로 지정했던 repo들을 후보로 제시한다**(실측: 빈 목록만 나와서
 원인을 못 찾았다). 후보 목록은 `<data-dir>/repos.json`에 남는다. 자동 적용은
@@ -318,6 +324,25 @@ plan 산출물이 파일 12개 이상 또는 테스트 파일 5개 이상을 지
 v0.7부터 이 예산은 **바닥이 아니라 시작점**이다. 여기 적은 숫자에서 죽되 정직하게
 죽은 단계는 엔진이 견적을 내서 스스로 올린다 → [실패와 자동 복구](#실패와-자동-복구-v07).
 
+**발사 이후에 올린 예산도 반영된다.** 실측 2건: `tasks/pipeline-gen2b.md`가
+`implement=160`인데 stage는 120으로 돌았고, `tasks/graph-trace.md`가 140인데 80으로
+돌았다. 원인은 캐시도 worktree 오독도 아니었다 — 발사 시점에 요구사항이 slice
+디렉터리로 **복사(동결)**되고, 그 뒤 모든 resume이 그 사본만 읽었다. 원본을 고쳐도
+아무 일도 일어나지 않았던 것이다.
+
+이제 resume / `--amend` / `--replan`은 원본 `tasks/*.md`의 **front matter만** 다시
+읽어 동결본에 반영하고, 바뀐 키를 로그에 한 줄로 찍는다.
+
+- **본문은 따라가지 않는다.** front matter는 slice가 도는 도중에 사람이 돌려도 되는
+  손잡이(예산·모델·검증 명령)지만, 본문이 바뀌는 것은 **다른 slice가 되는 일**이라
+  `--amend`의 몫이다.
+- 원본이 지워졌거나 이름이 바뀌었거나 utf-8이 아니면 note 한 줄을 찍고 동결본을
+  그대로 쓴다. **재동기화가 resume을 죽이지 않는다.**
+- 원본의 새 front matter에 오타가 있으면 exit 2로 거부하되 **동결본은 건드리지
+  않는다** — 검증을 통과한 뒤에만 다시 쓰므로 기록이 깨지지 않는다.
+- epic이 만든 slice는 원본 파일이 없으므로(`requirement_source` 키 없음) 재동기화
+  자체를 건너뛴다.
+
 ### 검증의 결정론화 (v0.5)
 
 실측 2026-08-16/17: slice 평균 $15에서 **검증 루프가 최대 지출원**이었다.
@@ -403,6 +428,34 @@ def run_verify(cfg, rec, state, requirement, amend=None):
   탈출구는 front matter `spec_check: off`(또는 `--no-spec-check`)다.
 - 커밋 범위를 알 수 없으면(`--no-worktree`, v0.2 레거시 state) **건너뛰고 알린다.**
 - implement는 `python -m aidev.specs --base <rev>`로 스스로 확인할 수 있다.
+
+**임시파일 가드 — 기계 검사.**
+
+실측 3건: `.tsscratch`, `reindent_tmp.py`, `reindent.py`가 각각 다른 slice의 브랜치에
+남았다. "임시파일을 남기지 마라"는 규약 문구로는 한 번도 안 막혔다. 그래서 이름을
+기계가 본다.
+
+- 검사 대상은 **이 slice가 신규 추가한 파일**이다: `requirement` 커밋부터 HEAD까지의
+  추가분(`git diff --diff-filter=A`) + 아직 커밋 안 된 추가분(`??` / `A`). test 단계
+  커밋은 검사 **뒤에** 일어나므로 후자를 안 보면 implement의 잔재가 그냥 통과한다.
+  **소급하지 않는다** — 이미 있던 파일은 건드리지 않는다.
+- 판정은 **basename만** 본다. 이름을 `[^A-Za-z0-9]+`로 쪼갠 토큰이
+  `tmp` `temp` `scratch` `scratchpad` `reindent` `debug` `bak` `backup` `wip`
+  `untitled` 중 하나면 걸린다. 확장자가 `.tmp .temp .bak .orig .rej .swp .swo`이거나
+  이름이 `~`로 끝나도 걸리고, `scratch`는 어디에 박혀 있든(`.tsscratch`) 걸린다.
+  토큰 정확 일치라서 `oldest.py`는 `old`가 아니고 `useDebug.ts`는 `debug`가 아니며,
+  `src/debug/panel.ts`는 폴더 이름이라 통과한다(`src/debug.ts`는 걸린다).
+- `.aidev/` 하위와 `node_modules/` `data/`는 제외한다. 특히 `.aidev/`는 필수다 —
+  엔진이 slice 기록을 worktree에 비추면서 `*.tmp`를 스치므로, 빠뜨리면 **모든
+  slice가 자기 기록 때문에 FAIL한다.**
+- 걸리면 test FAIL이고 `failure.md`의 `Temporary files` 절에 **파일 목록**이 남는다.
+  명령이 전부 초록이어도 마찬가지다. 지우면 끝나는 실패라서 진단 세션은 사지 않고
+  바로 수리 회전으로 간다.
+- git이 diff를 못 읽으면 note 한 줄 찍고 건너뛴다 — 검사기가 FAIL의 원인이 되면 안
+  된다. 오탐 탈출구는 `--no-temp-guard`다(front matter 키는 늘리지 않았다).
+- 인코딩도 같은 자리에서 챙긴다: requirement가 utf-8이 아니면 traceback 대신 경로와
+  "utf-8 인코딩 확인" 한 줄로 거부한다(exit 2). 실측: cp949로 저장된 `tasks/*.md`
+  하나가 `UnicodeDecodeError` 스택 트레이스를 그대로 노출했다.
 
 **progress.md — 턴 소진 대비.**
 
@@ -879,7 +932,13 @@ exit code로는 성공을 판정할 수 없다. 그래서 test 단계에 마지�
 `stages.test.verify`에 명령별 exit code와 로그 경로가 함께 남는다.
 
 - `FAIL` → 엔진 경로는 `failure.md`를 쓰고 등급에 따라 재시도한다. 폴백 경로는
-  v0.4 그대로 slice가 **failed**로 끝난다 (exit 1).
+  v0.4 그대로 slice가 **failed**로 끝난다 (exit 1) — **재시도는 여전히 없다.**
+  다만 이제 폴백 경로도 `failure.md`를 **엔진과 같은 규격**(사유·좌표·카운트·
+  `last commit:`)으로 남긴다. 세션의 최종 보고문을 엔진이 쓰는 것과 같은 파서에
+  태우므로, 모델이 `FAILED tests/x.py::test_y - AssertionError: ...`를 인용했으면
+  좌표까지 나오고, 아무것도 파싱되지 않으면 보고문 tail을 그대로 싣는다. **사유는
+  언제나 남는다** — 예전에는 세션이 사라지면 읽을 것이 아무것도 없었다.
+  규약 위반(명세·임시파일)도 이 경로에서 똑같이 검사한다.
 - 폴백 경로에서 줄이 아예 없으면 `unknown`으로 기록하고 요약에 표시한다. 아무 주장도
   없는 걸 실패로 단정하지는 않지만, **절대 통과로도 읽히지 않는다.**
 
@@ -1115,8 +1174,14 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   대상은 diff에 걸린 파이썬 함수만이고, 테스트 파일·`.aidev/`·중첩 함수·dunder는
   제외, **기존 코드에 소급하지 않는다.** 커밋 범위를 모르면 건너뛰고 알린다.
   `spec_check: off` 또는 `--no-spec-check`로 끈다. (위 "검증의 결정론화" 절)
+- **이 slice가 임시 이름의 파일을 새로 추가하면 verify가 FAIL이다.** 신규 추가분의
+  basename만 보고, `.aidev/`·`node_modules/`·`data/`는 제외하며 **소급하지 않는다.**
+  `--no-temp-guard`로 끈다. (위 "검증의 결정론화" 절)
 - **빈 requirement는 발사 시점에 거부한다**(v0.5, exit 2). 모든 진입점이 같은
-  검사를 부른다.
+  검사를 부른다. **utf-8이 아닌 requirement도 같은 자리에서 거부한다** — traceback
+  대신 경로와 "utf-8 인코딩 확인" 한 줄이다.
+- **`tasks/specs/` 아래 문서는 발사할 수 없다**(exit 2). 우산 명세는 분해해서
+  `tasks/`의 개별 requirement로 쏘거나 `--epic`으로 쏜다.
 - **plan / implement는 발사 직전에 그래프 브리핑을 받는다**(v0.6). `briefing: off`
   / `--no-briefing` / `--no-graph`로 끄고, 끄면 프롬프트는 바이트 단위로 예전과
   같다. (아래 "브리핑 생성기 — 상차림" 절)
@@ -1164,6 +1229,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--no-write-guard` | 기존 파일에 대한 Write 차단을 끈다 (v0.5) |
 | `--no-output-diet` | implement에 `aidev verify` 대신 원본 테스트 명령을 준다 (v0.5) |
 | `--no-spec-check` | 함수 명세 기계 검사를 끈다 (v0.5) |
+| `--no-temp-guard` | 임시파일 이름 기계 검사를 끈다 (오탐 탈출구) |
 | `--no-graph` | 단계 커밋 뒤 Function Graph를 stale로 표시하지 않는다 (브리핑도 함께 꺼진다, v0.6) |
 | `--no-briefing` | 세션 발사 전 브리핑을 차리지 않는다 (v0.6) |
 | `--permission-mode` | implement/test용 (plan은 항상 readonly) |

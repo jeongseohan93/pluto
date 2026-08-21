@@ -40,6 +40,14 @@ the pipeline has to survive.
                           the 함수 명세 machine check has something real to catch
     AIDEV_FAKE_SPEC_FIX     with SPECLESS: from the Nth invocation on, write the
                           same function *with* a spec - a repair that works
+    AIDEV_FAKE_TEMPFILE     implement leaves these files (comma separated) in cwd,
+                          default reindent_tmp.py - one of the three measured
+                          leftovers, so the temp-file guard has real scratch work
+    AIDEV_FAKE_TEMPFILE_FIX with TEMPFILE: from the Nth invocation on, delete them
+                          again instead of writing them - a repair that works
+    AIDEV_FAKE_TEST_REPORT  what the test stage's report says above its verdict
+                          line - AIDEV_FAKE_TEXT would replace every stage's
+                          text, and the fallback report only concerns this one
     AIDEV_FAKE_DIAGNOSIS    what the diagnose step answers with
     AIDEV_FAKE_TURN_FAILS   how many invocations of the turn stage die at the
                           turn limit (default: 1)
@@ -116,9 +124,14 @@ SPECKED_FUNCTION = (
 
 
 def test_report():
-    """AIDEV_FAKE_VERDICT: PASS (default), FAIL, or 'none' to omit the line."""
+    """AIDEV_FAKE_VERDICT: PASS (default), FAIL, or 'none' to omit the line.
+
+    AIDEV_FAKE_TEST_REPORT replaces the body above the verdict line, which is
+    what the fallback path writes its failure.md out of: the session's own
+    sentences are the only evidence that path ever has.
+    """
     verdict = os.environ.get("AIDEV_FAKE_VERDICT", "PASS")
-    body = "Ran: pytest -q\n12 passed, 0 failed."
+    body = os.environ.get("AIDEV_FAKE_TEST_REPORT") or "Ran: pytest -q\n12 passed, 0 failed."
     if verdict.lower() == "none":
         return body
     return "{0}\nTEST_RESULT: {1}".format(body, verdict)
@@ -420,6 +433,22 @@ def main():
         fixed = fix_from and previous >= int(fix_from)
         with open("aidev_generated.py", "w", encoding="utf-8") as handle:
             handle.write(SPECKED_FUNCTION if fixed else SPECLESS_FUNCTION)
+
+    if os.environ.get("AIDEV_FAKE_TEMPFILE") and stage == "implement":
+        # Real files with the real names, because the guard reads git's idea of
+        # what this slice added and not a list a test handed it.
+        fix_from = os.environ.get("AIDEV_FAKE_TEMPFILE_FIX")
+        cleaning = fix_from and previous >= int(fix_from)
+        for name in os.environ["AIDEV_FAKE_TEMPFILE"].split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if cleaning:
+                if os.path.exists(name):
+                    os.remove(name)
+                continue
+            with open(name, "w", encoding="utf-8") as handle:
+                handle.write("scratch work nobody meant to keep\n")
 
     if os.environ.get("AIDEV_FAKE_MIGRATION") and stage == "implement":
         # A real file in a real stage commit, so a rollback range genuinely
