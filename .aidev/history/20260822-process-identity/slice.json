@@ -1,0 +1,31 @@
+{
+  "slice_id": "20260822-process-identity",
+  "status": "pending",
+  "branch": "slice/20260822-process-identity",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "9aae0f0c4c1a4c432b392c7068d114f703e3cb17",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": null,
+  "amends": null,
+  "repairs": null,
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "pending"
+    },
+    "implement": {
+      "status": "pending"
+    },
+    "test": {
+      "status": "pending"
+    }
+  },
+  "runs": [],
+  "updated_at": "2026-08-22T05:19:45+09:00"
+}
