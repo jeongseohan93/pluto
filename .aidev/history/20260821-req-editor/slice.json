@@ -1,6 +1,6 @@
 {
   "slice_id": "20260821-req-editor",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260821-req-editor",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "e7ea090ffba7bb9f3736966f06cef87e7fdd4dc2",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 61,
+    "test_files": 6,
+    "budget": 140,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260821-130318-req-editor-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-21T13:03:12+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260821-130318-req-editor-plan",
+      "status": "completed",
+      "turns": 53,
+      "tokens": {
+        "input": 836,
+        "cache_creation": 129161,
+        "cache_read": 2097862,
+        "output": 31283,
+        "billed_input": 2227859,
+        "peak_context": 143630
+      },
+      "cost_usd": 3.126796
+    }
+  ],
+  "updated_at": "2026-08-21T13:10:47+09:00"
 }
