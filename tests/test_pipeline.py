@@ -1119,6 +1119,56 @@ def test_failing_tests_do_not_finish_the_slice(repo, tmp_path, claude_bin, log, 
     assert "TEST_RESULT: FAIL" in state["reason"]
 
 
+# The fallback path - a slice that declared no test_commands - used to end with
+# nothing to read: the session was gone and its reasons with it. There is still
+# no retry here; what changed is that the reasons are written down.
+
+
+def test_the_fallback_test_stage_writes_a_failure_report(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 폴백 test FAIL 시에도 failure.md - 엔진과 같은 규격."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_VERDICT", "FAIL")
+    monkeypatch.setenv(
+        "AIDEV_FAKE_TEST_REPORT",
+        "I ran pytest -q.\n"
+        "FAILED tests/test_night.py::test_doctor - AssertionError: expected 3, got 2\n"
+        "1 failed, 143 passed",
+    )
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+
+    text = (slice_dir(repo) / "failure.md").read_text(encoding="utf-8")
+    assert "# FAILURE" in text
+    assert "## Failed tests (1)" in text
+    assert "tests/test_night.py" in text  # the coordinate
+    assert "expected 3, got 2" in text  # the reason
+    assert "last commit:" in text  # the same footer the engine path writes
+    assert "passed 143   failed 1" in text
+    # the reason keeps its old words and gains the path to the document
+    reason = state_of(repo)["reason"]
+    assert "TEST_RESULT: FAIL" in reason
+    assert "failure.md" in reason
+
+
+def test_the_fallback_report_quotes_the_tail_when_nothing_parses(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """No summary line to read is not the same as no reason to record."""
+    requirement(repo, front="approval: none")
+    monkeypatch.setenv("AIDEV_FAKE_VERDICT", "FAIL")
+    monkeypatch.setenv(
+        "AIDEV_FAKE_TEST_REPORT", "the suite would not even start; the import blew up"
+    )
+
+    assert run_slice(repo, tmp_path, claude_bin) == 1
+
+    text = (slice_dir(repo) / "failure.md").read_text(encoding="utf-8")
+    assert "## Output (tail" in text
+    assert "the import blew up" in text
+
+
 def test_missing_verdict_is_reported_as_unknown_not_pass(
     repo, tmp_path, claude_bin, log, monkeypatch, capsys
 ):
@@ -1781,6 +1831,127 @@ def test_the_dry_run_prints_the_budget_it_would_use(repo, tmp_path, claude_bin, 
     assert "turns     plan=80  implement=140  test=80" in capsys.readouterr().out
 
 
+# ------------------------------------------ a budget raised after the launch
+#
+# Measured twice: 'tasks/pipeline-gen2b.md' said implement=160 and the stage ran
+# on 120, 'tasks/graph-trace.md' said 140 and the stage ran on 80. Neither was
+# state.json caching a launch-time value and neither was the wrong tree - the
+# requirement is *copied* into the slice at launch, and every resume since read
+# only that copy. Raising the budget afterwards did nothing whatever.
+
+
+def stopped_at_the_plan_gate(repo, tmp_path, claude_bin, monkeypatch, front="approval: plan"):
+    """Launch a slice and kill it waiting at its plan gate, as a real ^C would.
+
+    @param repo        the user's repository
+    @param tmp_path    the pytest temp dir
+    @param claude_bin  the stub launcher
+    @param monkeypatch the fixture that replaces the wait
+    @param front       the requirement's front matter at launch
+    """
+    requirement(repo, front=front)
+    git_repo(repo, "the requirement as launched")
+
+    def killed(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "_sleep", killed)
+    assert run_slice(repo, tmp_path, claude_bin) == 130
+    return slice_dir(repo)
+
+
+def approve_the_plan(repo, monkeypatch):
+    """Answer the gate in the file, and make waiting again a test failure."""
+    (slice_dir(repo) / "approvals" / "plan.md").write_text("approved\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline, "_sleep", lambda _s: pytest.fail("resume must not wait on a decided gate")
+    )
+
+
+def test_a_committed_max_turns_rise_reaches_the_next_stage(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """Done Criteria: 커밋된 상향값으로 발사됨을 증명."""
+    stopped_at_the_plan_gate(
+        repo, tmp_path, claude_bin, monkeypatch, front="approval: plan\nmax_turns: implement=80"
+    )
+
+    # the human raises the budget in the source file and commits it, exactly as
+    # they did on both measured slices
+    requirement(repo, front="approval: plan\nmax_turns: implement=140")
+    git_repo(repo, "raise the implement budget")
+    approve_the_plan(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+
+    # plan already ran on 80; implement is the stage the rise was for
+    assert budgets(log) == ["80", "140", "80"]
+    frozen = (slice_dir(repo) / "requirement.md").read_text(encoding="utf-8")
+    assert "implement=140" in frozen
+    assert "밤 페이즈 의사 보호 로직" in frozen  # the body is still the body
+
+
+def test_a_body_edited_after_launch_does_not_change_the_slice(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """The line the re-read stops at: handles follow, the work does not.
+
+    Changing what a slice is doing is what --amend is for, and doing it silently
+    under a resume would turn one slice into a different one with the same id.
+    """
+    stopped_at_the_plan_gate(repo, tmp_path, claude_bin, monkeypatch)
+
+    requirement(repo, body="# doctor\n\n낮 페이즈 투표를 다시 짠다.\n", front="approval: plan")
+    git_repo(repo, "a different piece of work altogether")
+    approve_the_plan(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+
+    frozen = (slice_dir(repo) / "requirement.md").read_text(encoding="utf-8")
+    assert "밤 페이즈 의사 보호 로직" in frozen
+    assert "낮 페이즈 투표" not in frozen
+    assert "낮 페이즈 투표" not in invocations(log)[1]["prompt"]
+
+
+def test_a_broken_max_turns_edit_stops_the_resume_and_keeps_the_record(
+    repo, tmp_path, claude_bin, log, monkeypatch, capsys
+):
+    """A typo in the source refuses the resume; it must not corrupt the slice."""
+    stopped_at_the_plan_gate(
+        repo, tmp_path, claude_bin, monkeypatch, front="approval: plan\nmax_turns: implement=80"
+    )
+    before = len(invocations(log))
+
+    requirement(repo, front="approval: plan\nmax_turns: planz=10")
+    git_repo(repo, "a stage that does not exist")
+    approve_the_plan(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 2
+    assert "unknown stage 'planz'" in capsys.readouterr().err
+    # nothing was written and nothing was run: the slice is still resumable
+    assert "implement=80" in (slice_dir(repo) / "requirement.md").read_text(encoding="utf-8")
+    assert len(invocations(log)) == before
+
+
+def test_a_slice_with_no_source_file_resumes_unchanged(
+    repo, tmp_path, claude_bin, log, monkeypatch
+):
+    """A renamed or deleted source is a note, never a dead resume.
+
+    An epic's slice takes the same path from the other side: it was never a file
+    of its own, so there is no ``requirement_source`` and nothing to re-read.
+    """
+    stopped_at_the_plan_gate(repo, tmp_path, claude_bin, monkeypatch)
+    (repo / "tasks" / "doctor.md").unlink()
+    git_repo(repo, "the source is gone")
+    approve_the_plan(repo, monkeypatch)
+
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 0
+    assert "밤 페이즈 의사 보호 로직" in (
+        slice_dir(repo) / "requirement.md"
+    ).read_text(encoding="utf-8")
+
+
 # ------------------------------------------------------- plan size warning
 
 
@@ -2013,7 +2184,7 @@ def test_discard_leaves_no_git_trace(repo, tmp_path, claude_bin, log, capsys):
 
     assert main(argv(repo, tmp_path, claude_bin, "--discard", slice_id)) == 0
     assert not work.exists()
-    assert str(work) not in git(repo, "worktree", "list", "--porcelain").stdout
+    assert work.as_posix() not in git(repo, "worktree", "list", "--porcelain").stdout
     assert not [name for name in branches(repo) if name.startswith("slice/")]
     assert git(repo, "rev-parse", "HEAD").stdout.strip() == head
 
@@ -2120,7 +2291,9 @@ def test_discard_keeps_the_branch_when_the_worktree_will_not_go(
     err = capsys.readouterr().err
     assert "Nothing changed" in err and "run --discard again" in err
     assert "slice/{0}".format(slice_id) in branches(repo)
-    assert str(work) in git(repo, "worktree", "list", "--porcelain").stdout
+    # as_posix: git prints worktree paths with forward slashes on Windows too,
+    # and str(WindowsPath) does not - the two never matched on this platform
+    assert work.as_posix() in git(repo, "worktree", "list", "--porcelain").stdout
     assert state_of(repo)["status"] != "discarded"
     assert "discard_failed" not in state_of(repo)
 
@@ -2698,6 +2871,97 @@ def test_a_short_requirement_in_korean_is_not_mistaken_for_an_empty_one():
     """The guard refuses *empty*, not *brief* - 다섯 글자가 한 문장인 언어가 있다."""
     body = pipeline.guard_requirement("---\napproval: none\n---\n밤 의사 보호\n", "x")
     assert body.strip() == "밤 의사 보호"
+
+
+# --------------------------------------------------- a requirement that is not utf-8
+#
+# Measured: 'tasks/graph-trace.md' is saved as cp949 and is still in the
+# repository. Launching it raised UnicodeDecodeError out of read_text, and
+# cmd_pipeline only catches PipelineError - so what the human saw about their own
+# file was a stack trace about codecs.
+
+
+CP949_REQUIREMENT = "---\napproval: none\n---\n# 의사\n\n밤 페이즈 의사 보호 로직.\n".encode("cp949")
+
+
+def test_a_requirement_that_is_not_utf8_is_refused_in_one_line(
+    repo, tmp_path, claude_bin, log, capsys
+):
+    """Done Criteria: 비utf8 시 친절 에러 한 줄 (traceback 대신)."""
+    (repo / "tasks" / "doctor.md").write_bytes(CP949_REQUIREMENT)
+    git_repo(repo)
+
+    assert run_slice(repo, tmp_path, claude_bin) == 2
+
+    err = capsys.readouterr().err
+    assert "tasks" in err and "doctor.md" in err  # which file to re-save
+    assert "utf-8 인코딩 확인" in err
+    assert "Traceback" not in err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
+
+
+def test_a_frozen_requirement_that_is_not_utf8_is_refused_on_resume(
+    repo, tmp_path, claude_bin, log, capsys, monkeypatch
+):
+    """The slice's own copy is a file a human can open too, and gets the same answer."""
+    requirement(repo)
+    git_repo(repo)
+    monkeypatch.setattr(pipeline, "_sleep", lambda _s: None)
+    assert run_slice(
+        repo, tmp_path, claude_bin, "--approval-timeout", "0.05", "--poll-interval", "0.01"
+    ) == 1
+    before = len(invocations(log))
+
+    (slice_dir(repo) / "requirement.md").write_bytes(CP949_REQUIREMENT)
+    assert main(argv(repo, tmp_path, claude_bin, "--resume-slice", "last")) == 2
+
+    err = capsys.readouterr().err
+    assert "utf-8 인코딩 확인" in err
+    assert "Traceback" not in err
+    assert len(invocations(log)) == before
+
+
+# ------------------------------------------------------ umbrella specifications
+#
+# tasks/specs/ holds documents that describe a whole area and are decomposed into
+# requirements, never launched. Saying so in a convention is what did not work,
+# so the folder is a rule the CLI enforces.
+
+
+def test_an_umbrella_spec_cannot_be_launched(repo, tmp_path, claude_bin, log, capsys):
+    (repo / "tasks" / "specs").mkdir()
+    (repo / "tasks" / "specs" / "umbrella.md").write_text(
+        "---\napproval: none\n---\n# functiondb\n\n영역 전체를 서술하는 문서다.\n",
+        encoding="utf-8",
+    )
+    git_repo(repo)
+
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--requirement", "tasks/specs/umbrella.md")
+    ) == 2
+
+    err = capsys.readouterr().err
+    assert "umbrella spec" in err
+    assert "분해" in err
+    assert invocations(log) == []
+    assert not pipeline.slices_root(repo).exists()
+
+
+def test_a_requirement_that_merely_mentions_specs_is_launched_normally(
+    repo, tmp_path, claude_bin, log
+):
+    """The rule is the folder, not the word: tasks/spec-bootstrap.md is a slice."""
+    path = repo / "tasks" / "specs-of-the-doctor.md"
+    path.write_text(
+        "---\napproval: none\n---\n# doctor\n\n밤 페이즈 의사 보호 로직을 구현한다.\n",
+        encoding="utf-8",
+    )
+    git_repo(repo)
+
+    assert main(
+        argv(repo, tmp_path, claude_bin, "--requirement", "tasks/specs-of-the-doctor.md")
+    ) == 0
 
 
 # ----------------------------------------------------------------- progress.md

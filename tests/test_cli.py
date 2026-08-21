@@ -145,6 +145,32 @@ def test_missing_repo_and_prompt(tmp_path, workspace, capsys):
     assert "--prompt not found" in capsys.readouterr().err
 
 
+def test_a_prompt_that_is_not_utf8_is_refused_in_one_line(tmp_path, workspace, capsys):
+    """The same refusal the pipeline gives: which file, and what to do about it.
+
+    Nothing above cmd_run catches PipelineError, so this path says the sentence
+    itself rather than raising it - a traceback about codecs names no file.
+    """
+    (workspace / "tasks" / "doctor.md").write_bytes("# 의사\n밤 페이즈 보호.\n".encode("cp949"))
+
+    code = main(
+        [
+            "--data-dir", str(tmp_path / "data"),
+            "run",
+            "--repo", str(workspace),
+            "--prompt", "tasks/doctor.md",
+            "--no-live",
+        ]
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "doctor.md" in err
+    assert "utf-8 인코딩 확인" in err
+    assert "Traceback" not in err
+    assert not (tmp_path / "data" / "runs").exists()
+
+
 def test_missing_claude_binary(tmp_path, workspace, capsys):
     code = main(
         [

@@ -172,7 +172,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     final live.json, so a watcher that sees a terminal status can always read it.
 
     @param args  parsed arguments: --repo, --prompt, --phase, --dry-run, the runner's knobs
-    @flow  repo/prompt checks -> RunConfig -> dry-run? print and stop
+    @flow  repo/prompt checks (a prompt that is not utf-8 is one line, not a
+           traceback) -> RunConfig -> dry-run? print and stop
            : execute, streaming each event to the live view and live.json
            -> finish -> telemetry + run.json -> sqlite -> final report
     주요 내부 변수: cfg(런 설정), store(run dir 기록), telemetry(진행 상태), result(StageRun)
@@ -186,7 +187,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     if prompt_path is None:
         print("error: --prompt not found: {0}".format(args.prompt), file=sys.stderr)
         return 2
-    prompt_text = prompt_path.read_text(encoding="utf-8")
+    try:
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Nobody above this catches PipelineError, so the same sentence is said
+        # here directly rather than raised: a traceback about codecs tells the
+        # human nothing about which file to re-save.
+        print(
+            "error: " + pipeline.ENCODING_REFUSAL.format(prompt_path),
+            file=sys.stderr,
+        )
+        return 2
     if not prompt_text.strip():
         print("error: prompt file is empty: {0}".format(prompt_path), file=sys.stderr)
         return 2

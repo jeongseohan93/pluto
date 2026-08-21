@@ -1,6 +1,6 @@
 {
   "slice_id": "20260821-small-fixes-2",
-  "status": "running:plan",
+  "status": "running:implement",
   "branch": "slice/20260821-small-fixes-2",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "a61096ef27adb6ca747ac293e182f936d2406bcd",
@@ -23,11 +23,15 @@
   "stages": {
     "plan": {
       "status": "done",
+      "approval": "approved",
       "run_id": "20260821-050138-small-fixes-2-plan",
-      "attempts": 1
+      "attempts": 1,
+      "commit": "d5b80608e128f01e1d33f78993c7196742c5cd04"
     },
     "implement": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260821-130538-small-fixes-2-implement-2",
+      "attempts": 2
     },
     "test": {
       "status": "pending"
@@ -49,7 +53,23 @@
         "peak_context": 184489
       },
       "cost_usd": 5.5323105
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260821-130538-small-fixes-2-implement-2",
+      "status": "completed",
+      "turns": 132,
+      "tokens": {
+        "input": 205,
+        "cache_creation": 167778,
+        "cache_read": 14495388,
+        "output": 59927,
+        "billed_input": 14663371,
+        "peak_context": 188663
+      },
+      "cost_usd": 10.424674000000007
     }
   ],
-  "updated_at": "2026-08-21T05:12:21+09:00"
+  "updated_at": "2026-08-21T13:37:54+09:00"
 }

@@ -230,6 +230,32 @@ class PipelineError(RuntimeError):
 
 # --------------------------------------------------------------- requirement
 
+# One sentence, said the same way wherever a requirement is read - the pipeline,
+# an epic, or ``aidev run``'s prompt.
+ENCODING_REFUSAL = (
+    "requirement 파일을 utf-8로 읽을 수 없다: {0}\n"
+    "    파일의 utf-8 인코딩 확인 (utf-8로 다시 저장하면 된다)."
+)
+
+
+def read_text_utf8(path: Path, where: str = "") -> str:
+    """Read a requirement as utf-8, or refuse it in one line instead of a traceback.
+
+    Measured: a ``tasks/*.md`` saved as cp949 raised ``UnicodeDecodeError`` out
+    of ``read_text``, and ``cmd_pipeline`` only catches ``PipelineError`` - so
+    what the human saw was a stack trace about codecs. The file is the problem
+    and the message should say so, while the exit code stays non-zero.
+
+    @param path   the file to read
+    @param where  what to call it in the refusal; the path itself when empty
+    @flow  read as utf-8 -> UnicodeDecodeError -> PipelineError naming the file
+    """
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise PipelineError(ENCODING_REFUSAL.format(where or path))
+
+
 _FRONT_MATTER_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", re.DOTALL)
 
 # Only these keys accumulate across repeated lines, joined with a newline.
@@ -1019,7 +1045,12 @@ class SliceRecord:
 
     @property
     def requirement_path(self) -> Path:
-        """The human's own words, copied in at the start and never rewritten by a stage."""
+        """The human's own words, copied in at the start and never rewritten by a stage.
+
+        The body is exactly that. The front matter is not frozen quite so hard:
+        a resume, an amend or a replan re-reads it from the source file, so a
+        budget raised after launch is the budget the next stage runs on.
+        """
         return self.dir / "requirement.md"
 
     @property
@@ -2278,6 +2309,10 @@ class PipelineConfig:
     # about the user's project.
     spec_check: bool = True
     verify_engine: bool = True
+    # The temp-file guard, on for the same reason spec_check is: three measured
+    # slices left scratch files on the branch. --no-temp-guard is the way out of
+    # a false positive, because a false positive kills a whole slice.
+    temp_guard: bool = True
     # v0.6: after a stage commit the function graph is *marked* stale, not rebuilt.
     graph_hook: bool = True
     # v0.6 2단계: the engine reads the graph and sets the table before a session.
@@ -3509,15 +3544,23 @@ def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any])
     Rewritten before every stage commit, which is also how a plan.md edited by a
     human during the gate reaches the branch: the next stage commit carries it.
 
+    A document that cannot be read is skipped rather than raised over - including
+    one saved in another encoding, which is a ``ValueError`` and so slipped past
+    the ``OSError`` arm this used to have. Failing to mirror a record is not a
+    reason to stop a commit.
+
     @param cfg    the slice's configuration, for the worktree the mirror lives in
     @param rec    the slice whose documents are copied
     @param state  state.json, projected into slice.json beside them
+    @flow  requirement -> plan -> amends -> failure/diagnosis/progress -> slice.json
     """
     directory = history_dir(cfg, rec.slice_id)
     directory.mkdir(parents=True, exist_ok=True)
     try:
         write_text_atomic(directory / "requirement.md", rec.requirement_path.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError, so the OSError arm never caught it.
+        # Not mirroring a document is no reason to stop a commit either way.
         pass
     plan = rec.read_plan()
     if plan.strip():
@@ -3528,7 +3571,7 @@ def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any])
         source = rec.amend_path(int(entry["n"]))
         try:
             text = source.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         (directory / "amends").mkdir(parents=True, exist_ok=True)
         write_text_atomic(directory / "amends" / source.name, text)
@@ -3537,7 +3580,7 @@ def mirror_history(cfg: PipelineConfig, rec: SliceRecord, state: Dict[str, Any])
     for source in (rec.failure_path, rec.diagnosis_path, rec.progress_path):
         try:
             write_text_atomic(directory / source.name, source.read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
     write_json_atomic(directory / "slice.json", history_snapshot(rec, state))
     return directory
@@ -3696,6 +3739,59 @@ def run_spec_check(cfg: PipelineConfig, state: Dict[str, Any]) -> List[Any]:
         return []
 
 
+# Output nobody committed and nobody should judge: a dependency tree and the
+# project's own data. .gitignore already hides most of it from porcelain; these
+# two are named because a slice that adds them by hand is not adding scratch work.
+TEMP_CHECK_SKIP_ROOTS: Tuple[str, ...] = ("node_modules", "data")
+# Porcelain statuses that mean "this path is new here": untracked, and staged-new.
+_ADDED_STATUSES: Tuple[str, ...] = ("??", "A ", "AM", "AD", "AA")
+
+
+def run_temp_file_check(cfg: PipelineConfig, state: Dict[str, Any]) -> List[str]:
+    """Files this slice added whose names read as temporary, in path order.
+
+    Both halves are needed. The committed additions are where the three measured
+    leftovers were; the uncommitted ones are where implement's leftovers still
+    sit when this runs, because the test stage's own commit happens after it.
+
+    ``.aidev/`` is excluded before anything else: ``mirror_history`` writes the
+    slice's own record into the worktree and ``write_text_atomic`` brushes a
+    ``*.tmp`` past it, so without this every slice would accuse itself.
+
+    @param cfg    the slice's configuration - ``temp_guard`` turns this off
+    @param state  state.json, which knows what commit the slice started from
+    @flow  off -> [] ; no commit range -> committed additions skipped ; add the
+           uncommitted ones -> drop .aidev and generated roots -> name test -> sort
+    주요 내부 변수: added(신규 추가 경로), found(임시로 읽히는 것들)
+    """
+    if not cfg.temp_guard:
+        return []
+    added: List[str] = []
+    base = spec_base_commit(cfg, state)
+    head = workspace.head_commit(cfg.cwd)
+    try:
+        if base and head:
+            added += workspace.added_paths(cfg.cwd, base, head)
+        for line in (git_porcelain(cfg.cwd) or "").splitlines():
+            if line[:2] in _ADDED_STATUSES:
+                added.append(_porcelain_path(line))
+    except workspace.GitError as exc:
+        # A checker that cannot read the diff must not be the reason a stage fails.
+        say("note: temp-file check could not read the diff ({0}) - skipped".format(exc))
+        return []
+
+    found = set()
+    for path in added:
+        path = str(path).replace("\\", "/").strip("/")
+        if not path or _under_aidev(path):
+            continue
+        if path.split("/", 1)[0] in TEMP_CHECK_SKIP_ROOTS:
+            continue
+        if verify.looks_temporary(path):
+            found.add(path)
+    return sorted(found)
+
+
 def record_verify(
     rec: SliceRecord, state: Dict[str, Any], attempt: int, result: verify.VerifyResult
 ) -> None:
@@ -3731,10 +3827,14 @@ def failure_grade(cfg: PipelineConfig, result: verify.VerifyResult) -> str:
     Output nobody could parse counts as large: not being able to summarise a
     failure is exactly when a diagnosis session is worth what it costs.
 
+    A temporary file counts like a violation: the commands may have passed and
+    left ``parsed`` False, and buying a diagnosis session to explain a file that
+    only has to be deleted would be the most expensive way to say "rm".
+
     @param cfg     the slice's configuration - the threshold lives there
     @param result  the failed attempt
     """
-    if not result.parsed and not result.spec_violations:
+    if not result.parsed and not result.spec_violations and not result.temp_files:
         return "large"
     count = result.failure_count()
     return "small" if 0 < count <= cfg.diagnose_threshold else "large"
@@ -3920,7 +4020,8 @@ def run_verify(
     @param state        state.json, updated in place
     @param requirement  the requirement body, for the retry and the diagnosis
     @param amend        the open amend cycle, if any
-    @flow  run -> spec check -> clean? return None : failure.md -> grade -> diagnose? -> implement -> repeat
+    @flow  run -> spec check -> temp-file check -> clean? return None
+           : failure.md -> grade -> diagnose? -> implement -> repeat
     주요 내부 변수: attempt(회차), result(VerifyResult), grade(small|large)
     """
     attempt = 0
@@ -3935,8 +4036,10 @@ def run_verify(
             attempt=attempt,
         )
         # Always, whatever the commands said: a green suite over an undocumented
-        # function is still a slice that broke the convention.
+        # function is still a slice that broke the convention, and so is a green
+        # suite with reindent_tmp.py sitting beside it.
         result.spec_violations = list(run_spec_check(cfg, state))
+        result.temp_files = list(run_temp_file_check(cfg, state))
         record_verify(rec, state, attempt, result)
         for command in result.commands:
             say("  {0}  exit {1}".format(command.command, command.exit_code))
@@ -3984,6 +4087,7 @@ def run_verify(
                 "at": now_iso(),
                 "failed": result.failure_count(),
                 "spec_violations": len(result.spec_violations),
+                "temp_files": len(result.temp_files),
                 "diagnosis": bool(diagnosis),
             }
         )
@@ -4138,7 +4242,8 @@ def finish_stage(
     @param state   state.json, where the verdict and the plan scale land
     @param run     what the stage actually did
     @param before  ``git status`` from before a readonly stage, or None
-    @flow  safety violations -> plan (readonly proof, save) -> test (verdict, spec check)
+    @flow  safety violations -> plan (readonly proof, save)
+           -> test (verdict, spec check, temp-file check -> _fallback_failure)
     """
     # Recorded before any verdict, so a failing stage still reports what it did.
     entry = stage_entry(state, run.stage)
@@ -4167,29 +4272,77 @@ def finish_stage(
         verdict = parse_test_verdict(run.text)
         entry["verdict"] = verdict
         state["test_verdict"] = verdict
-        if verdict == "fail":
-            return "test stage reported failing tests (TEST_RESULT: FAIL)"
         if verdict == VERDICT_UNKNOWN:
             # Not fatal - we cannot claim tests failed when nothing was claimed -
             # but it must never read as a pass.
             say("warning: the test stage gave no TEST_RESULT line; result is unknown")
-        # The convention is checked on this path too: the engine is not what
-        # makes it a rule, the diff is.
+        # The conventions are checked on this path too: the engine is not what
+        # makes them rules, the diff is.
         violations = run_spec_check(cfg, state)
-        if violations:
+        temps = run_temp_file_check(cfg, state)
+        if verdict == "fail" or violations or temps:
             state["test_verdict"] = "fail"
             entry["verdict"] = "fail"
-            result = verify.VerifyResult(ok=True, spec_violations=list(violations))
-            write_text_atomic(
-                rec.failure_path,
-                verify.render_failure_md(result, slice_id=rec.slice_id, attempt=1),
-            )
-            return "{0} function(s) changed without their spec keeping up:\n{1}\n    {2}".format(
-                len(violations),
-                "\n".join("    " + str(v) for v in violations[:20]),
-                rec.failure_path,
-            )
+            return _fallback_failure(cfg, rec, run, verdict, violations, temps)
     return None
+
+
+def _fallback_failure(
+    cfg: PipelineConfig,
+    rec: SliceRecord,
+    run: StageRun,
+    verdict: str,
+    violations: Sequence[Any],
+    temps: Sequence[str],
+) -> str:
+    """Write failure.md for a failed agent test stage, and say why in one reason.
+
+    The engine path leaves a document behind and the fallback path did not, so a
+    ``TEST_RESULT: FAIL`` from a slice that declared no ``test_commands:`` left
+    nothing to read once the session was gone. The session's own report is run
+    through the same parser the engine uses, which is what makes the reasons and
+    the coordinates come out in the same shape. There is still no retry here:
+    what changes is that the slice dies with its reasons written down.
+
+    @param cfg         the slice's configuration, for the worktree git is asked about
+    @param rec         the record failure.md is written into
+    @param run         the test stage's run, whose text is the only evidence there is
+    @param verdict     what ``TEST_RESULT:`` said
+    @param violations  spec violations found over this slice's diff
+    @param temps       temporary-looking files this slice added
+    @flow  report -> VerifyResult -> failure.md -> one reason per failing kind
+    주요 내부 변수: result(보고문에서 읽은 결과), parts(사유 줄들)
+    """
+    result = verify.result_from_report(run.text, ok=(verdict != "fail"))
+    result.spec_violations = list(violations)
+    result.temp_files = list(temps)
+    head = workspace.head_commit(cfg.cwd) or ""
+    write_text_atomic(
+        rec.failure_path,
+        verify.render_failure_md(
+            result,
+            slice_id=rec.slice_id,
+            attempt=1,
+            last_commit=head,
+            last_subject=(workspace.log_subjects(cfg.cwd, "-1") or [""])[-1] if head else "",
+        ),
+    )
+    parts: List[str] = []
+    if verdict == "fail":
+        parts.append("test stage reported failing tests (TEST_RESULT: FAIL)")
+    if violations:
+        parts.append(
+            "{0} function(s) changed without their spec keeping up:\n{1}".format(
+                len(violations), "\n".join("    " + str(v) for v in violations[:20])
+            )
+        )
+    if temps:
+        parts.append(
+            "{0} temporary file(s) added by this slice:\n{1}".format(
+                len(temps), "\n".join("    " + str(path) for path in temps[:20])
+            )
+        )
+    return "\n".join(parts + ["    {0}".format(rec.failure_path)])
 
 
 def _measure_plan(cfg: PipelineConfig, text: str) -> Dict[str, Any]:
@@ -4825,7 +4978,11 @@ def changed_files(runs: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def add_parser(sub: Any) -> Any:
-    """Register the ``aidev pipeline`` subcommand and all of its flags, v0.7's 자동 복구 included.
+    """Register the ``aidev pipeline`` subcommand and all of its flags, the guard switches included.
+
+    Every guard that can fail a slice carries a ``--no-*`` beside it - spec
+    check, verify engine, and the temp-file guard - because a false positive on
+    any of them costs a whole slice and the way out has to be one flag.
 
     @param sub  the subparsers object from ``cli.build_parser``
     """
@@ -4992,6 +5149,11 @@ def add_parser(sub: Any) -> Any:
         "--no-spec-check",
         action="store_true",
         help="do not check that changed functions carry a spec comment",
+    )
+    cmd.add_argument(
+        "--no-temp-guard",
+        action="store_true",
+        help="do not fail a slice for adding files whose names read as temporary",
     )
     cmd.add_argument(
         "--no-graph",
@@ -5184,8 +5346,11 @@ def _config(
     CLI stage > front-matter stage > CLI base > front-matter base > the default.
     A caller with no front matter to offer (an epic's own decompose) gets exactly
     what it got before. The ``model:`` line resolves by the same precedence, and
-    each ``--no-*`` switch (spec check, verify engine, graph hook, briefing, ...)
-    turns one default behaviour back off here. The two-sided ones - ``spec_check``,
+    each ``--no-*`` switch (spec check, verify engine, temp guard, graph hook,
+    briefing, ...) turns one default behaviour back off here. ``temp_guard`` is
+    flag-only on purpose: the front matter's known keys are a list four other
+    places have to agree with, and one escape hatch does not earn that.
+    The two-sided ones - ``spec_check``,
     ``briefing`` and v0.7's ``auto_resume`` - are off when *either* the front
     matter or the flag says so.
 
@@ -5246,6 +5411,7 @@ def _config(
         commit_file_limit=getattr(args, "commit_file_limit", MAX_COMMIT_FILES),
         spec_check=resolve_spec_check(fields) and not getattr(args, "no_spec_check", False),
         verify_engine=not getattr(args, "no_verify_engine", False),
+        temp_guard=not getattr(args, "no_temp_guard", False),
         graph_hook=not getattr(args, "no_graph", False),
         briefing=resolve_briefing(fields) and not getattr(args, "no_briefing", False),
         output_diet=not getattr(args, "no_output_diet", False),
@@ -5302,10 +5468,12 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
     @param args      the parsed arguments
     @param repo      the user's repository
     @param data_dir  where runs are stored
-    @flow  read + guard the requirement -> dry-run? print and stop -> launch_slice
+    @flow  refuse an umbrella spec -> read as utf-8 -> guard the requirement
+           -> dry-run? print and stop : launch_slice, told which file it came from
     """
     source = resolve_requirement(args.requirement, repo)
-    text = source.read_text(encoding="utf-8")
+    refuse_umbrella_spec(source)
+    text = read_text_utf8(source, where=str(source))
     # Measured 2026-08-17: an empty requirement bought a worktree, a plan stage
     # and a gate before anyone noticed. Refused at the moment of launch instead.
     guard_requirement(text, str(source))
@@ -5350,12 +5518,16 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
                 for name in STAGES
             )
         ))
-        print("guards    write-guard {0}, spec-check {1}, output-diet {2}, briefing {3}".format(
-            "on" if turns.write_guard else "off",
-            "on" if turns.spec_check else "off",
-            "on" if diet_is_on(turns) else "off",
-            "on" if (turns.briefing and turns.graph_hook) else "off",
-        ))
+        print(
+            "guards    write-guard {0}, spec-check {1}, temp-guard {2}, output-diet {3}, "
+            "briefing {4}".format(
+                "on" if turns.write_guard else "off",
+                "on" if turns.spec_check else "off",
+                "on" if turns.temp_guard else "off",
+                "on" if diet_is_on(turns) else "off",
+                "on" if (turns.briefing and turns.graph_hook) else "off",
+            )
+        )
         print("recovery  auto-resume {0}, auto-extend {1} (연장 {2}회, Observer {3}회), turn cap {4}".format(
             "on" if turns.auto_resume else "off",
             turns.auto_extend,
@@ -5368,7 +5540,30 @@ def start_slice(args: Any, repo: Path, data_dir: Path) -> int:
         print("run dir   {0}".format(data_dir / "runs"))
         return EXIT_DONE
 
-    return launch_slice(args, repo, data_dir, text, source.stem).code
+    return launch_slice(args, repo, data_dir, text, source.stem, source=source).code
+
+
+# ``tasks/specs/`` is where umbrella specifications live: documents that describe
+# a whole area and are decomposed into requirements, never launched themselves.
+# Measured: saying so in a convention did not stop it, so the folder is a rule.
+SPEC_DIR_PARTS: Tuple[str, str] = ("tasks", "specs")
+
+
+def refuse_umbrella_spec(source: Path) -> None:
+    """Refuse to launch a document that lives under ``tasks/specs/``.
+
+    @param source  the requirement file the human named
+    @flow  the path passes through tasks/specs -> PipelineError ; otherwise nothing
+    """
+    parts = [part.lower() for part in Path(source).parts]
+    for index in range(len(parts) - 1):
+        if (parts[index], parts[index + 1]) == SPEC_DIR_PARTS:
+            raise PipelineError(
+                "{0} is an umbrella spec (tasks/specs/), not a requirement.\n"
+                "    우산 명세는 직접 발사하지 않는다 - 개별 requirement로 분해해서 "
+                "tasks/ 에 두고 쏴라.\n"
+                "    분해 자체를 맡기려면 --epic 으로 쏘면 된다.".format(source)
+            )
 
 
 def launch_slice(
@@ -5381,6 +5576,7 @@ def launch_slice(
     start: Optional[str] = None,
     epic: Optional[Dict[str, Any]] = None,
     quiet_unfinished: bool = False,
+    source: Optional[Path] = None,
 ) -> SliceOutcome:
     """Create a slice from requirement text and run it to its first stop.
 
@@ -5398,6 +5594,8 @@ def launch_slice(
     @param start             an explicit commit to start at, for a queued slice
     @param epic              the epic this slice belongs to, when it has one
     @param quiet_unfinished  suppress the "other slices are open" notice, for a queue
+    @param source            the file the text was read from, when there was one,
+                             so a later resume can re-read its front matter
     @flow  guard + validate every front matter key (recovery switches included)
            -> slice record -> workspace -> run_pipeline
     주요 내부 변수: plan(worktree 계획, --no-worktree면 None), ws(만들어진 작업 공간)
@@ -5438,6 +5636,10 @@ def launch_slice(
     rec.ensure()
     write_text_atomic(rec.requirement_path, text)
     state = new_state(slice_id, repo, gates, epic=epic)
+    if source is not None:
+        # Optional, like every key added after schema 2: an epic's slice has no
+        # file of its own, and a reader that has never seen this key is only older.
+        state["requirement_source"] = str(Path(source).resolve())
     if setup_command:
         state["setup"] = {"command": setup_command, "status": "pending"}
     say("slice {0}".format(slice_id))
@@ -5621,6 +5823,112 @@ def _broken_workspace_error(
     )
 
 
+# ------------------------------------------------- front matter, re-read
+#
+# Measured twice: 'tasks/pipeline-gen2b.md' said implement=160 and the stage ran
+# on 120; 'tasks/graph-trace.md' said 140 and the stage ran on 80. Neither was a
+# caching bug and neither was the wrong tree - launch_slice *copies* the
+# requirement into the slice directory, and every resume since has read only
+# that copy. Raising a budget after launch therefore did nothing at all.
+
+
+def front_matter_changes(frozen: Dict[str, str], fresh: Dict[str, str]) -> List[str]:
+    """Which front matter keys differ, each as one 'key: old -> new' line.
+
+    @param frozen  the front matter the slice has been running with
+    @param fresh   the front matter the source file carries now
+    @flow  every key of either side, in a stable order -> different? -> one line
+    """
+    lines: List[str] = []
+    for key in sorted(set(frozen) | set(fresh)):
+        was, now = frozen.get(key), fresh.get(key)
+        if was == now:
+            continue
+        lines.append(
+            "{0}: {1} -> {2}".format(
+                key, "(none)" if was is None else was, "(none)" if now is None else now
+            )
+        )
+    return lines
+
+
+def refresh_front_matter(rec: SliceRecord, state: Dict[str, Any]) -> List[str]:
+    """Re-read the source requirement's front matter into the frozen copy.
+
+    The body is deliberately not followed. The front matter is a set of handles a
+    human is allowed to turn while a slice is running - the budget, the model,
+    the verification commands - but a changed body means a different piece of
+    work, and changing what a slice is doing is what ``--amend`` is for.
+
+    Nothing here may kill a resume: a source that was renamed, deleted or saved
+    in another encoding leaves a note and the frozen copy exactly as it was. A
+    source whose new front matter does not validate is the one refusal, and it
+    happens before anything is written, so the record survives it too.
+
+    @param rec    the slice whose frozen requirement may be updated
+    @param state  state.json, where the source path was recorded at launch
+    @flow  no recorded source -> [] ; unreadable -> note and [] ; same -> []
+           ; validate the new keys -> rewrite (new front matter + old body)
+    주요 내부 변수: fresh(원본 front matter), frozen(동결본 front matter)
+    """
+    source = state.get("requirement_source")
+    if not source:
+        # An epic's slice was never a file of its own; there is nothing to re-read.
+        return []
+    path = Path(str(source))
+    try:
+        fresh_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        say("note: cannot re-read {0} ({1}) - the slice keeps its own copy".format(path, exc))
+        return []
+    fresh_text = fresh_text.lstrip("﻿")
+    fresh, fresh_body = parse_front_matter(fresh_text)
+    frozen_text = read_text_utf8(rec.requirement_path, where=str(rec.requirement_path))
+    frozen, frozen_body = parse_front_matter(frozen_text)
+    changes = front_matter_changes(frozen, fresh)
+    if not changes:
+        return []
+
+    # Everything is validated before the frozen copy is touched: a typo in the
+    # source must refuse the resume, not corrupt the slice's own record.
+    try:
+        resolve_gates(fresh)
+        resolve_setup(fresh)
+        resolve_test_commands(fresh)
+        resolve_max_turns(fresh)
+        resolve_models(fresh)
+        resolve_spec_check(fresh)
+        resolve_auto_resume(fresh)
+        resolve_auto_extend(fresh)
+    except PipelineError as exc:
+        raise PipelineError(
+            "{0}\n    in {1}, which slice {2} re-reads its front matter from.\n"
+            "    Fix that file, or the slice keeps running on {3}".format(
+                exc, path, rec.slice_id, rec.requirement_path
+            )
+        )
+
+    # The source's own block, copied as written rather than re-rendered from the
+    # parsed keys: comments and ordering are the human's and stay theirs.
+    header = fresh_text[: len(fresh_text) - len(fresh_body)]
+    write_text_atomic(rec.requirement_path, header + frozen_body)
+    return changes
+
+
+def apply_source_front_matter(rec: SliceRecord, state: Dict[str, Any]) -> None:
+    """Pull in any front matter the human edited since launch, and say what moved.
+
+    Said out loud on purpose: a budget or a model that changed under a resume is
+    exactly the kind of thing that is only ever noticed afterwards.
+
+    @param rec    the slice about to be resumed, amended or re-planned
+    @param state  state.json, carrying the source path when the slice had one
+    @flow  refresh_front_matter -> one 'key: old -> new' line each, said out loud
+    """
+    for line in refresh_front_matter(rec, state):
+        say("front matter re-read from the source: {0}".format(line))
+
+
 def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> int:
     """Pick a stopped slice up where it stopped. The queue resumes slices this way too.
 
@@ -5628,7 +5936,8 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
     @param repo      the user's repository
     @param data_dir  where runs are stored
     @param rec       the slice to continue, already located
-    @flow  refuse finished states -> re-guard the requirement -> verify workspace
+    @flow  refuse finished states -> re-read the source's front matter
+           -> re-guard the requirement -> verify workspace
            (a broken one is refused by ``_broken_workspace_error``) -> _finish
     """
     state = rec.read_state()
@@ -5649,7 +5958,8 @@ def continue_slice(args: Any, repo: Path, data_dir: Path, rec: SliceRecord) -> i
             "slice {0} is {1}; there is nothing left to resume".format(rec.slice_id, status)
         )
 
-    text = rec.requirement_path.read_text(encoding="utf-8")
+    apply_source_front_matter(rec, state)
+    text = read_text_utf8(rec.requirement_path, where=str(rec.requirement_path))
     # The same guard as at launch: a requirement that was emptied between two
     # runs must not be resumed into a session that has nothing to work from.
     body = guard_requirement(text, rec.slice_id)
@@ -5696,7 +6006,8 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
     @param repo       the user's repository
     @param data_dir   where runs are stored
     @param repo_given whether --repo was named, for the "no slices here" hint
-    @flow  instruction -> find slice -> re-guard the requirement -> verify workspace
+    @flow  instruction -> find slice -> re-read the source's front matter
+           -> re-guard the requirement -> verify workspace
            (a broken one is refused by ``_broken_workspace_error``) -> open the cycle -> _finish
     """
     instruction = (getattr(args, "instruction", None) or "").strip()
@@ -5716,7 +6027,8 @@ def amend_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) 
             "nothing to amend".format(rec.slice_id)
         )
 
-    text = rec.requirement_path.read_text(encoding="utf-8")
+    apply_source_front_matter(rec, state)
+    text = read_text_utf8(rec.requirement_path, where=str(rec.requirement_path))
     body = guard_requirement(text, rec.slice_id)
     fields, _ = parse_front_matter(text)
     setup_command = resolve_setup(fields)
@@ -5874,7 +6186,8 @@ def replan_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
     @param repo       the user's repository
     @param data_dir   where runs are stored
     @param repo_given whether --repo was named, for the "no slices here" hint
-    @flow  find slice -> read requirement -> dry-run? -> reopen_plan -> _finish
+    @flow  find slice -> re-read the source's front matter -> read requirement
+           -> dry-run? -> reopen_plan -> _finish
     주요 내부 변수: rec(대상 slice), rejection(직전 반려), body(요구사항 본문)
     """
     rec = find_slice(repo, args.replan, repo_given, data_dir)
@@ -5888,7 +6201,8 @@ def replan_slice(args: Any, repo: Path, data_dir: Path, repo_given: bool = True)
             "go. Amend it instead.".format(rec.slice_id, status)
         )
 
-    text = rec.requirement_path.read_text(encoding="utf-8")
+    apply_source_front_matter(rec, state)
+    text = read_text_utf8(rec.requirement_path, where=str(rec.requirement_path))
     body = guard_requirement(text, rec.slice_id)
     fields, _ = parse_front_matter(text)
     setup_command = resolve_setup(fields)

@@ -52,6 +52,55 @@ def split_command(command: str) -> List[str]:
     return shlex.split(command)
 
 
+# ------------------------------------------------------- temporary file names
+#
+# Measured: three slices left scratch work on the branch (.tsscratch,
+# reindent_tmp.py, reindent.py). The convention said not to and the convention
+# was not read, so the name is judged by machine instead. Nothing here knows
+# about git or the repository - it is a predicate over a filename, which is why
+# it lives beside the parsers and not in the pipeline.
+
+# Whole tokens, matched against the basename split on [^A-Za-z0-9]+: 'oldest.py'
+# is not 'old' and 'useDebug.ts' is not 'debug'. One false positive kills a whole
+# slice, so this list is chosen to be exact rather than wide.
+TEMP_TOKENS: Tuple[str, ...] = (
+    "tmp", "temp", "scratch", "scratchpad", "reindent",
+    "debug", "bak", "backup", "wip", "untitled",
+)
+# Temporary wherever it sits in the name - what does not split into tokens,
+# '.tsscratch' being the measured one.
+TEMP_SUBSTRINGS: Tuple[str, ...] = ("scratch",)
+# Extensions that are the leftovers themselves: editors, patches, merges.
+TEMP_SUFFIXES: Tuple[str, ...] = (".tmp", ".temp", ".bak", ".orig", ".rej", ".swp", ".swo")
+
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def looks_temporary(path: str) -> bool:
+    """Does this path's filename read as temporary working scratch?
+
+    Only the basename is judged: ``src/debug/panel.ts`` is a module in a folder
+    called debug, ``src/debug.ts`` is a file called debug. A directory name is
+    somebody's architecture and not their leftovers.
+
+    @param path  a repository-relative path, with either separator
+    @flow  basename lowered -> '~' tail -> suffix -> substring -> whole tokens
+    주요 내부 변수: name(소문자 basename), tokens(이름을 쪼갠 조각들)
+    """
+    name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not name:
+        return False
+    if name.endswith("~"):  # the editor's own backup
+        return True
+    if name.endswith(TEMP_SUFFIXES):
+        return True
+    for fragment in TEMP_SUBSTRINGS:
+        if fragment in name:
+            return True
+    tokens = [token for token in _TOKEN_SPLIT_RE.split(name) if token]
+    return any(token in TEMP_TOKENS for token in tokens)
+
+
 @dataclass
 class FailedTest:
     """One failing test, located precisely enough for an editor to jump to it."""
@@ -115,20 +164,24 @@ class VerifyResult:
     skipped: Optional[int] = None
     parsed: bool = False
     spec_violations: List[Any] = field(default_factory=list)
+    # Paths this slice added whose names read as scratch work. Filled by the
+    # pipeline, which is the only side that knows what "this slice added" means.
+    temp_files: List[str] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        """Did everything pass, including the spec check? What a PASS really means."""
-        return self.ok and not self.spec_violations
+        """Did everything pass - the commands, the spec check, and the temp-file guard?"""
+        return self.ok and not self.spec_violations and not self.temp_files
 
     def failure_count(self) -> int:
         """How big the failure is, for the diagnosis grade. Spec violations count too.
 
         An unread count (``None``) falls through to the listed failures, exactly
-        as a zero one did - which is why this body did not have to change.
+        as a zero one did - which is why this body did not have to change. A
+        temporary file counts as one failure for the same reason a violation does.
         """
         counted = self.failed or len(self.failures)
-        return counted + len(self.spec_violations)
+        return counted + len(self.spec_violations) + len(self.temp_files)
 
     def first_failing(self) -> Optional[CommandResult]:
         """The command that stopped the run, in declared order - the one a failure report quotes.
@@ -141,10 +194,11 @@ class VerifyResult:
         return None
 
     def to_dict(self) -> Dict[str, Any]:
-        """What state.json keeps of an attempt: counts in full, failures capped, violations as text.
+        """What state.json keeps of an attempt: counts in full, failures capped, violations and temp files as text.
 
         A count nobody could read is stored as ``null``, so a reader can tell
-        "the output never said" from "it really was none".
+        "the output never said" from "it really was none". The temporary files
+        go in whole: there are never many, and which file it was is the answer.
         """
         return {
             "ok": self.ok,
@@ -155,6 +209,7 @@ class VerifyResult:
             "parsed": self.parsed,
             "failures": [failure.to_dict() for failure in self.failures[:MAX_FAILURES_LISTED]],
             "spec_violations": [str(violation) for violation in self.spec_violations],
+            "temp_files": list(self.temp_files),
         }
 
 
@@ -387,6 +442,39 @@ def _tail(text: str, lines: int) -> str:
     return "\n".join((text or "").rstrip().splitlines()[-lines:])
 
 
+def result_from_report(
+    text: str, ok: bool = False, command: str = "(the test stage's own report)"
+) -> VerifyResult:
+    """Read an agent's own report into the same shape the engine produces.
+
+    The fallback path - a slice that declared no ``test_commands:`` - has no
+    command and no exit code. What it has is the sentences the session wrote,
+    and those sentences usually quote pytest's or jest's summary verbatim: the
+    same letters the engine parses. Running them through the same parser is what
+    makes a fallback failure.md carry the same reasons and coordinates as an
+    engine one. When nothing parses the report is still the output, so
+    ``render_failure_md`` quotes its tail and the reason is never lost.
+
+    @param text     the session's final report
+    @param ok       did the run itself succeed - False once the verdict is FAIL
+    @param command  what to call it in the report's 'Command' section
+    @flow  parse the report -> one CommandResult standing in for the session
+    주요 내부 변수: failures(파싱된 실패), counts(passed/failed/skipped)
+    """
+    failures, counts, parsed = parse_output(text)
+    return VerifyResult(
+        ok=ok,
+        commands=[
+            CommandResult(command=command, exit_code=0 if ok else 1, output=text or "")
+        ],
+        failures=list(failures),
+        passed=counts.get("passed"),
+        failed=_sum_present(counts, "failed", "error"),
+        skipped=counts.get("skipped"),
+        parsed=parsed,
+    )
+
+
 def traceback_summary(text: str, limit: int = TRACEBACK_LINES) -> str:
     """The last traceback in the output, clipped. Empty when there is none."""
     body = text or ""
@@ -426,9 +514,13 @@ def summarize_for_agent(result: VerifyResult) -> str:
     the raw output - 233 test names - went into the session's context each time.
     This is what the ``aidev verify`` wrapper prints instead. A count nobody
     could read prints as ``n/a``; failed and skipped stay silent when they are
-    ``None``, exactly as they did when they were zero.
+    ``None``, exactly as they did when they were zero. Spec violations and
+    temporary files are listed after the tests, because a green suite that broke
+    a convention still has to say which convention and where.
 
     @param result  what ``run_commands`` produced
+    @flow  one line per command -> counts -> failures (or the output's tail)
+           -> spec violations -> temporary files -> log paths
     """
     lines: List[str] = []
     for command in result.commands:
@@ -461,6 +553,8 @@ def summarize_for_agent(result: VerifyResult) -> str:
 
     for violation in result.spec_violations[:MAX_FAILURES_LISTED]:
         lines.append("  spec: {0}".format(violation))
+    for path in result.temp_files[:MAX_FAILURES_LISTED]:
+        lines.append("  temp file: {0}".format(path))
 
     for command in result.commands:
         if command.log_path:
@@ -503,7 +597,8 @@ def render_failure_md(
     @param attempt       which verification round produced it
     @param last_commit   the sha the failure sits on top of
     @param last_subject  that commit's subject line
-    @flow  header -> commands -> failures (or output tail) -> spec violations -> counts -> traceback
+    @flow  header -> commands -> failures (or output tail) -> spec violations
+           -> temporary files -> counts -> traceback
     주요 내부 변수: lines(누적 출력), failing(첫 실패 명령)
     """
     lines = [
@@ -556,6 +651,18 @@ def render_failure_md(
         lines.append(
             "A function that changed must carry a spec comment, and an existing spec "
             "must change with it (one line is enough)."
+        )
+
+    if result.temp_files:
+        lines += ["", "## Temporary files ({0})".format(len(result.temp_files))]
+        for path in result.temp_files[:MAX_FAILURES_LISTED]:
+            lines.append("- {0}".format(path))
+        if len(result.temp_files) > MAX_FAILURES_LISTED:
+            lines.append("- ... {0} more".format(len(result.temp_files) - MAX_FAILURES_LISTED))
+        lines.append("")
+        lines.append(
+            "이 slice가 새로 추가한 파일이고, 이름이 임시 작업 잔재로 읽힌다. 브랜치에 "
+            "남길 파일이 아니면 지우고, 남길 파일이면 임시로 읽히지 않는 이름으로 바꿔라."
         )
 
     lines += [

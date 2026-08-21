@@ -175,6 +175,23 @@ def diff_paths(repo: Path, a: str, b: str) -> List[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def added_paths(repo: Path, a: str, b: str) -> List[str]:
+    """Paths that exist at ``b`` and did not at ``a``. Empty when git cannot answer.
+
+    Only ``A``: a file git resolved as a rename is the same file under a new
+    name, and treating a refactor as a brand-new file would make every rename
+    answer to whatever asked this question.
+
+    @param repo  the repository or worktree to ask
+    @param a     the older commit
+    @param b     the newer commit
+    """
+    proc = run(repo, ["diff", "--name-only", "--diff-filter=A", a, b], check=False)
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def diff_unified(
     repo: Path, a: str, b: str, paths: Sequence[str] = (), context: int = 0
 ) -> str:

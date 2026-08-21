@@ -704,12 +704,25 @@ def _drop_workspace(repo: Path, state: Dict[str, Any]) -> None:
 
 
 def start_epic(args: Any, repo: Path, data_dir: Path) -> int:
+    """``--epic``: decompose one umbrella document into a list of slices to queue.
+
+    The decompose branch is temporary and says so: it exists to produce the list,
+    and the slices that follow branch from each other, not from it.
+
+    @param args      the parsed arguments - ``--epic``, ``--dry-run``
+    @param repo      the user's repository
+    @param data_dir  where runs are stored
+    @flow  refuse --no-worktree -> read the file as utf-8 -> refuse an empty one
+           -> epic record + workspace plan -> dry-run? print and stop
+           : create the workspace -> _finish
+    주요 내부 변수: erec(epic 기록), plan(작업 공간 계획), body(우산 명세 본문)
+    """
     if getattr(args, "no_worktree", False):
         raise pipeline.PipelineError(
             "--epic needs worktrees: slice N+1 branches from slice N, which is a branch"
         )
     source = pipeline.resolve_requirement(args.epic, repo, flag="--epic")
-    text = source.read_text(encoding="utf-8")
+    text = pipeline.read_text_utf8(source, where=str(source))
     if not text.strip():
         raise pipeline.PipelineError("epic file is empty: {0}".format(source))
     _, body = pipeline.parse_front_matter(text)
@@ -756,12 +769,28 @@ def start_epic(args: Any, repo: Path, data_dir: Path) -> int:
 
 
 def resume_epic(args: Any, repo: Path, data_dir: Path, repo_given: bool = True) -> int:
+    """``--resume-epic``: pick a decomposed epic up, at the list or in the queue.
+
+    Once the list is approved the decompose worktree has done its job, so finding
+    it gone is a note rather than a refusal - which is the one asymmetry with a
+    slice, where a missing worktree always stops the run.
+
+    @param args        the parsed arguments - ``--resume-epic``, ``--dry-run``
+    @param repo        the user's repository
+    @param data_dir    where runs are stored
+    @param repo_given  whether --repo was named, for the "no epics here" hint
+    @flow  find the epic -> read its copy as utf-8 -> dry-run? print the list and
+           stop -> already done? -> workspace still needed? -> _finish
+    주요 내부 변수: erec(epic 기록), state(state.json), ws(작업 공간)
+    """
     erec = find_epic(repo, args.resume_epic, repo_given, data_dir)
     state = erec.read_state()
     if state is None:
         raise pipeline.PipelineError("no readable state.json in {0}".format(erec.dir))
     status = str(state.get("status", ""))
-    _, body = pipeline.parse_front_matter(erec.requirement_path.read_text(encoding="utf-8"))
+    _, body = pipeline.parse_front_matter(
+        pipeline.read_text_utf8(erec.requirement_path, where=str(erec.requirement_path))
+    )
 
     if args.dry_run:
         print("epic    {0}  ({1})".format(erec.epic_id, status))
