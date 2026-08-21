@@ -14,12 +14,11 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { readJsonTolerant, readTextTolerant, safeSegment, slicesRoot } from '../../../main/aidev-store'
+import { isRequirementPath } from '../commands'
 import { CAUSE_QUOTA, causeEvidence, classifyCause } from '../death'
+import { TASKS_DIR } from '../requirement'
 import { failedStage, readQuota, readStopped, secondsLeft } from '../state'
 import type { ProgressNote, RequirementFile, SliceFailure } from '../types'
-
-/** Where a repository keeps the requirements a human may launch. */
-const TASKS_DIR = 'tasks'
 
 /** A run's `summary` is clipped at 2000 chars by record_run; keep that bound. */
 const SUMMARY_MAX = 2000
@@ -30,6 +29,10 @@ const SUMMARY_MAX = 2000
  * Returns `[]` for a repository with no `tasks/` — a folder that cannot be
  * listed is an empty launcher, not an error dialog.
  *
+ * `editable` annotates rather than filters: a `tasks/*.md` the editor cannot
+ * open is still a requirement somebody may launch, and quietly dropping it here
+ * would take a working button away.
+ *
  * @param repoRoot  the repository the app has open
  * @flow  read the directory -> keep .md files -> title from the first heading
  *        -> sort by name so the list does not reshuffle between polls
@@ -38,6 +41,9 @@ export function listRequirements(repoRoot: string): RequirementFile[] {
   const dir = join(repoRoot, TASKS_DIR)
   let names: string[]
   try {
+    // `isFile()` is also the rule that keeps `tasks/specs/` — the umbrella
+    // specs — out of the launcher and out of the editor: only the top level of
+    // `tasks/` is ever looked at, and a directory is never an entry.
     names = readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
       .map((entry) => entry.name)
@@ -57,12 +63,14 @@ export function listRequirements(repoRoot: string): RequirementFile[] {
     } catch {
       // the file went away between the listing and the stat; still offer it
     }
+    const path = `${TASKS_DIR}/${name}`
     out.push({
-      path: `${TASKS_DIR}/${name}`,
+      path,
       name,
       title: firstHeading(file) ?? name,
       bytes,
-      modifiedAt
+      modifiedAt,
+      editable: isRequirementPath(path)
     })
   }
   return out

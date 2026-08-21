@@ -9,10 +9,11 @@
  *
  * Shorthand declarations on purpose: the real surface is reached through
  * `import type * as MonacoNs from 'monaco-editor'`, which is typed properly.
- * These four only need to exist.
+ * These five only need to exist.
  */
 declare module 'monaco-editor/esm/vs/editor/edcore.main'
 declare module 'monaco-editor/esm/vs/editor/editor.api'
 declare module 'monaco-editor/esm/vs/basic-languages/python/python.contribution'
 declare module 'monaco-editor/esm/vs/basic-languages/typescript/typescript.contribution'
 declare module 'monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution'
+declare module 'monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution'

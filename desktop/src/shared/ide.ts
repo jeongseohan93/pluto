@@ -284,6 +284,12 @@ export interface ApprovalResult {
  * v0.2.8 adds one more question to the graph half — a call chain — and it is
  * still only a question: the trace reads the same read-only handle every other
  * graph channel does.
+ *
+ * The requirement editor adds the second — and, so far, last — write: the
+ * pipeline half's `saveRequirement`. It is not a widening of the surface. The
+ * only paths it accepts are `tasks/<name>.md`, which is the same regex the
+ * launcher uses to decide what may be launched, so the editor cannot be aimed
+ * at a source file by typing a different name into it.
  */
 export interface AidevBridge extends PipelineBridge, GraphBridge, CodeViewBridge {
   getProject(): Promise<ProjectInfo>
@@ -303,9 +309,14 @@ export interface AidevBridge extends PipelineBridge, GraphBridge, CodeViewBridge
   selectRepo(root: string): Promise<RepoState>
   getStageArtifact(sliceId: string, stage: string): Promise<StageArtifact>
   /**
-   * The one and only capability that writes into the target repository:
+   * The first of the two capabilities that write into the target repository:
    * `<repo>/.aidev/slices/<id>/approvals/<stage>.md`. Judgement stays with the
    * Python core — Pluto records the human's answer and nothing else.
+   *
+   * The second is `saveRequirement` on the pipeline half, which writes one
+   * `tasks/<name>.md`. There are no others, and neither can name a path of its
+   * own shape: a slice id and a stage are single segments, a requirement is one
+   * regex.
    */
   writeApproval(input: ApprovalInput): Promise<ApprovalResult>
 }
@@ -343,5 +354,10 @@ export const IPC = {
 
   /** v0.2.8 — one function's call chain, N rings out. Read-only, like the two
    *  graph channels above it. */
-  graphTrace: 'aidev:get-graph-trace'
+  graphTrace: 'aidev:get-graph-trace',
+
+  /** The requirement editor: one `tasks/<name>.md` read, and the one write —
+   *  the same file, plus the `git add` + `git commit` that follows it. */
+  requirementRead: 'aidev:get-requirement',
+  requirementSave: 'aidev:save-requirement'
 } as const

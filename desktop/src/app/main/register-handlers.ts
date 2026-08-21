@@ -1,11 +1,12 @@
 /**
  * Wiring: which IPC channel reaches which domain function.
  *
- * Nothing here decides anything. It exists so the three things that *are*
+ * Nothing here decides anything. It exists so the four things that *are*
  * decisions — building an argv (`domains/pipeline/commands.ts`), reading the
- * Function DB (`domains/graph-view/main/graph-store.ts`) and reading a source
- * file (`domains/code-view/main/source-store.ts`) — have exactly one caller
- * each, and so `main/index.ts` stays what it is: the window and the app
+ * Function DB (`domains/graph-view/main/graph-store.ts`), reading a source file
+ * (`domains/code-view/main/source-store.ts`) and reading or writing a
+ * requirement (`domains/pipeline/main/requirement-store.ts`) — have exactly one
+ * caller each, and so `main/index.ts` stays what it is: the window and the app
  * lifecycle.
  *
  * Two rules hold for every handler below:
@@ -24,7 +25,15 @@ import { slicesRoot } from '../../main/aidev-store'
 import { isRequirementPath, isSafeSegment } from '../../domains/pipeline/commands'
 import type { CommandRunner } from '../../domains/pipeline/main/cli-runner'
 import { listRequirements, readSliceFailure } from '../../domains/pipeline/main/store'
-import type { CommandRequest, CommandStart } from '../../domains/pipeline/types'
+import { readRequirement, saveRequirement } from '../../domains/pipeline/main/requirement-store'
+import type {
+  CommandRequest,
+  CommandStart,
+  RequirementDoc,
+  RequirementProblem,
+  RequirementSave,
+  RequirementSaveInput
+} from '../../domains/pipeline/types'
 import {
   pathInGraph,
   readGraphIndex,
@@ -44,7 +53,8 @@ export interface SliceHandlerContext {
 
 /**
  * Register the v0.2.6 channels: launching, watching, finishing, and the graph —
- * plus v0.2.7's one source read and v0.2.8's one call chain.
+ * plus v0.2.7's one source read, v0.2.8's one call chain, and the requirement
+ * editor's read and write.
  *
  * @param ctx  the open repository and the single command slot
  * @flow  one `ipcMain.handle` per channel, each guarded and each answering with
@@ -164,6 +174,65 @@ export function registerSliceHandlers(ctx: SliceHandlerContext): void {
       return noSource(rel, 'unreadable', String(err))
     }
   })
+
+  ipcMain.handle(IPC.requirementRead, (_event, path: unknown): RequirementDoc => {
+    const rel = typeof path === 'string' ? path : ''
+    const root = ctx.repoRoot()
+    if (!root) return noRequirement(rel, 'refused', 'no repository selected')
+    try {
+      // No graph question here, unlike `sourceFile`: a requirement is not in the
+      // graph. Its boundary is narrower instead — one regex, `tasks/<name>.md`,
+      // which `readRequirement` applies again against the resolved path.
+      return readRequirement(root, rel)
+    } catch (err) {
+      return noRequirement(rel, 'unreadable', String(err))
+    }
+  })
+
+  ipcMain.handle(IPC.requirementSave, (_event, input: unknown): RequirementSave => {
+    const ask = (input ?? {}) as Partial<RequirementSaveInput>
+    const rel = typeof ask.path === 'string' ? ask.path : ''
+    const root = ctx.repoRoot()
+    if (!root) {
+      return noSave(rel, 'no repository selected')
+    }
+    // The renderer's strings are checked twice: by shape here, and against the
+    // resolved path in the store. This is the app's second write into a repo,
+    // so the first of those checks is spelled out rather than delegated.
+    if (!isRequirementPath(rel)) {
+      return noSave(rel, `not a requirement: ${rel}`)
+    }
+    try {
+      return saveRequirement(root, {
+        path: rel,
+        text: typeof ask.text === 'string' ? ask.text : '',
+        create: ask.create === true
+      })
+    } catch (err) {
+      return noSave(rel, String(err))
+    }
+  })
+}
+
+/**
+ * A save refusal shaped like an answer: nothing written, nothing committed.
+ *
+ * @param path   what the renderer asked for
+ * @param error  the sentence the editor shows
+ */
+function noSave(path: string, error: string): RequirementSave {
+  return { ok: false, path, error, committed: false, commit: null }
+}
+
+/**
+ * A requirement refusal shaped like an answer, for the two this layer decides.
+ *
+ * @param path     what the renderer asked for
+ * @param problem  which refusal it is
+ * @param detail   the sentence the editor shows under it
+ */
+function noRequirement(path: string, problem: RequirementProblem, detail: string): RequirementDoc {
+  return { ok: false, problem, detail, path, name: '', text: '', bytes: 0 }
 }
 
 /**

@@ -10,7 +10,12 @@ import type { CommandEvent } from '../domains/pipeline/types'
  * to widen its own reach. Nothing is imported from `node:` either: the window
  * is sandboxed, and this file must not be the hole in it.
  *
- * Exactly one member writes into the target repository: `writeApproval`.
+ * Exactly two members write into the target repository: `writeApproval`, which
+ * records a decision under `.aidev/`, and `saveRequirement`, which writes one
+ * `tasks/<name>.md` and commits that one file. Neither is a `writeFile(anyPath)`
+ * — a requirement path is a single regex (`tasks/<name>.md`, no separators, no
+ * `..`), main re-checks it after preload, and the store re-checks the resolved
+ * path after that. Widening either of them is how this file becomes the hole.
  *
  * v0.2.6 adds the ability to *start* things, and keeps the same shape while
  * doing it: `runCommand` takes a named request (launch this requirement, resume
@@ -33,7 +38,7 @@ const aidev: AidevBridge = {
   openRepoDialog: () => ipcRenderer.invoke(IPC.openRepo),
   selectRepo: (root) => ipcRenderer.invoke(IPC.selectRepo, root),
   getStageArtifact: (sliceId, stage) => ipcRenderer.invoke(IPC.artifact, sliceId, stage),
-  // The one write. `approvals/<stage>.md` and nothing else.
+  // The first write. `approvals/<stage>.md` and nothing else.
   writeApproval: (input) => ipcRenderer.invoke(IPC.approve, input),
 
   // -- v0.2.6 the pipeline's own commands
@@ -51,6 +56,11 @@ const aidev: AidevBridge = {
     }
   },
   getSliceFailure: (sliceId) => ipcRenderer.invoke(IPC.sliceFailure, sliceId),
+
+  // -- the requirement editor: one `tasks/<name>.md` in, the same one out.
+  getRequirement: (path) => ipcRenderer.invoke(IPC.requirementRead, path),
+  // The second write. `tasks/<name>.md`, and the commit of that one file.
+  saveRequirement: (input) => ipcRenderer.invoke(IPC.requirementSave, input),
 
   // -- v0.2.6 the Function DB, read-only
   getGraphIndex: () => ipcRenderer.invoke(IPC.graphIndex),

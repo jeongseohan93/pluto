@@ -75,6 +75,30 @@ describe('listRequirements', () => {
     writeFileSync(join(root, 'tasks', 'plain.md'), 'no heading here\n')
     assert.equal(listRequirements(root)[0].title, 'plain.md')
   })
+
+  test('tasks/specs/ — the umbrella specs — is not a requirement list', () => {
+    const root = tempRoot()
+    mkdirSync(join(root, 'tasks', 'specs'), { recursive: true })
+    writeFileSync(join(root, 'tasks', 'a.md'), '# A\n')
+    writeFileSync(join(root, 'tasks', 'specs', 'umbrella.md'), '# Umbrella\n')
+
+    assert.deepEqual(
+      listRequirements(root).map((f) => f.path),
+      ['tasks/a.md']
+    )
+  })
+
+  test('a name the launcher cannot spell is listed anyway, marked uneditable', () => {
+    const root = tempRoot()
+    mkdirSync(join(root, 'tasks'), { recursive: true })
+    writeFileSync(join(root, 'tasks', 'a-first.md'), '# First\n')
+    writeFileSync(join(root, 'tasks', '한글.md'), '# 한글\n')
+
+    const found = listRequirements(root)
+    assert.equal(found.length, 2, 'a requirement was dropped from the list')
+    assert.equal(found.find((f) => f.name === 'a-first.md')?.editable, true)
+    assert.equal(found.find((f) => f.name === '한글.md')?.editable, false)
+  })
 })
 
 describe('readSliceFailure', () => {
