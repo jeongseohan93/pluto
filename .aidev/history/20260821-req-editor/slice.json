@@ -1,6 +1,6 @@
 {
   "slice_id": "20260821-req-editor",
-  "status": "running:implement",
+  "status": "failed",
   "branch": "slice/20260821-req-editor",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "e7ea090ffba7bb9f3736966f06cef87e7fdd4dc2",
@@ -44,8 +44,8 @@
       "commit": "7cec48630bb1fa6d548eefe09dee7c34df48c23a"
     },
     "test": {
-      "status": "pending",
-      "verdict": "fail"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -114,5 +114,5 @@
       "cost_usd": 5.787815
     }
   ],
-  "updated_at": "2026-08-21T13:52:14+09:00"
+  "updated_at": "2026-08-21T13:59:52+09:00"
 }
