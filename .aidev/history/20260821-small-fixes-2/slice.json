@@ -31,10 +31,12 @@
     "implement": {
       "status": "done",
       "run_id": "20260821-130538-small-fixes-2-implement-2",
-      "attempts": 2
+      "attempts": 2,
+      "commit": "d5b83e6510428b94e9984ddba7cc0f5aae69042e"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "verdict": "pass"
     }
   },
   "runs": [
@@ -71,5 +73,5 @@
       "cost_usd": 10.424674000000007
     }
   ],
-  "updated_at": "2026-08-21T13:37:54+09:00"
+  "updated_at": "2026-08-21T13:51:10+09:00"
 }
