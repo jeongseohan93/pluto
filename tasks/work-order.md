@@ -55,6 +55,22 @@ test_commands: python -m pytest -q
 - 기존에 승인된 legacy slice의 resume에만 하위 호환 적용
 - 새 plan과 재계획(replan)은 작업 지시서가 없으면 FAIL한다
 
+### 7. 2차 리뷰 반영 (상태 전이·보증 범위 — 필수)
+- --no-worktree 우회 차단: legacy 기존 slice의 resume만 사후
+  대조 skip 허용. 신규 work order slice에서 workspace가 None이면
+  즉시 PipelineError로 거부한다
+- amend 중 재승인 데드락 방지: digest 불일치로 plan 승인이
+  stale 처리되면 plan_reapproval_pending 상태를 두고, amend
+  필터보다 먼저 plan 게이트를 직접 처리한 뒤 같은 amend를 재개
+- 보증 범위 명시: 사후 대조의 보증은 "Git이 관찰하는 worktree
+  내부 변경"이다. worktree 밖 쓰기 차단은 범위 밖 — README에
+  별도 안전 게이트 항목으로 등록만. "모든 신규 파일 즉시 FAIL"
+  표현은 문서 전체에서 위 보증 범위로 한정해 서술
+- unplanned 재계산: unplanned는 영구 누적하지 않는다.
+  scope_checks는 감사 이력으로 누적하되, unplanned는 기준 커밋
+  대비 현재 최종 diff와 effective_scope로 매번 재계산 (원복·정식
+  MODIFY 전환된 경로는 현재 목록에서 제거, 감사 이력엔 유지)
+
 ## 하지 않는 것
 - 컨텍스트 트레이(2-2 몫) / 빈 파일 준비(2-4 몫) / plan 산문 전면
   금지 (지시서 절 추가지 양식 전체 개편 아님)
@@ -69,6 +85,13 @@ test_commands: python -m pytest -q
   FAIL / 지시서 없는 새 plan → FAIL
 - legacy resume 하위 호환 동작 확인
 - 기존 pytest 전량 통과
+- agent test가 범위 밖 파일 수정 → FAIL
+- test_commands가 tracked/untracked 파일 생성 → FAIL
+- scope FAIL 후 resume → 같은 stage 재실행·재검증
+- unplanned 파일 원복 → 현재 unplanned에서 제거 + 감사 이력 유지
+- 신규 slice의 --no-worktree → 거부
+- plan 수정 → amend 중단 → 재승인 → 같은 amend 재개 (데드락 없음)
+
 
 ### 6. 리뷰 반영 사항 (기계 차단 강건성 — 필수)
 - diff_status는 git 실패·기준 commit 없음·미지 status를 예외로
