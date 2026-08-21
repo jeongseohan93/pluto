@@ -16,6 +16,10 @@ import { Inspector } from '@renderer/features/inspector/Inspector'
 import { BottomPanel, type BottomTab } from '@renderer/features/bottom/BottomPanel'
 import { StatusBar } from '@renderer/features/statusbar/StatusBar'
 import { useCommandState } from '@domains/pipeline/ui/useCommandState'
+import {
+  RequirementEditor,
+  type RequirementTarget
+} from '@domains/pipeline/ui/RequirementEditor'
 import { useSliceFailure } from '@domains/pipeline/ui/useSliceFailure'
 import { useFunctionGraph } from '@domains/graph-view/ui/useFunctionGraph'
 import { SPLIT_DEFAULT } from '@domains/code-view/split'
@@ -38,10 +42,12 @@ const ACTIVITY_SURFACE: Partial<Record<ActivityId, SurfaceId>> = {
  * the activity bar beside it is already a permanent icon rail and is also how
  * it comes back; the right one to a 32px strip that keeps its own chevron.
  *
- * @flow  no global data yet -> the boot mark ; otherwise the whole shell
+ * @flow  no global data yet -> the boot mark ; otherwise the whole shell, with
+ *        the requirement editor drawn over the middle pane when one is open
  * 주요 내부 변수: activity(좌측 패널이 무엇을 보여주는가),
  * inspectorCollapsed(셰브런 방향 — 접힘의 진실은 패널 자신이 안다),
- * codeSplit(그래프와 코드가 나눠 갖는 비율 — 탭을 옮겨 다녀도 남도록 셸이 든다)
+ * codeSplit(그래프와 코드가 나눠 갖는 비율 — 탭을 옮겨 다녀도 남도록 셸이 든다),
+ * editing(열려 있는 requirement 편집기 — 탭이 아니라 오버레이다)
  */
 function App(): JSX.Element {
   const [activity, setActivity] = useState<ActivityId>('workspaces')
@@ -68,6 +74,12 @@ function App(): JSX.Element {
   const [functionId, setFunctionId] = useState<number | null>(null)
   // Bumped when a command ends, so the failure panel re-reads what it left.
   const [runsDone, setRunsDone] = useState(0)
+  // The requirement editor, over the main pane. Not a `SurfaceId`: the tab bar
+  // is Plan and Graph on purpose, and a third tab that is empty most of the
+  // time would undo that. An overlay costs the split machinery nothing.
+  const [editing, setEditing] = useState<RequirementTarget | null>(null)
+  // Bumped by a save, so the launcher's list re-reads without waiting a poll.
+  const [requirementsVersion, setRequirementsVersion] = useState(0)
 
   const global = useGlobalData()
   const workspace = useWorkspaceData(workspaceId)
@@ -276,7 +288,10 @@ function App(): JSX.Element {
                 onOpenRepo: repo.open,
                 onSelectRepo: repo.select,
                 busy: command.busy,
-                onLaunch: (requirement) => runCommand({ kind: 'pipeline', requirement })
+                onLaunch: (requirement) => runCommand({ kind: 'pipeline', requirement }),
+                onNewRequirement: () => setEditing({ path: null }),
+                onEditRequirement: (path) => setEditing({ path }),
+                requirementsVersion
               }}
               functions={{
                 index: graph.index,
@@ -303,65 +318,86 @@ function App(): JSX.Element {
           <Separator className="rp-separator" />
 
           <Panel minSize={320}>
-            <Group orientation="vertical" className="h-full">
-              <Panel minSize={200}>
-                <Group orientation="horizontal" className="h-full">
-                  <Panel minSize={280}>
-                    <SurfacePane
-                      surface={primary}
-                      onSurfaceChange={setPrimary}
-                      data={surfaceData}
-                      zoom={zoom}
-                      onZoomChange={setZoom}
-                      onToggleSplit={() => setSplitOpen((v) => !v)}
-                      splitOpen={splitOpen}
-                      codeSplit={codeSplit}
-                      onCodeSplitChange={setCodeSplit}
-                      onCodeSplitOpen={makeRoomForCode}
-                    />
-                  </Panel>
-                  {splitOpen ? (
-                    <>
-                      <Separator className="rp-separator" />
-                      <Panel minSize={280}>
-                        <SurfacePane
-                          surface={secondary}
-                          onSurfaceChange={setSecondary}
-                          data={surfaceData}
-                          zoom={zoom}
-                          onZoomChange={setZoom}
-                          codeSplit={codeSplit}
-                          onCodeSplitChange={setCodeSplit}
-                          onCodeSplitOpen={makeRoomForCode}
-                        />
-                      </Panel>
-                    </>
-                  ) : null}
-                </Group>
-              </Panel>
+            {/* The requirement editor is drawn over this pane, so the sidebar
+                stays usable and the split/tab machinery is not involved. */}
+            <div className="relative h-full">
+              <Group orientation="vertical" className="h-full">
+                <Panel minSize={200}>
+                  <Group orientation="horizontal" className="h-full">
+                    <Panel minSize={280}>
+                      <SurfacePane
+                        surface={primary}
+                        onSurfaceChange={setPrimary}
+                        data={surfaceData}
+                        zoom={zoom}
+                        onZoomChange={setZoom}
+                        onToggleSplit={() => setSplitOpen((v) => !v)}
+                        splitOpen={splitOpen}
+                        codeSplit={codeSplit}
+                        onCodeSplitChange={setCodeSplit}
+                        onCodeSplitOpen={makeRoomForCode}
+                      />
+                    </Panel>
+                    {splitOpen ? (
+                      <>
+                        <Separator className="rp-separator" />
+                        <Panel minSize={280}>
+                          <SurfacePane
+                            surface={secondary}
+                            onSurfaceChange={setSecondary}
+                            data={surfaceData}
+                            zoom={zoom}
+                            onZoomChange={setZoom}
+                            codeSplit={codeSplit}
+                            onCodeSplitChange={setCodeSplit}
+                            onCodeSplitOpen={makeRoomForCode}
+                          />
+                        </Panel>
+                      </>
+                    ) : null}
+                  </Group>
+                </Panel>
 
-              <Separator className="rp-separator" />
+                <Separator className="rp-separator" />
 
-              <Panel
-                panelRef={bottomRef}
-                defaultSize={220}
-                minSize={120}
-                collapsible
-                collapsedSize={32}
-                groupResizeBehavior="preserve-pixel-size"
-              >
-                <BottomPanel
-                  tab={bottomTab}
-                  onTabChange={setBottomTab}
-                  logs={global.logs}
-                  telemetry={global.telemetry}
-                  collapsed={bottomCollapsed}
-                  onToggleCollapsed={toggleBottom}
-                  command={command.state}
-                  onStop={command.stop}
-                />
-              </Panel>
-            </Group>
+                <Panel
+                  panelRef={bottomRef}
+                  defaultSize={220}
+                  minSize={120}
+                  collapsible
+                  collapsedSize={32}
+                  groupResizeBehavior="preserve-pixel-size"
+                >
+                  <BottomPanel
+                    tab={bottomTab}
+                    onTabChange={setBottomTab}
+                    logs={global.logs}
+                    telemetry={global.telemetry}
+                    collapsed={bottomCollapsed}
+                    onToggleCollapsed={toggleBottom}
+                    command={command.state}
+                    onStop={command.stop}
+                  />
+                </Panel>
+              </Group>
+              {editing ? (
+                <div className="absolute inset-0 z-30">
+                  <RequirementEditor
+                    // A new document is a new editor: remounting is how the
+                    // buffer, the name and the save line are all reset at once.
+                    key={editing.path ?? '(new)'}
+                    target={editing}
+                    busy={command.busy}
+                    onClose={() => setEditing(null)}
+                    onSaved={() => setRequirementsVersion((n) => n + 1)}
+                    onLaunch={(requirement) => {
+                      setEditing(null)
+                      runCommand({ kind: 'pipeline', requirement })
+                    }}
+                  />
+                </div>
+              ) : null}
+            </div>
           </Panel>
 
           <Separator className="rp-separator" />

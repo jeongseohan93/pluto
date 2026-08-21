@@ -1,8 +1,7 @@
----
+﻿---
 approval: plan
-max_turns: implement=220
-setup: npm ci --prefix desktop
-test_commands: npm --prefix desktop run typecheck
+max_turns: implement=140
+test_commands: npx --prefix desktop tsc --noEmit -p desktop
 ---
 # req 에디터 — requirement 작성을 IDE에서
 
@@ -19,7 +18,7 @@ IDE 밖(메모장/터미널 heredoc)에서 작성 — 이 동선을 IDE 안으�
 - 파일명 입력(자동 .md, tasks/ 고정 — 경로 탈출 금지) → 저장 =
   git add + commit (메시지 자동: "task: <파일명>")
 - 저장 후 [발사] 버튼 → 기존 발사 배선 재사용
-- 기존 tasks/*.md 열어서 수정도 가능 (같은 편집기, 저장 = 커밋)
+- 기존 tasks/*.md 열어서 수정도 가능 (같은 편집기, 저장 = 커밋)
 - 편집 범위 가드: tasks/ 밖 파일은 이 편집기로 열 수 없음
   (코드 편집 개방 아님 — requirement 전용)
 

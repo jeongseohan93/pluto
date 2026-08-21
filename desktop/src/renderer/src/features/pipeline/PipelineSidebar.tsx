@@ -14,6 +14,12 @@ export interface PipelineSidebarProps {
   busy: boolean
   /** A1: start `aidev pipeline --requirement <path>`. */
   onLaunch: (requirement: string) => void
+  /** Open the requirement editor on a new `tasks/*.md`. */
+  onNewRequirement: () => void
+  /** Open the requirement editor on an existing one. */
+  onEditRequirement: (requirement: string) => void
+  /** Bumped by a save, so the launcher's list re-reads at once. */
+  requirementsVersion: number
 }
 
 /**
@@ -28,8 +34,11 @@ export interface PipelineSidebarProps {
  * @param onSelectSlice    select another slice
  * @param onOpenRepo       open the folder dialog
  * @param onSelectRepo     switch to a repository already in `recent`
- * @param busy             is a command running?
- * @param onLaunch         launch the chosen requirement
+ * @param busy                 is a command running?
+ * @param onLaunch             launch the chosen requirement
+ * @param onNewRequirement     write a new one
+ * @param onEditRequirement    edit the chosen one
+ * @param requirementsVersion  bumped by a save, to re-read the list
  * @flow  no repo -> say so ; no .aidev -> say so ; else the launcher, the
  *        epics, and the slice list
  */
@@ -40,12 +49,23 @@ export function PipelineSidebar({
   onOpenRepo,
   onSelectRepo,
   busy,
-  onLaunch
+  onLaunch,
+  onNewRequirement,
+  onEditRequirement,
+  requirementsVersion
 }: PipelineSidebarProps): JSX.Element {
   return (
     <>
       <RepoHeader repo={repo} onOpenRepo={onOpenRepo} onSelectRepo={onSelectRepo} />
-      {repo?.root && repo.isAidevRepo ? <LaunchPanel busy={busy} onLaunch={onLaunch} /> : null}
+      {repo?.root && repo.isAidevRepo ? (
+        <LaunchPanel
+          busy={busy}
+          onLaunch={onLaunch}
+          onNew={onNewRequirement}
+          onEdit={onEditRequirement}
+          reloadKey={requirementsVersion}
+        />
+      ) : null}
       {!repo || !repo.root ? (
         <EmptyState
           title="No repository selected"

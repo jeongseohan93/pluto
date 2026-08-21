@@ -79,6 +79,26 @@ export const EDITOR_OPTIONS: MonacoNs.editor.IStandaloneEditorConstructionOption
   find: { addExtraSpaceOnTop: false, seedSearchStringFromSelection: 'never' }
 }
 
+/**
+ * The same window and the same constraints — no workers — with one difference:
+ * a human can type into it.
+ *
+ * Derived rather than edited in place. `EDITOR_OPTIONS` is one object shared by
+ * every read-only viewer, and turning `readOnly` off there would turn it off
+ * for all of them. Everything worker-backed stays off as inherited: this is a
+ * text box for prose, not a language service.
+ */
+export const EDIT_OPTIONS: MonacoNs.editor.IStandaloneEditorConstructionOptions = {
+  ...EDITOR_OPTIONS,
+  readOnly: false,
+  domReadOnly: false,
+  // A requirement is prose. It has no columns to keep.
+  wordWrap: 'on',
+  renderLineHighlight: 'line',
+  // The paste menu. It runs in the renderer and asks no worker anything.
+  contextmenu: true
+}
+
 /** The load, kept so a second viewer does not import the editor twice. */
 let pending: Promise<MonacoApi | null> | null = null
 
@@ -86,7 +106,7 @@ let pending: Promise<MonacoApi | null> | null = null
  * Monaco, once per session — or null where it could not be loaded at all.
  *
  * @flow  already asked -> the same promise ; otherwise import the editor core,
- *        the three highlighters, register the theme, and hand the api back ;
+ *        the four highlighters, register the theme, and hand the api back ;
  *        anything throwing on that path -> null, and the caller draws plain text
  */
 export function ensureMonaco(): Promise<MonacoApi | null> {
@@ -99,8 +119,9 @@ export function ensureMonaco(): Promise<MonacoApi | null> {
  *
  * Takes no arguments.
  *
- * @flow  every step inside one try — a missing sub-path is a fallback, not a
- *        blank panel
+ * @flow  the core and the api inside one try — a missing sub-path there is a
+ *        fallback, not a blank panel ; each grammar inside its own, so one
+ *        missing colour scheme cannot cost the whole editor
  */
 async function load(): Promise<MonacoApi | null> {
   try {
@@ -108,13 +129,40 @@ async function load(): Promise<MonacoApi | null> {
     // language services, and those want workers this window cannot create.
     await import('monaco-editor/esm/vs/editor/edcore.main')
     // Monarch grammars only. Colouring, no analysis, no worker.
-    await import('monaco-editor/esm/vs/basic-languages/python/python.contribution')
-    await import('monaco-editor/esm/vs/basic-languages/typescript/typescript.contribution')
-    await import('monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution')
+    await tryLanguage(() => import('monaco-editor/esm/vs/basic-languages/python/python.contribution'))
+    await tryLanguage(() =>
+      import('monaco-editor/esm/vs/basic-languages/typescript/typescript.contribution')
+    )
+    await tryLanguage(() =>
+      import('monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution')
+    )
+    // The requirement editor's language, and the only one nothing else needed.
+    await tryLanguage(() =>
+      import('monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution')
+    )
     const api = (await import('monaco-editor/esm/vs/editor/editor.api')) as unknown as MonacoApi
     api.editor.defineTheme(THEME, { base: 'vs-dark', inherit: true, rules: [], colors: COLOURS })
     return api
   } catch {
     return null
+  }
+}
+
+/**
+ * One Monarch grammar, allowed to be absent.
+ *
+ * Separately wrapped because the alternative is what this file used to do: a
+ * single try around the whole load, where one grammar sub-path that a future
+ * monaco moved or dropped takes the entire editor down to the plain-text
+ * fallback. A missing grammar should cost that language its colours and
+ * nothing else.
+ *
+ * @param load  the dynamic import for one `*.contribution` module
+ */
+async function tryLanguage(load: () => Promise<unknown>): Promise<void> {
+  try {
+    await load()
+  } catch {
+    // This language has no colours in this build. That is all it means.
   }
 }

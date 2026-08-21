@@ -20,6 +20,55 @@ export interface RequirementFile {
   title: string
   bytes: number
   modifiedAt: number
+  /**
+   * Can the requirement editor open this one? A `tasks/*.md` whose name the
+   * launcher's own regex refuses (a Korean filename, a `.MD`) is still listed
+   * and still launchable by whatever already knows it — the list is not
+   * narrowed, only annotated.
+   */
+  editable: boolean
+}
+
+/** Why the editor would not open or write a path. */
+export type RequirementProblem = 'refused' | 'missing' | 'too-large' | 'unreadable'
+
+/** One `tasks/<name>.md` as the editor holds it, or why it could not be held. */
+export interface RequirementDoc {
+  ok: boolean
+  problem?: RequirementProblem
+  detail?: string
+  path: string
+  name: string
+  text: string
+  bytes: number
+}
+
+/** A save: the file, its new body, and whether this is meant to be a new file. */
+export interface RequirementSaveInput {
+  path: string
+  text: string
+  /** True from the [새 요구사항] button — an existing file is then refused. */
+  create: boolean
+}
+
+/**
+ * What a save did. `ok` is about the *file*: a write that landed but could not
+ * be committed is still a save, because no editor throws away what a human just
+ * typed over a git failure. The commit is reported beside it, never instead.
+ */
+export interface RequirementSave {
+  ok: boolean
+  path: string
+  error?: string
+  /** `create` was asked for and something is already there; nothing was written. */
+  alreadyExists?: boolean
+  committed: boolean
+  /** The short sha the commit got, when there was one. */
+  commit: string | null
+  /** The file was byte-for-byte what it already was — nothing to commit. */
+  unchanged?: boolean
+  /** Why the commit did not happen, when the write did. */
+  commitError?: string
 }
 
 export type CommandKind = 'pipeline' | 'resume' | 'merge' | 'discard' | 'graph-build'
@@ -175,4 +224,15 @@ export interface PipelineBridge {
   /** Returns its own unsubscribe, because a React effect needs one. */
   onCommandEvent(handler: (event: CommandEvent) => void): () => void
   getSliceFailure(sliceId: string): Promise<SliceFailure | null>
+  /**
+   * One `tasks/<name>.md`. Anything not of that shape is refused — this is the
+   * requirement editor's read, not a file read.
+   */
+  getRequirement(path: string): Promise<RequirementDoc>
+  /**
+   * The second and last capability that writes into the target repository, and
+   * the narrower of the two: one `tasks/<name>.md`, written and then committed
+   * on its own. See `writeApproval` in `shared/ide.ts` for the first.
+   */
+  saveRequirement(input: RequirementSaveInput): Promise<RequirementSave>
 }

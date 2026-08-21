@@ -1,0 +1,118 @@
+{
+  "slice_id": "20260821-req-editor",
+  "status": "failed",
+  "branch": "slice/20260821-req-editor",
+  "base": "feat/v0.2-slice-pipeline",
+  "base_commit": "e7ea090ffba7bb9f3736966f06cef87e7fdd4dc2",
+  "start": null,
+  "epic": null,
+  "gates": [
+    "plan"
+  ],
+  "setup": null,
+  "plan_scale": {
+    "files": 61,
+    "test_files": 6,
+    "budget": 140,
+    "warn": true
+  },
+  "amends": null,
+  "repairs": [
+    {
+      "n": 1,
+      "grade": "large",
+      "at": "2026-08-21T13:41:30+09:00",
+      "failed": 0,
+      "spec_violations": 0,
+      "diagnosis": true
+    }
+  ],
+  "replans": null,
+  "rejections": null,
+  "stages": {
+    "plan": {
+      "status": "done",
+      "approval": "approved",
+      "run_id": "20260821-130318-req-editor-plan",
+      "attempts": 1,
+      "commit": "790ecf66f012d70ba86e13cf614c2569f6254f0b"
+    },
+    "implement": {
+      "status": "done",
+      "run_id": "20260821-134131-req-editor-implement-2",
+      "attempts": 2,
+      "commit": "7cec48630bb1fa6d548eefe09dee7c34df48c23a"
+    },
+    "test": {
+      "status": "done",
+      "verdict": "pass"
+    }
+  },
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260821-130318-req-editor-plan",
+      "status": "completed",
+      "turns": 53,
+      "tokens": {
+        "input": 836,
+        "cache_creation": 129161,
+        "cache_read": 2097862,
+        "output": 31283,
+        "billed_input": 2227859,
+        "peak_context": 143630
+      },
+      "cost_usd": 3.126796
+    },
+    {
+      "stage": "implement",
+      "attempt": 1,
+      "run_id": "20260821-131209-req-editor-implement",
+      "status": "completed",
+      "turns": 129,
+      "tokens": {
+        "input": 218,
+        "cache_creation": 205743,
+        "cache_read": 19023354,
+        "output": 85695,
+        "billed_input": 19229315,
+        "peak_context": 226628
+      },
+      "cost_usd": 13.712571999999994
+    },
+    {
+      "stage": "diagnose",
+      "attempt": 1,
+      "run_id": "20260821-133952-req-editor-diagnose",
+      "status": "completed",
+      "turns": 19,
+      "tokens": {
+        "input": 55,
+        "cache_creation": 38665,
+        "cache_read": 549340,
+        "output": 6615,
+        "billed_input": 588060,
+        "peak_context": 53134
+      },
+      "cost_usd": 0.8269699999999999
+    },
+    {
+      "stage": "implement",
+      "attempt": 2,
+      "run_id": "20260821-134131-req-editor-implement-2",
+      "status": "completed",
+      "turns": 85,
+      "tokens": {
+        "input": 150,
+        "cache_creation": 124280,
+        "cache_read": 6942630,
+        "output": 42918,
+        "billed_input": 7067060,
+        "peak_context": 145166
+      },
+      "cost_usd": 5.787815
+    }
+  ],
+  "updated_at": "2026-08-21T13:59:52+09:00"
+}
