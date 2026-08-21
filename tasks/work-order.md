@@ -69,3 +69,29 @@ test_commands: python -m pytest -q
   FAIL / 지시서 없는 새 plan → FAIL
 - legacy resume 하위 호환 동작 확인
 - 기존 pytest 전량 통과
+
+### 6. 리뷰 반영 사항 (기계 차단 강건성 — 필수)
+- diff_status는 git 실패·기준 commit 없음·미지 status를 예외로
+  올리고 scope check를 FAIL시킨다 (fail-closed — 차단 장치에
+  fail-open 금지)
+- .aidev/ 통째 제외 금지: 엔진이 이번 slice에서 생성한 정확한
+  파일만 제외. 그 외 .aidev 신규 파일은 신규 파일 FAIL로 잡는다
+- scope check는 파일을 변경하는 모든 실행에 적용: implement,
+  repair implement, amend implement, agent test, engine verify
+  command 실행 후
+- scope FAIL 시 해당 stage를 failed로 전환하고 commit하지 않는다.
+  resume에서도 최종 scope check가 재실행되어야 한다
+- 대조용 effective order = plan 지시서 + 지금까지 저장된 모든
+  amends[].work_order의 누적 합산. state의 원본 지시서는 불변
+- symbol 행이 하나라도 있으면 graph build/open/freshness 실패는
+  plan FAIL. --no-graph는 symbol 없는 파일 단위 지시서에서만 허용
+- 승인 직후 plan.md를 재파싱·재검증하고 digest를 저장한다.
+  implement/resume/repair 직전 digest 불일치 시 재승인까지 중단
+- 인식 가능한 작업 지시서·사유 절이 2개 이상이면 FAIL.
+  fenced code block 안의 제목은 절로 인식하지 않는다
+- git 파싱은 --name-status -z 및 status --porcelain=v1 -z 사용
+  (공백·한글·인용 경로 안전)
+- 경로 검증에 ADS 콜론, 제어문자, Windows 예약 장치명,
+  segment 후행 점·공백 포함
+- 테스트: 같은 파일 내 동명 bare name 2개 fixture로 ambiguous
+  검증 / symbol 해석 0개 → plan FAIL 테스트
