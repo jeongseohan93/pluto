@@ -1,6 +1,6 @@
 {
   "slice_id": "20260822-process-identity",
-  "status": "pending",
+  "status": "running:plan",
   "branch": "slice/20260822-process-identity",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9aae0f0c4c1a4c432b392c7068d114f703e3cb17",
@@ -10,14 +10,21 @@
     "plan"
   ],
   "setup": null,
-  "plan_scale": null,
+  "plan_scale": {
+    "files": 12,
+    "test_files": 4,
+    "budget": 80,
+    "warn": true
+  },
   "amends": null,
   "repairs": null,
   "replans": null,
   "rejections": null,
   "stages": {
     "plan": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260822-051949-process-identity-plan",
+      "attempts": 1
     },
     "implement": {
       "status": "pending"
@@ -26,6 +33,23 @@
       "status": "pending"
     }
   },
-  "runs": [],
-  "updated_at": "2026-08-22T05:19:45+09:00"
+  "runs": [
+    {
+      "stage": "plan",
+      "attempt": 1,
+      "run_id": "20260822-051949-process-identity-plan",
+      "status": "completed",
+      "turns": 33,
+      "tokens": {
+        "input": 29,
+        "cache_creation": 78816,
+        "cache_read": 925721,
+        "output": 26613,
+        "billed_input": 1004566,
+        "peak_context": 93285
+      },
+      "cost_usd": 1.9164904999999997
+    }
+  ],
+  "updated_at": "2026-08-22T05:26:09+09:00"
 }
