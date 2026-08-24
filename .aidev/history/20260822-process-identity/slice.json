@@ -1,6 +1,6 @@
 {
   "slice_id": "20260822-process-identity",
-  "status": "running:implement",
+  "status": "running:test",
   "branch": "slice/20260822-process-identity",
   "base": "feat/v0.2-slice-pipeline",
   "base_commit": "9aae0f0c4c1a4c432b392c7068d114f703e3cb17",
@@ -31,10 +31,14 @@
     "implement": {
       "status": "done",
       "run_id": "20260824-214012-process-identity-implement-2",
-      "attempts": 2
+      "attempts": 2,
+      "commit": "0865710983a7ce13c514e67c6fde2e9c7ea34c6d"
     },
     "test": {
-      "status": "pending"
+      "status": "done",
+      "run_id": "20260824-215748-process-identity-test",
+      "verdict": "unknown",
+      "attempts": 1
     }
   },
   "runs": [
@@ -85,7 +89,23 @@
         "peak_context": 87521
       },
       "cost_usd": 1.6051185000000001
+    },
+    {
+      "stage": "test",
+      "attempt": 1,
+      "run_id": "20260824-215748-process-identity-test",
+      "status": "completed",
+      "turns": 7,
+      "tokens": {
+        "input": 11,
+        "cache_creation": 25820,
+        "cache_read": 230732,
+        "output": 3278,
+        "billed_input": 256563,
+        "peak_context": 46705
+      },
+      "cost_usd": 0.45557100000000006
     }
   ],
-  "updated_at": "2026-08-24T21:57:48+09:00"
+  "updated_at": "2026-08-24T22:09:02+09:00"
 }
