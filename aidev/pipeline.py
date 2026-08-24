@@ -55,6 +55,7 @@ from . import (
     briefing,
     events as ev,
     graph,
+    procid,
     progress,
     recovery,
     reporter,
@@ -1334,39 +1335,115 @@ def write_text_atomic(path: Path, text: str) -> None:
     os.replace(str(tmp), str(path))
 
 
+def _record_repo(rec: Any) -> str:
+    """The repository a record belongs to, read back out of where the record lives.
+
+    ``<repo>/.aidev/slices/<id>`` and ``<repo>/.aidev/epics/<id>`` are both three
+    levels deep, so the repo is the third parent. A record built outside that
+    shape - a bare ``SliceRecord`` in a temporary directory - has no repo, and an
+    empty answer is the honest one: it matches other empty answers and nothing else.
+
+    @param rec  a slice or epic record
+    @flow  resolve the record dir -> the third parent ; not deep enough -> ""
+    """
+    try:
+        return str(Path(rec.dir).resolve().parents[2])
+    except (IndexError, OSError):
+        return ""
+
+
 class SliceLock:
     """One process per record, so state.json genuinely has a single writer.
 
     Slices are not run in parallel, so a second process on the same record is a
     mistake rather than a case to merge: it is refused, not queued. An epic holds
     the same lock over its own directory while its queue runs.
+
+    The lock records who took it - pid, that process's creation time, the record
+    and the repository (see ``procid``) - and not merely that it was taken. That
+    is what lets a lock whose owner is gone be taken over instead of demanding a
+    human delete it, without ever mistaking a stranger who inherited the pid for
+    the owner. A lock from before this format is never touched automatically.
     """
 
     def __init__(self, rec: Any) -> None:
         self.path = rec.dir / ".lock"
         self.label = "{0} {1}".format(getattr(rec, "kind", "slice"), rec.label)
+        self.record_label = rec.label
+        self.kind = getattr(rec, "kind", "slice")
+        self.repo = _record_repo(rec)
+        self.identity = procid.current_identity(self.label, self.repo)
 
     def __enter__(self) -> "SliceLock":
+        """Take the lock, or take it over from an owner that is provably gone, or refuse.
+
+        @flow  take -> won? done ; else judge the holder -> stale/vanished -> unlink
+               and take once more ; anything else -> refuse with what it is
+        주요 내부 변수: holder(lock을 잡고 있는 것의 판정)
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._take():
+            return self
+        holder = procid.inspect(self.path, self.identity)
+        if holder.status in (procid.STALE, procid.ABSENT):
+            if holder.status == procid.STALE:
+                say(
+                    "taking over a lock whose owner is gone ({0}): {1}".format(
+                        holder.text, holder.detail
+                    )
+                )
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            if self._take():
+                return self
+            # Lost the retry: someone else took it in between, so ask again
+            # rather than report the holder we already know is gone.
+            holder = procid.inspect(self.path, self.identity)
+        raise PipelineError(self._refusal(holder))
+
+    def _take(self) -> bool:
+        """Create the lock file exclusively and write our identity into that same handle.
+
+        ``O_EXCL`` is the whole guarantee, so the file is never written through a
+        temporary and renamed: an atomic replace would happily overwrite a lock
+        that another process had just won.
+
+        @flow  O_EXCL create -> already there? False ; else write the identity -> True
+        """
         try:
             handle = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            raise PipelineError(
-                "{0} is already running ({1}).\n"
-                "    If that process is gone, delete {2}".format(
-                    self.label, self._holder() or "owner unknown", self.path
+            return False
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(procid.encode(self.identity))
+        return True
+
+    def _refusal(self, holder: Any) -> str:
+        """The message for a lock we will not touch: what holds it, why, and the one way out.
+
+        Every branch ends at a human doing something, because that is the point
+        of refusing. A live owner gets the command that can stop it; everything
+        else gets the lock's path and the advice to look before deleting.
+
+        @param holder  the judgement ``procid.inspect`` returned
+        @flow  live and a slice -> offer --stop ; else the reason, then the path to delete
+        주요 내부 변수: lines(메시지 줄들)
+        """
+        lines = [
+            "{0} is already running ({1}).".format(self.label, holder.text or "owner unknown")
+        ]
+        if holder.detail:
+            lines.append("    {0}".format(holder.detail))
+        if holder.status == procid.LIVE and self.kind == "slice" and self.repo:
+            lines.append(
+                "    stop it: aidev pipeline --repo {0} --stop {1}".format(
+                    self.repo, self.record_label
                 )
             )
-        with os.fdopen(handle, "w", encoding="utf-8") as fh:
-            fh.write("pid {0}\nsince {1}\n".format(os.getpid(), now_iso()))
-        return self
-
-    def _holder(self) -> str:
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return ""
-        return "; ".join(line.strip() for line in lines if line.strip())
+        lines.append("    If you have checked that the process is gone, delete {0}".format(self.path))
+        return "\n".join(lines)
 
     def __exit__(self, *exc_info: Any) -> None:
         try:
@@ -6036,6 +6113,9 @@ def add_parser(sub: Any) -> Any:
     check, verify engine, and the temp-file guard - because a false positive on
     any of them costs a whole slice and the way out has to be one flag.
 
+    ``--stop`` sits beside ``--discard`` because it is the same kind of thing: a
+    command a human types about one slice, not a modifier of a run.
+
     @param sub  the subparsers object from ``cli.build_parser``
     """
     cmd = sub.add_parser(
@@ -6071,6 +6151,12 @@ def add_parser(sub: Any) -> Any:
     )
     cmd.add_argument(
         "--discard", default=None, metavar="SLICE", help="remove a slice's worktree and branch"
+    )
+    cmd.add_argument(
+        "--stop",
+        default=None,
+        metavar="SLICE",
+        help="stop the process holding this slice's lock, only if its recorded identity still matches",
     )
     cmd.add_argument(
         "--amend",
@@ -6301,6 +6387,10 @@ def cmd_pipeline(args: Any) -> int:
 def _dispatch(args: Any) -> int:
     """Pick the one command the flags asked for, and refuse two at once.
 
+    ``--stop`` joins ``modes`` rather than being handled apart from it, so that
+    "stop this and merge it in one line" is refused by the rule that already
+    exists instead of by a second one written for it.
+
     @param args  the parsed arguments
     @flow  resolve repo -> refuse combined modes -> hand off to that command
     주요 내부 변수: modes(각 명령의 (attr, 플래그) 쌍), chosen(실제로 주어진 것들)
@@ -6322,6 +6412,7 @@ def _dispatch(args: Any) -> int:
         ("list_slices", "--list"),
         ("merge", "--merge"),
         ("discard", "--discard"),
+        ("stop", "--stop"),
         ("amend", "--amend"),
         ("replan", "--replan"),
         ("rollback", "--rollback"),
@@ -6367,6 +6458,8 @@ def _dispatch(args: Any) -> int:
         return merge_slice(args, repo, repo_given, data_dir)
     if getattr(args, "discard", None):
         return discard_slice(args, repo, repo_given, data_dir)
+    if getattr(args, "stop", None):
+        return stop_slice(args, repo, repo_given, data_dir)
     if getattr(args, "amend", None):
         return amend_slice(args, repo, data_dir, repo_given)
     if getattr(args, "replan", None):
@@ -6381,7 +6474,7 @@ def _dispatch(args: Any) -> int:
         return epic_module.start_epic(args, repo, data_dir)
     raise PipelineError(
         "one of --requirement, --epic, --amend, --replan, --rollback, --revert-merge, "
-        "--resume-slice or --list is required"
+        "--stop, --resume-slice or --list is required"
     )
 
 
@@ -8001,6 +8094,68 @@ def discard_slice(
     if sha:
         say("  recoverable for now: git -C {0} branch {1} {2}".format(repo, ws.branch, sha[:10]))
     say("no git trace left in {0}. The slice's own record stays at {1}".format(repo, rec.dir))
+    return EXIT_DONE
+
+
+def stop_slice(
+    args: Any, repo: Path, repo_given: bool = True, data_dir: Optional[Path] = None
+) -> int:
+    """``--stop``: end the process running this slice, and only when the lock still proves it is that one.
+
+    Every branch other than "all four parts of the identity agree" ends without
+    signalling anything. A pid whose creation time has changed is a stranger and
+    is left alone; a lock with no identity in it at all is a human's to look at.
+    That asymmetry is deliberate: not stopping costs a Ctrl-C, and stopping the
+    wrong process costs whatever that process was doing.
+
+    The lock is never deleted here either. The process being ended removes it on
+    its way out, and if it cannot, the next run of the slice sees a dead owner
+    and takes it over - deleting it from the outside would only race with that.
+
+    @param args        parsed arguments - ``--stop <slice>``
+    @param repo        the user's repository
+    @param repo_given  whether --repo was named, for the "no slices here" hint
+    @param data_dir    where runs are stored, for that same hint
+    @flow  find the slice -> judge the lock -> absent/stale -> "not running" ;
+           legacy/unknown/foreign -> refuse and hand it to a human ;
+           live -> POSIX and not its own group? refuse ; else terminate
+    주요 내부 변수: lock(같은 신원 계산을 쓰기 위한 SliceLock), holder(lock의 판정)
+    """
+    rec = find_slice(repo, args.stop, repo_given, data_dir)
+    # Built, never entered: constructing it is how this command computes exactly
+    # the identity the running process would have computed for itself.
+    lock = SliceLock(rec)
+    holder = procid.inspect(lock.path, lock.identity)
+    if holder.status == procid.ABSENT:
+        say("{0} is not running - there is no lock at {1}".format(lock.label, lock.path))
+        return EXIT_DONE
+    if holder.status == procid.STALE:
+        say("{0} is not running ({1}).".format(lock.label, holder.text))
+        say("  {0}".format(holder.detail))
+        say("  nothing was signalled; the next run of this slice takes the lock over by itself.")
+        return EXIT_DONE
+    if holder.status != procid.LIVE:
+        raise PipelineError(
+            "{0} will not be stopped automatically ({1}).\n"
+            "    {2}\n"
+            "    Check yourself who holds it, then delete {3}".format(
+                lock.label, holder.text or "owner unknown", holder.detail, lock.path
+            )
+        )
+    identity = holder.identity
+    if os.name != "nt" and not procid.owns_group(identity):
+        raise PipelineError(
+            "{0} is running as pid {1}, but it was not launched into a process group of "
+            "its own.\n"
+            "    Only a group that holds nothing but this run may be signalled, so stop it "
+            "where it runs (Ctrl-C in that terminal).".format(lock.label, identity.pid)
+        )
+    try:
+        note = procid.terminate(identity)
+    except procid.TerminateRefused as exc:
+        raise PipelineError("{0} was not stopped: {1}".format(lock.label, exc))
+    say("stopped {0}: {1}".format(lock.label, note))
+    say("  the lock at {0} is left alone - it is removed on the way out.".format(lock.path))
     return EXIT_DONE
 
 
