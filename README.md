@@ -111,6 +111,7 @@ worktree 생성   <repo>-slices/<slice-id> + 브랜치 slice/<slice-id>  (base =
 --amend <id>   같은 브랜치 위에서 implement → test 한 바퀴 더 (사람이 친다)
 --merge <id>   base 브랜치에 merge      (사람이 친다)
 --discard <id> worktree + 브랜치 제거    (사람이 친다)
+--stop <id>    돌고 있는 그 프로세스를 종료 — 신원이 맞을 때만 (사람이 친다)
 --rollback <id> --to <stage>  브랜치와 상태를 그 단계 커밋으로 되감기 (사람이 친다)
 --revert-merge <id>           base에 merge revert 커밋 (사람이 친다)
 ```
@@ -1240,8 +1241,30 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
   안에서 `.aidev/`에 쓰는 행위 자체도 여전히 readonly 위반으로 잡힌다.** 둘 다다.
 - **slice 하나당 프로세스 하나.** `.aidev/slices/<id>/.lock`을 O_EXCL로 잡는다.
   같은 slice를 두 번 돌리면 두 번째는 거부된다 (exit 2). state.json의 단일 writer
-  규약이 규약이 아니라 강제가 된다. 프로세스가 강제 종료돼 lock이 남으면 지우라고
-  경로를 알려준다.
+  규약이 규약이 아니라 강제가 된다.
+- **lock은 pid가 아니라 신원을 적는다.** pid는 재사용되는 번호라 "pid 4812가 살아
+  있다"와 "lock을 잡은 그 프로세스가 살아 있다"는 다른 질문이다. 그래서 lock에는 네
+  가지가 들어간다: pid, **그 프로세스의 생성 시각**, 어느 레코드의 것인지, 어느
+  repo의 것인지 (POSIX는 독립 process group으로 발사됐는지도). 넷이 **전부** 맞아야
+  "그 프로세스"다.
+  - 주인이 죽었거나, pid는 살아 있는데 생성 시각이 다르면(= 번호가 남에게 넘어갔다)
+    **stale**이다. 다음 실행이 한 줄 알리고 자동으로 인수한다 — 사람이 지울 필요가 없다.
+  - 생성 시각을 못 읽거나(다른 계정의 pid 등), 다른 repo·다른 레코드의 lock이면
+    **아무것도 하지 않고** 사유와 경로만 알려준다. 못 죽여서 드는 비용은 Ctrl-C
+    한 번이고, 잘못 죽여서 드는 비용은 남의 작업 전부다.
+- **`--stop <slice>`: 신원이 전부 맞을 때만 종료한다.**
+  ```bash
+  aidev pipeline --repo <repo> --stop 20260822-doctor
+  ```
+  - 신원 4요소 일치 → 종료. POSIX는 **독립 process group으로 발사된 경우에만**
+    그 그룹에 SIGTERM을 보낸다 (부모 pid 단독 시그널은 자식을 고아로 남기므로
+    아예 제공하지 않는다). 그룹을 공유하고 있으면 거부하고, 그 터미널에서 직접
+    끊으라고 안내한다. Windows는 정중한 그룹 시그널이 없어 `taskkill /T /F`다.
+  - lock이 없거나 stale이면 종료할 게 없다고만 말하고 exit 0 — 아무것도 죽이지 않는다.
+  - **구형 lock**(신원 정보 없는 `pid`/`since` 두 줄)은 자동 인수도 자동 종료도
+    거부하고 exit 2로 수동 정리 경로를 알려준다. 파일은 손대지 않는다.
+  - `--stop`은 lock을 **지우지 않는다.** 죽는 프로세스가 나가면서 지우고, 못 지웠으면
+    다음 실행이 stale로 인수한다. 밖에서 지우면 그 인수와 경합할 뿐이다.
 - `--permission-mode`는 implement/test에만 먹는다. plan은 무슨 값을 줘도 readonly다.
 - **에픽의 목록 게이트는 `approval: none`으로도 못 끈다.** 다른 게이트는 사람이
   끄겠다고 하면 꺼지지만, 분해는 무슨 일이 존재하는지를 정하는 단계라 예외다.
@@ -1320,6 +1343,7 @@ session을 resume한다. 반면 일반 실패는 세션이 이미 "막혔다 / F
 | `--merge` | 끝난 slice를 base 브랜치에 merge (충돌 시 exit 4) |
 | `--push` | `--merge`와 함께: base 브랜치만 원격에 push (slice 브랜치는 절대 안 함) |
 | `--discard` | slice의 worktree 제거 + 브랜치 삭제 |
+| `--stop` | slice의 lock을 쥔 프로세스를 종료 — 신원 4요소가 전부 맞을 때만 |
 | `--rollback` | slice 브랜치와 상태를 그 slice의 stage 커밋으로 되감기 (`--to` 필수, v0.4.2) |
 | `--to` | `--rollback`이 되감을 지점: `requirement` / `plan` / `implement` / `test` |
 | `--revert-merge` | merge된 slice를 base에서 철회 — revert 커밋만, reset 없음 (충돌 시 exit 4) |
